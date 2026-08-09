@@ -110,6 +110,26 @@ var (
 			Foreground(colorBlue).
 			Bold(true)
 
+	// --- Zsh Statusline Powerline Style Pill Badges ---
+	badgeCleanBranch = lipgloss.NewStyle().
+				Background(lipgloss.Color("#10B981")). // Emerald Green
+				Foreground(lipgloss.Color("#11111B")). // Dark Obsidian
+				Bold(true)
+
+	badgeDirtyBranch = lipgloss.NewStyle().
+				Background(lipgloss.Color("#F59E0B")). // Warm Amber Yellow
+				Foreground(lipgloss.Color("#11111B")). // Dark Obsidian
+				Bold(true)
+
+	badgeErrorBranch = lipgloss.NewStyle().
+				Background(lipgloss.Color("#EF4444")). // Coral Red
+				Foreground(lipgloss.Color("#FFFFFF")). // White
+				Bold(true)
+
+	badgeArchivedBranch = lipgloss.NewStyle().
+				Background(lipgloss.Color("#313244")). // Muted Slate
+				Foreground(colorMuted)
+
 	selectedRowStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("#313244")).
 				Foreground(lipgloss.Color("#F5E0DC")).
@@ -128,10 +148,9 @@ var (
 			BorderForeground(colorSecondary).
 			Padding(0, 1)
 
-	// Explicit Column Width Styles for Pixel-Perfect Table Alignment
-	cellNameStyle   = lipgloss.NewStyle().Width(22)
-	cellStatusStyle = lipgloss.NewStyle().Width(12)
-	cellBranchStyle = lipgloss.NewStyle().Width(20)
+	// Explicit Column Width Styles for Table Alignment
+	cellNameStyle   = lipgloss.NewStyle().Width(24)
+	cellBranchStyle = lipgloss.NewStyle().Width(22)
 	cellPRsStyle    = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
 	cellIssuesStyle = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
@@ -234,6 +253,11 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 				Logs:       make([]string, 0),
 			}
 
+			if git.IsGitRepo(localPath) {
+				item.CurrentBranch = git.GetOriginalBranch(localPath)
+				item.DefaultBranch = git.GetDefaultBranch(localPath)
+			}
+
 			if counts, found := orgCounts[ghRepo.Name]; found {
 				item.OpenIssuesCount = counts.Issues
 				item.OpenPRsCount = counts.PRs
@@ -252,11 +276,13 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 				path := fmt.Sprintf("%s/%s", m.TargetDir, name)
 				if git.IsGitRepo(path) {
 					item := &git.RepoItem{
-						Name:       name,
-						GHRepoName: git.GetGHRepoName(name),
-						Path:       path,
-						Status:     git.StatusPending,
-						Logs:       make([]string, 0),
+						Name:          name,
+						GHRepoName:    git.GetGHRepoName(name),
+						Path:          path,
+						CurrentBranch: git.GetOriginalBranch(path),
+						DefaultBranch: git.GetDefaultBranch(path),
+						Status:        git.StatusPending,
+						Logs:          make([]string, 0),
 					}
 
 					if counts, found := orgCounts[item.GHRepoName]; found {
@@ -355,11 +381,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "J", "ctrl+d", "pgdown":
-			// Scroll right viewport panel down
 			m.Viewport.LineDown(3)
 
 		case "K", "ctrl+u", "pgup":
-			// Scroll right viewport panel up
 			m.Viewport.LineUp(3)
 
 		case "right", "l", "tab":
@@ -766,11 +790,10 @@ func (m Model) View() string {
 
 	// Pixel-Perfect Column Header Layout
 	headerPrefix := "   "
-	headerLine := fmt.Sprintf("%s%s %s %s %s %s",
+	headerLine := fmt.Sprintf("%s%s %s %s %s",
 		headerPrefix,
 		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
-		cellStatusStyle.Bold(true).Foreground(colorPrimary).Render("STATUS"),
-		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
+		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH / STATUS"),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
@@ -786,29 +809,29 @@ func (m Model) View() string {
 			statusIcon := renderStatusBadge(item)
 
 			// 1. Name Cell
-			nameCell := cellNameStyle.Render(truncateString(item.Name, 22))
+			nameCell := cellNameStyle.Render(truncateString(item.Name, 24))
 
-			// 2. Status Cell
-			stStyle := cellStatusStyle
-			if item.StatusMsg == "OK" {
-				stStyle = stStyle.Foreground(colorMuted)
-			}
-			statusCell := stStyle.Render(truncateString(item.StatusMsg, 12))
-
-			// 3. Branch Cell
-			brStyle := cellBranchStyle
+			// 2. Zsh Statusline Style Powerline Branch Pill Badge
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
-			if branchStr == item.DefaultBranch || branchStr == "-" {
-				brStyle = brStyle.Foreground(colorMuted)
-			} else {
-				brStyle = brStyle.Foreground(lipgloss.Color("#CDD6F4")).Bold(true)
-			}
-			branchCell := brStyle.Render(truncateString(branchStr, 20))
+			branchStr = truncateString(branchStr, 18)
 
-			// 4. PRs Count Cell
+			var branchPill string
+			pillWrapper := cellBranchStyle
+
+			if item.IsArchived {
+				branchPill = pillWrapper.Render(badgeArchivedBranch.Render(" Archived "))
+			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
+				branchPill = pillWrapper.Render(badgeErrorBranch.Render(" " + branchStr + " "))
+			} else if item.HasUnstagedChanges {
+				branchPill = pillWrapper.Render(badgeDirtyBranch.Render(" " + branchStr + " "))
+			} else {
+				branchPill = pillWrapper.Render(badgeCleanBranch.Render(" " + branchStr + " "))
+			}
+
+			// 3. PRs Count Cell
 			prsStyle := cellPRsStyle
 			var prsCell string
 			if item.OpenPRsCount > 0 {
@@ -817,7 +840,7 @@ func (m Model) View() string {
 				prsCell = prsStyle.Foreground(colorMuted).Render("-")
 			}
 
-			// 5. Issues Count Cell
+			// 4. Issues Count Cell
 			issuesStyle := cellIssuesStyle
 			var issuesCell string
 			if item.OpenIssuesCount > 0 {
@@ -827,8 +850,8 @@ func (m Model) View() string {
 			}
 
 			// Combine cells into a pixel-aligned table line
-			line := fmt.Sprintf("%s %s %s %s %s %s",
-				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
+			line := fmt.Sprintf("%s %s %s %s %s",
+				statusIcon, nameCell, branchPill, prsCell, issuesCell,
 			)
 
 			if i == m.SelectedIndex {
@@ -852,7 +875,7 @@ func (m Model) View() string {
 
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
-	// 3. Footer Keybindings Help with Viewport Scroll Shortcuts
+	// 3. Footer Keybindings Help
 	footerText := "[↑/↓/j/k] Move  |  [J/K] Scroll Pane  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
