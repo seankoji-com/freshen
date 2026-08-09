@@ -40,10 +40,13 @@ var (
 	iconStash    = "󰏖"
 	iconSwitch   = "󰁨"
 	iconTrash    = "🗑️"
-	iconSyncing  = "⏳"
 	iconPending  = "•"
 	iconCopy     = "󰅍"
 	iconWorktree = "󰉓"
+
+	// Powerline Pill Half-Dome Rounded Caps
+	iconCapLeft  = "\ue0b6" //  Left Powerline Dome
+	iconCapRight = "\ue0b4" //  Right Powerline Dome
 
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
@@ -106,30 +109,6 @@ var (
 			Foreground(colorMuted).
 			Strikethrough(true)
 
-	badgeSyncing = lipgloss.NewStyle().
-			Foreground(colorBlue).
-			Bold(true)
-
-	// --- Zsh Statusline Powerline Style Pill Badges ---
-	badgeCleanBranch = lipgloss.NewStyle().
-				Background(lipgloss.Color("#10B981")). // Emerald Green
-				Foreground(lipgloss.Color("#11111B")). // Dark Obsidian
-				Bold(true)
-
-	badgeDirtyBranch = lipgloss.NewStyle().
-				Background(lipgloss.Color("#F59E0B")). // Warm Amber Yellow
-				Foreground(lipgloss.Color("#11111B")). // Dark Obsidian
-				Bold(true)
-
-	badgeErrorBranch = lipgloss.NewStyle().
-				Background(lipgloss.Color("#EF4444")). // Coral Red
-				Foreground(lipgloss.Color("#FFFFFF")). // White
-				Bold(true)
-
-	badgeArchivedBranch = lipgloss.NewStyle().
-				Background(lipgloss.Color("#313244")). // Muted Slate
-				Foreground(colorMuted)
-
 	selectedRowStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("#313244")).
 				Foreground(lipgloss.Color("#F5E0DC")).
@@ -150,10 +129,18 @@ var (
 
 	// Explicit Column Width Styles for Table Alignment
 	cellNameStyle   = lipgloss.NewStyle().Width(24)
-	cellBranchStyle = lipgloss.NewStyle().Width(22)
+	cellBranchStyle = lipgloss.NewStyle().Width(24)
 	cellPRsStyle    = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
 	cellIssuesStyle = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
+
+// renderPowerlinePill creates a rounded NerdFont Powerline pill badge (e.g.  main ).
+func renderPowerlinePill(text string, bg lipgloss.Color, fg lipgloss.Color) string {
+	leftCap := lipgloss.NewStyle().Foreground(bg).Render(iconCapLeft)
+	body := lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true).Render(text)
+	rightCap := lipgloss.NewStyle().Foreground(bg).Render(iconCapRight)
+	return leftCap + body + rightCap
+}
 
 // --- Messages for Bubble Tea Update Loop ---
 
@@ -421,8 +408,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err == nil {
 					item.CurrentBranch = git.GetOriginalBranch(item.Path)
 					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
-					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), pruned worktrees, and deleted %d non-default local branches.", count))
-					m.ToastMsg = fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, deleted %d stale branches & pruned worktrees!", count)
+					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
+					m.ToastMsg = fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count)
 					m.updateViewport()
 				}
 			}
@@ -789,7 +776,7 @@ func (m Model) View() string {
 	var leftSb strings.Builder
 
 	// Pixel-Perfect Column Header Layout
-	headerPrefix := "   "
+	headerPrefix := "  "
 	headerLine := fmt.Sprintf("%s%s %s %s %s",
 		headerPrefix,
 		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
@@ -798,7 +785,7 @@ func (m Model) View() string {
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
 	leftSb.WriteString(headerLine + "\n")
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("   --------------------------------------------------------------------------------") + "\n")
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  --------------------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -806,30 +793,29 @@ func (m Model) View() string {
 		leftSb.WriteString("No repositories found in target directory.\n")
 	} else {
 		for i, item := range m.Repos {
-			statusIcon := renderStatusBadge(item)
+			statusIcon := m.renderStatusBadge(item)
 
 			// 1. Name Cell
 			nameCell := cellNameStyle.Render(truncateString(item.Name, 24))
 
-			// 2. Zsh Statusline Style Powerline Branch Pill Badge
+			// 2. Rounded NerdFont Powerline Dome Pill Badge (\ue0b6 main \ue0b4)
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
 			branchStr = truncateString(branchStr, 18)
 
-			var branchPill string
-			pillWrapper := cellBranchStyle
-
+			var rawPill string
 			if item.IsArchived {
-				branchPill = pillWrapper.Render(badgeArchivedBranch.Render(" Archived "))
+				rawPill = renderPowerlinePill(" Archived ", lipgloss.Color("#313244"), colorMuted)
 			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
-				branchPill = pillWrapper.Render(badgeErrorBranch.Render(" " + branchStr + " "))
+				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#EF4444"), lipgloss.Color("#FFFFFF"))
 			} else if item.HasUnstagedChanges {
-				branchPill = pillWrapper.Render(badgeDirtyBranch.Render(" " + branchStr + " "))
+				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#F59E0B"), lipgloss.Color("#11111B"))
 			} else {
-				branchPill = pillWrapper.Render(badgeCleanBranch.Render(" " + branchStr + " "))
+				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#10B981"), lipgloss.Color("#11111B"))
 			}
+			branchPill := cellBranchStyle.Render(rawPill)
 
 			// 3. PRs Count Cell
 			prsStyle := cellPRsStyle
@@ -886,7 +872,7 @@ func (m Model) View() string {
 	return header + "\n" + mainView + "\n" + footer
 }
 
-func renderStatusBadge(item *git.RepoItem) string {
+func (m Model) renderStatusBadge(item *git.RepoItem) string {
 	switch item.Status {
 	case git.StatusUpToDate:
 		return badgeUpToDate.Render(iconSuccess)
@@ -905,7 +891,7 @@ func renderStatusBadge(item *git.RepoItem) string {
 	case git.StatusArchived:
 		return badgeArchived.Render(iconTrash)
 	case git.StatusSyncing:
-		return badgeSyncing.Render(iconSyncing)
+		return m.Spinner.View()
 	default:
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(iconPending)
 	}

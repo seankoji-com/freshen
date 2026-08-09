@@ -220,12 +220,27 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 	return details
 }
 
-// PruneBranchesAndWorktrees runs git fetch --prune, git worktree prune, and deletes local non-default branches.
+// PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
 func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 	// 1. Fetch & prune deleted remote-tracking references from origin
 	_ = exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run()
 
-	// 2. Prune stale worktrees
+	// 2. Force remove secondary git worktrees
+	cmdWorktree := exec.Command("git", "-C", path, "worktree", "list", "--porcelain")
+	var wtOut bytes.Buffer
+	cmdWorktree.Stdout = &wtOut
+	if err := cmdWorktree.Run(); err == nil {
+		lines := strings.Split(wtOut.String(), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "worktree ") {
+				wtPath := strings.TrimPrefix(line, "worktree ")
+				wtPath = strings.TrimSpace(wtPath)
+				if wtPath != "" && wtPath != path {
+					_ = exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run()
+				}
+			}
+		}
+	}
 	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
 
 	// 3. Delete local non-default branches
@@ -240,6 +255,11 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
 		b = strings.TrimSpace(b)
+		if strings.HasPrefix(b, "+") || strings.HasPrefix(b, "*") {
+			b = strings.TrimPrefix(b, "+")
+			b = strings.TrimPrefix(b, "*")
+			b = strings.TrimSpace(b)
+		}
 		if b != "" && b != defaultBranch && b != currentBranch {
 			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
 			if delCmd.Run() == nil {
