@@ -14,8 +14,22 @@ import (
 	"github.com/seankoji-com/freshen/pkg/git"
 )
 
-// --- Color Palette & Lip Gloss Styles ---
+// --- NerdFont Glyphs & Color Palette ---
 var (
+	iconLeaf     = "🍃"
+	iconGithub   = "󰊤"
+	iconFolder   = "󰉋"
+	iconBranch   = ""
+	iconPR       = "󰏫"
+	iconSuccess  = "󰄬"
+	iconError    = "󰅙"
+	iconRebase   = "󰚰"
+	iconStash    = "󰏖"
+	iconSwitch   = "󰁨"
+	iconTrash    = "🗑️"
+	iconSyncing  = "⏳"
+	iconPending  = "•"
+
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
 	colorGreen     = lipgloss.Color("#10B981") // Emerald Green
@@ -46,7 +60,11 @@ var (
 			Foreground(colorBlue).
 			Bold(true)
 
-	badgeStashedPR = lipgloss.NewStyle().
+	badgeStash = lipgloss.NewStyle().
+			Foreground(colorYellow).
+			Bold(true)
+
+	badgePR = lipgloss.NewStyle().
 			Foreground(colorYellow).
 			Bold(true)
 
@@ -201,7 +219,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 	}
 }
 
-func (m Model) startParallelSyncCmd(forceFullSync bool) tea.Cmd {
+func (m Model) startParallelSyncCmd() tea.Cmd {
 	return func() tea.Msg {
 		var wg sync.WaitGroup
 		concurrency := 4
@@ -219,8 +237,8 @@ func (m Model) startParallelSyncCmd(forceFullSync bool) tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Branch-selective sync
-				git.SyncRepository(r, forceFullSync)
+				// Perform sync according to branch state
+				git.SyncRepository(r)
 			}(item)
 		}
 
@@ -257,26 +275,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					go git.SyncRepository(item, false)
+					go git.SyncRepository(item)
 					m.updateViewport()
 				}
 			}
 
-		case "f":
-			// Run Full Sync ("do the rest": stash, checkout default, pull, stash apply, draft PR) on selected repo
+		case "b":
+			// Switch back to feature branch (or default branch)
+			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+				item := m.Repos[m.SelectedIndex]
+				target := item.OriginalBranch
+				if item.CurrentBranch == item.OriginalBranch {
+					target = item.DefaultBranch
+				}
+				_ = git.SwitchBranch(item, target)
+				m.updateViewport()
+			}
+
+		case "p":
+			// Commit, push to PR, and switch back to default branch
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					go git.SyncRepository(item, true)
+					go func(r *git.RepoItem) {
+						_ = git.CommitPushPRAndSwitchDefault(r)
+					}(item)
 					m.updateViewport()
 				}
-			}
-
-		case "F":
-			// Run Full Sync on ALL repositories
-			if !m.IsSyncing && len(m.Repos) > 0 {
-				m.IsSyncing = true
-				return m, m.startParallelSyncCmd(true)
 			}
 
 		case "d":
@@ -286,7 +311,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
 					item.StatusMsg = "Deleted from disk"
-					item.Logs = append(item.Logs, "Local folder deleted successfully.")
+					item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
 					m.updateViewport()
 				}
 			}
@@ -299,7 +324,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.Repos) > 0 {
 			m.IsSyncing = true
 			m.updateViewport()
-			cmds = append(cmds, m.startParallelSyncCmd(false))
+			cmds = append(cmds, m.startParallelSyncCmd())
 		}
 
 	case syncFinishedMsg:
@@ -329,14 +354,19 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY:"), subtitleStyle.Render(item.Name)))
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.Name)))
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("GITHUB NAME:"), item.GHRepoName))
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL PATH: "), item.Path))
-	sb.WriteString(fmt.Sprintf("%s %s (Default: %s)\n", lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render("BRANCH:     "), item.CurrentBranch, item.DefaultBranch))
+	sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL PATH: "), iconFolder, item.Path))
+	sb.WriteString(fmt.Sprintf("%s %s %s (Default: %s)\n", lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render("BRANCH:     "), iconBranch, item.CurrentBranch, item.DefaultBranch))
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:     "), item.StatusMsg))
-	if item.DraftPRURL != "" {
-		sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:   "), badgeStashedPR.Render(item.DraftPRURL)))
+	
+	if item.ExistingPRURL != "" {
+		sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR:    "), iconPR, badgePR.Render(item.ExistingPRURL)))
 	}
+	if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
+		sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:   "), iconPR, badgePR.Render(item.DraftPRURL)))
+	}
+	
 	sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
 
 	for _, logLine := range item.Logs {
@@ -346,7 +376,7 @@ func (m *Model) updateViewport() {
 	m.Viewport.SetContent(sb.String())
 }
 
-// highlightLogLine applies syntax highlighting to git commands, timestamps, URLs, and status markers.
+// highlightLogLine applies NerdFont styling & syntax highlighting to log text.
 func highlightLogLine(line string) string {
 	if line == "" {
 		return line
@@ -358,7 +388,7 @@ func highlightLogLine(line string) string {
 	})
 
 	// 2. Highlight Git / GH commands
-	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|gh pr create|gh repo list)\b`)
+	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list)\b`)
 	line = cmdRegex.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
 	})
@@ -376,9 +406,9 @@ func highlightLogLine(line string) string {
 	})
 
 	// 5. Highlight Success / Error prefix markers
-	if strings.HasPrefix(line, "✓") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
+	if strings.Contains(line, "󰄬") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
 		line = lipgloss.NewStyle().Foreground(colorGreen).Render(line)
-	} else if strings.HasPrefix(line, "✗") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
+	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
 		line = lipgloss.NewStyle().Foreground(colorRed).Render(line)
 	}
 
@@ -390,10 +420,10 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Header Banner
-	header := titleStyle.Render(" FRESHEN ") + " " +
+	// 1. Header Banner with NerdFont icons
+	header := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
 		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager") + "\n" +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("Target Directory: %s | Org: %s", m.TargetDir, m.TargetOrg)) + "\n"
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s Target Directory: %s | %s Org: %s", iconFolder, m.TargetDir, iconGithub, m.TargetOrg)) + "\n"
 
 	// 2. Main Content Split View
 	leftWidth := (m.Width / 2) - 2
@@ -401,7 +431,7 @@ func (m Model) View() string {
 
 	// Render Repo List (Left)
 	var leftSb strings.Builder
-	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("REPOSITORIES") + "\n\n")
+	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰓦 REPOSITORIES") + "\n\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -433,9 +463,9 @@ func (m Model) View() string {
 
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
-	// 3. Footer Keybindings Help
+	// 3. Footer Keybindings Help with NerdFont Glyphs
 	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [f] Full PR Sync  |  [d] Delete Archived  |  [q] Quit",
+		"[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [b] Switch Branch  |  [p] Push/PR  |  [d] Delete Archived  |  [q] Quit",
 	)
 
 	return header + "\n" + mainView + "\n" + footer
@@ -444,20 +474,24 @@ func (m Model) View() string {
 func renderStatusBadge(item *git.RepoItem) string {
 	switch item.Status {
 	case git.StatusUpToDate:
-		return badgeUpToDate.Render("✓")
+		return badgeUpToDate.Render(iconSuccess)
 	case git.StatusUpdated:
-		return badgeUpdated.Render("✓")
+		return badgeUpdated.Render(iconSuccess)
+	case git.StatusStashedApplied:
+		return badgeStash.Render(iconStash)
+	case git.StatusSwitchedDefault:
+		return badgeUpToDate.Render(iconSwitch)
 	case git.StatusRebased:
-		return badgeRebased.Render("🔄")
-	case git.StatusStashedPR:
-		return badgeStashedPR.Render("🔗")
+		return badgeRebased.Render(iconRebase)
+	case git.StatusPRCreated:
+		return badgePR.Render(iconPR)
 	case git.StatusError, git.StatusRebaseConflict:
-		return badgeError.Render("✗")
+		return badgeError.Render(iconError)
 	case git.StatusArchived:
-		return badgeArchived.Render("🗑️")
+		return badgeArchived.Render(iconTrash)
 	case git.StatusSyncing:
-		return badgeSyncing.Render("⏳")
+		return badgeSyncing.Render(iconSyncing)
 	default:
-		return lipgloss.NewStyle().Foreground(colorMuted).Render("•")
+		return lipgloss.NewStyle().Foreground(colorMuted).Render(iconPending)
 	}
 }

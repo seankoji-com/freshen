@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -14,16 +13,18 @@ import (
 type RepoStatus string
 
 const (
-	StatusPending        RepoStatus = "PENDING"
-	StatusSyncing        RepoStatus = "SYNCING"
-	StatusUpToDate       RepoStatus = "UP_TO_DATE"
-	StatusUpdated        RepoStatus = "UPDATED"
-	StatusRebased        RepoStatus = "REBASED"
-	StatusRebaseConflict RepoStatus = "REBASE_CONFLICT"
-	StatusStashedPR      RepoStatus = "STASHED_PR"
-	StatusCloned         RepoStatus = "CLONED"
-	StatusArchived       RepoStatus = "ARCHIVED"
-	StatusError          RepoStatus = "ERROR"
+	StatusPending         RepoStatus = "PENDING"
+	StatusSyncing         RepoStatus = "SYNCING"
+	StatusUpToDate        RepoStatus = "UP_TO_DATE"
+	StatusUpdated         RepoStatus = "UPDATED"
+	StatusStashedApplied  RepoStatus = "STASHED_APPLIED"
+	StatusSwitchedDefault RepoStatus = "SWITCHED_DEFAULT"
+	StatusRebased         RepoStatus = "REBASED"
+	StatusRebaseConflict  RepoStatus = "REBASE_CONFLICT"
+	StatusPRCreated       RepoStatus = "PR_CREATED"
+	StatusCloned          RepoStatus = "CLONED"
+	StatusArchived        RepoStatus = "ARCHIVED"
+	StatusError           RepoStatus = "ERROR"
 )
 
 type GHRepoInfo struct {
@@ -34,19 +35,22 @@ type GHRepoInfo struct {
 }
 
 type RepoItem struct {
-	Name          string
-	GHRepoName    string
-	Path          string
-	IsArchived    bool
-	IsNew         bool
-	CurrentBranch string
-	DefaultBranch string
-	Status        RepoStatus
-	StatusMsg     string
-	Stashed       bool
-	DraftPRURL    string
-	Logs          []string
-	ErrorErr      error
+	Name               string
+	GHRepoName         string
+	Path               string
+	IsArchived         bool
+	IsNew              bool
+	CurrentBranch      string
+	OriginalBranch     string
+	DefaultBranch      string
+	HasUnstagedChanges bool
+	ExistingPRURL      string
+	Status             RepoStatus
+	StatusMsg          string
+	Stashed            bool
+	DraftPRURL         string
+	Logs               []string
+	ErrorErr           error
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
@@ -88,6 +92,21 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 	}
 
 	return repos, nil
+}
+
+// FetchExistingPRURL checks if an open PR exists on GitHub for the given branch.
+func FetchExistingPRURL(repoPath, branch string) string {
+	if branch == "" || branch == "HEAD" {
+		return ""
+	}
+	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
+	cmd.Dir = repoPath
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		return strings.TrimSpace(out.String())
+	}
+	return ""
 }
 
 // IsGitRepo checks if a directory is a valid git working tree.
@@ -148,215 +167,220 @@ func GetDefaultBranch(path string) string {
 	return GetOriginalBranch(path)
 }
 
-// SyncRepository performs branch-selective workflow:
-// 1. Repos on default branch -> Full sync (stash -> pull default -> stash apply -> draft PR if stashed)
-// 2. Repos on feature branch with NO unstaged changes -> Switch back to default branch & pull
-// 3. Repos on feature branch WITH unstaged changes -> Fetch origin & rebase onto default branch
-func SyncRepository(item *RepoItem, forceFullSync bool) {
+// SyncRepository performs the exact branch workflow:
+// A. If on DEFAULT branch:
+//   - No unstaged changes: git pull, done.
+//   - Unstaged changes: git add . && git stash && git pull && git stash apply, done.
+// B. If on DIFFERENT branch:
+//   - Fetch link to any existing open PR.
+//   - No unstaged changes: checkout default branch, git pull, done. (Option in TUI to switch back with 'b')
+//   - Unstaged changes: git fetch && git rebase to default branch. (Option in TUI to commit/push PR with 'p')
+func SyncRepository(item *RepoItem) {
 	item.Status = StatusSyncing
-	item.Logs = append(item.Logs, fmt.Sprintf("[%s] Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
+	item.Logs = append(item.Logs, fmt.Sprintf("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
 
 	origBranch := GetOriginalBranch(item.Path)
+	item.OriginalBranch = origBranch
 	item.CurrentBranch = origBranch
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
 
-	item.Logs = append(item.Logs, fmt.Sprintf("Current branch: %s | Default branch: %s", origBranch, defaultBranch))
+	// Check if an open PR exists for this feature branch
+	if origBranch != defaultBranch {
+		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
+		if item.ExistingPRURL != "" {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Existing Open PR found: %s", item.ExistingPRURL))
+		}
+	}
 
-	// Check if working tree has unstaged/uncommitted changes
+	// Check for unstaged / uncommitted changes
 	isDirtyCmd := exec.Command("git", "-C", item.Path, "status", "--porcelain")
 	var dirtyOut bytes.Buffer
 	isDirtyCmd.Stdout = &dirtyOut
 	_ = isDirtyCmd.Run()
-	hasDirtyChanges := strings.TrimSpace(dirtyOut.String()) != ""
+	hasUnstagedChanges := strings.TrimSpace(dirtyOut.String()) != ""
+	item.HasUnstagedChanges = hasUnstagedChanges
 
-	// Branch Logic Condition: Not on default branch & not forcing full sync
-	if origBranch != defaultBranch && !forceFullSync {
-		if hasDirtyChanges {
-			// Sub-case: Feature branch HAS unstaged changes -> fetch origin & rebase to default
-			item.Logs = append(item.Logs, fmt.Sprintf("Branch '%s' has unstaged changes. Executing git fetch origin and git rebase origin/%s...", origBranch, defaultBranch))
+	item.Logs = append(item.Logs, fmt.Sprintf(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges))
 
-			fetchCmd := exec.Command("git", "-C", item.Path, "fetch", "origin")
-			if err := fetchCmd.Run(); err != nil {
-				item.Logs = append(item.Logs, fmt.Sprintf("git fetch error: %v", err))
-			}
-
-			rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
-			rebaseCmd := exec.Command("git", "-C", item.Path, "rebase", rebaseTarget)
-			var rebaseOut bytes.Buffer
-			rebaseCmd.Stdout = &rebaseOut
-			rebaseCmd.Stderr = &rebaseOut
-
-			if err := rebaseCmd.Run(); err == nil {
-				item.Status = StatusRebased
-				item.StatusMsg = fmt.Sprintf("Rebased (%s)", origBranch)
-				item.Logs = append(item.Logs, fmt.Sprintf("✓ Rebased '%s' onto '%s'. Hit 'f' for full PR sync.", origBranch, rebaseTarget))
-			} else {
-				_ = exec.Command("git", "-C", item.Path, "rebase", "--abort").Run()
-				item.Status = StatusRebaseConflict
-				item.StatusMsg = fmt.Sprintf("Rebase Conflict (%s)", origBranch)
-				item.Logs = append(item.Logs, fmt.Sprintf("✗ Rebase conflict on %s: %s", origBranch, rebaseOut.String()))
-			}
-			return
-		} else {
-			// Sub-case: Feature branch HAS NO unstaged changes -> switch back to default and pull
-			item.Logs = append(item.Logs, fmt.Sprintf("Branch '%s' is clean with no unstaged changes. Switching back to '%s' and pulling...", origBranch, defaultBranch))
-
-			coCmd := exec.Command("git", "-C", item.Path, "checkout", defaultBranch)
-			if err := coCmd.Run(); err != nil {
-				item.Status = StatusError
-				item.StatusMsg = fmt.Sprintf("Checkout failed (%s)", defaultBranch)
-				item.Logs = append(item.Logs, fmt.Sprintf("✗ Error checking out default branch '%s': %v", defaultBranch, err))
-				return
-			}
-			item.CurrentBranch = defaultBranch
-
+	// =========================================================================
+	// CASE A: Repository is on DEFAULT branch
+	// =========================================================================
+	if origBranch == defaultBranch {
+		if !hasUnstagedChanges {
+			// A1: No unstaged changes -> git pull, done.
+			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (clean). Running git pull...", defaultBranch))
 			pullCmd := exec.Command("git", "-C", item.Path, "pull")
 			var pullOut bytes.Buffer
 			pullCmd.Stdout = &pullOut
 			pullCmd.Stderr = &pullOut
 			if err := pullCmd.Run(); err == nil {
-				isUpToDate := strings.Contains(pullOut.String(), "Already up to date.")
-				if isUpToDate {
+				if strings.Contains(pullOut.String(), "Already up to date.") {
 					item.Status = StatusUpToDate
-					item.StatusMsg = fmt.Sprintf("Up to date (%s)", defaultBranch)
+					item.StatusMsg = fmt.Sprintf("󰄬 Up to date (%s)", defaultBranch)
 				} else {
 					item.Status = StatusUpdated
-					item.StatusMsg = fmt.Sprintf("Updated (%s)", defaultBranch)
+					item.StatusMsg = fmt.Sprintf("󰄬 Updated (%s)", defaultBranch)
 				}
-				item.Logs = append(item.Logs, fmt.Sprintf("✓ Successfully switched to '%s' and pulled latest changes.", defaultBranch))
+				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s'.", defaultBranch))
 			} else {
 				item.Status = StatusError
-				item.StatusMsg = "Pull Failed"
-				item.Logs = append(item.Logs, fmt.Sprintf("✗ git pull error: %s", pullOut.String()))
+				item.StatusMsg = "󰅙 Pull Failed"
+				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
+			}
+			return
+		} else {
+			// A2: Unstaged changes -> git add . && git stash && git pull && git stash apply, done.
+			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull && git stash apply...", defaultBranch))
+
+			_ = exec.Command("git", "-C", item.Path, "add", ".").Run()
+			stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
+			stashCmd := exec.Command("git", "-C", item.Path, "stash", "push", "-m", stashMsg)
+			if err := stashCmd.Run(); err != nil {
+				item.Status = StatusError
+				item.StatusMsg = "󰅙 Stash Error"
+				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to stash local changes: %v", err))
+				return
+			}
+			item.Stashed = true
+
+			pullCmd := exec.Command("git", "-C", item.Path, "pull")
+			_ = pullCmd.Run()
+
+			applyCmd := exec.Command("git", "-C", item.Path, "stash", "apply")
+			if err := applyCmd.Run(); err == nil {
+				item.Status = StatusStashedApplied
+				item.StatusMsg = fmt.Sprintf("󰏖 Stash Applied (%s)", defaultBranch)
+				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch))
+			} else {
+				item.Status = StatusError
+				item.StatusMsg = "󰅙 Stash Apply Conflict"
+				item.Logs = append(item.Logs, "󰅙 Conflict occurred while applying stash!")
 			}
 			return
 		}
 	}
 
-	// Full Sync Workflow (For repos on default branch OR when forceFullSync is true)
-	item.Logs = append(item.Logs, "Executing full sync workflow (stash -> checkout default -> pull -> stash apply -> draft PR)...")
+	// =========================================================================
+	// CASE B: Repository is on DIFFERENT branch (origBranch != defaultBranch)
+	// =========================================================================
+	if !hasUnstagedChanges {
+		// B1: No unstaged changes -> checkout default branch, git pull, done.
+		// (Option in TUI: Press 'b' to switch back to origBranch)
+		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull...", origBranch, defaultBranch))
 
-	// Step 1: Check for uncommitted changes & Stash
-	stashed := false
-	if hasDirtyChanges {
-		item.Logs = append(item.Logs, "Uncommitted changes detected. Stashing local working tree...")
-		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
-		stashCmd := exec.Command("git", "-C", item.Path, "stash", "push", "--include-untracked", "-m", stashMsg)
-		if err := stashCmd.Run(); err == nil {
-			stashed = true
-			item.Stashed = true
-			item.Logs = append(item.Logs, "✓ Local changes stashed successfully.")
-		} else {
-			item.Logs = append(item.Logs, "✗ Failed to stash local changes!")
-		}
-	}
-
-	// Step 2: Switch to default branch
-	if origBranch != defaultBranch {
-		item.Logs = append(item.Logs, fmt.Sprintf("Switching branch from '%s' to '%s'...", origBranch, defaultBranch))
 		coCmd := exec.Command("git", "-C", item.Path, "checkout", defaultBranch)
 		if err := coCmd.Run(); err != nil {
 			item.Status = StatusError
-			item.StatusMsg = fmt.Sprintf("Checkout failed (%s)", defaultBranch)
-			item.Logs = append(item.Logs, fmt.Sprintf("✗ Error checking out default branch '%s': %v", defaultBranch, err))
+			item.StatusMsg = fmt.Sprintf("󰅙 Checkout Failed (%s)", defaultBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to checkout '%s': %v", defaultBranch, err))
 			return
 		}
 		item.CurrentBranch = defaultBranch
-	}
 
-	// Step 3: Pull latest changes
-	item.Logs = append(item.Logs, fmt.Sprintf("Pulling latest changes on '%s'...", defaultBranch))
-	pullCmd := exec.Command("git", "-C", item.Path, "pull")
-	var pullOut bytes.Buffer
-	pullCmd.Stdout = &pullOut
-	pullCmd.Stderr = &pullOut
-	pullErr := pullCmd.Run()
+		pullCmd := exec.Command("git", "-C", item.Path, "pull")
+		var pullOut bytes.Buffer
+		pullCmd.Stdout = &pullOut
+		pullCmd.Stderr = &pullOut
+		if err := pullCmd.Run(); err == nil {
+			item.Status = StatusSwitchedDefault
+			item.StatusMsg = fmt.Sprintf("󰄬 Switched to %s & Pulled", defaultBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched from '%s' to '%s' and pulled. (Press 'b' to switch back to '%s')", origBranch, defaultBranch, origBranch))
+		} else {
+			item.Status = StatusError
+			item.StatusMsg = "󰅙 Pull Failed"
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
+		}
+		return
+	} else {
+		// B2: Unstaged changes -> git fetch and rebase to default branch.
+		// (Option in TUI: Press 'p' to commit & push to raise new/existing PR and switch back to default)
+		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch))
 
-	pullOutputStr := strings.TrimSpace(pullOut.String())
-	if pullOutputStr != "" {
-		item.Logs = append(item.Logs, fmt.Sprintf("git pull output: %s", pullOutputStr))
-	}
+		_ = exec.Command("git", "-C", item.Path, "fetch", "origin").Run()
+		rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
+		rebaseCmd := exec.Command("git", "-C", item.Path, "rebase", rebaseTarget)
+		var rebaseOut bytes.Buffer
+		rebaseCmd.Stdout = &rebaseOut
+		rebaseCmd.Stderr = &rebaseOut
 
-	if pullErr != nil {
-		item.Status = StatusError
-		item.StatusMsg = "Pull Failed"
-		item.Logs = append(item.Logs, fmt.Sprintf("✗ git pull error: %v", pullErr))
+		if err := rebaseCmd.Run(); err == nil {
+			item.Status = StatusRebased
+			item.StatusMsg = fmt.Sprintf("󰚰 Rebased (%s)", origBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Rebased '%s' onto '%s'. (Press 'p' to commit, push/PR & switch to %s)", origBranch, rebaseTarget, defaultBranch))
+		} else {
+			_ = exec.Command("git", "-C", item.Path, "rebase", "--abort").Run()
+			item.Status = StatusRebaseConflict
+			item.StatusMsg = fmt.Sprintf("󰅙 Rebase Conflict (%s)", origBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Rebase conflict: %s", rebaseOut.String()))
+		}
 		return
 	}
+}
 
-	isUpToDate := strings.Contains(pullOutputStr, "Already up to date.")
+// SwitchBranch switches checkout to target branch.
+func SwitchBranch(item *RepoItem, targetBranch string) error {
+	cmd := exec.Command("git", "-C", item.Path, "checkout", targetBranch)
+	if err := cmd.Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch to branch '%s': %v", targetBranch, err))
+		return err
+	}
+	item.CurrentBranch = targetBranch
+	item.StatusMsg = fmt.Sprintf("󰁨 Switched to %s", targetBranch)
+	item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched branch to '%s'.", targetBranch))
+	return nil
+}
 
-	// Step 4: Stash Apply & Draft PR Creation
-	if stashed {
-		item.Logs = append(item.Logs, "Applying stashed changes onto pulled default branch...")
-		applyCmd := exec.Command("git", "-C", item.Path, "stash", "apply")
-		if err := applyCmd.Run(); err != nil {
-			item.Status = StatusError
-			item.StatusMsg = "Stash Conflict"
-			item.Logs = append(item.Logs, "✗ Conflict occurred while applying stash!")
-			return
-		}
-		item.Logs = append(item.Logs, "✓ Stashed changes applied successfully.")
-
-		// Step 5: Draft PR Creation
-		// How Draft PR works on default branch:
-		// Since we cannot push directly to main to create a PR, we create a feature branch `draft/<branch>-<timestamp>`,
-		// commit the stashed changes to that feature branch, push to origin, and run `gh pr create --draft --base defaultBranch --head draft/...`.
-		restoredDirty := exec.Command("git", "-C", item.Path, "status", "--porcelain")
-		var restoredOut bytes.Buffer
-		restoredDirty.Stdout = &restoredOut
-		_ = restoredDirty.Run()
-
-		if strings.TrimSpace(restoredOut.String()) != "" {
-			item.Logs = append(item.Logs, "Creating draft pull request for stashed changes...")
-			timestamp := time.Now().Format("20060102-150405")
-			cleanBranch := sanitizeBranchName(origBranch)
-			prBranch := fmt.Sprintf("draft/%s-%s", cleanBranch, timestamp)
-
-			item.Logs = append(item.Logs, fmt.Sprintf("Creating feature branch '%s' for PR...", prBranch))
-			coBranchCmd := exec.Command("git", "-C", item.Path, "checkout", "-b", prBranch)
-			if err := coBranchCmd.Run(); err == nil {
-				_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
-				commitMsg := fmt.Sprintf("WIP: Restored stashed changes from branch '%s'", origBranch)
-				_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
-
-				item.Logs = append(item.Logs, fmt.Sprintf("Pushing branch '%s' to origin...", prBranch))
-				pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", prBranch)
-				if err := pushCmd.Run(); err == nil {
-					prTitle := fmt.Sprintf("WIP: Stashed changes (%s)", origBranch)
-					prBody := fmt.Sprintf("Draft pull request automatically generated by freshen after pulling %s.", defaultBranch)
-					prCmd := exec.Command("gh", "pr", "create", "--draft", "--base", defaultBranch, "--head", prBranch, "--title", prTitle, "--body", prBody)
-					prCmd.Dir = item.Path
-					var prOut bytes.Buffer
-					prCmd.Stdout = &prOut
-					prCmd.Stderr = &prOut
-
-					if err := prCmd.Run(); err == nil {
-						prURL := strings.TrimSpace(prOut.String())
-						item.DraftPRURL = prURL
-						item.Status = StatusStashedPR
-						item.StatusMsg = "Draft PR Created"
-						item.Logs = append(item.Logs, fmt.Sprintf("✓ Draft PR created successfully: %s", prURL))
-						return
-					} else {
-						item.Logs = append(item.Logs, fmt.Sprintf("✗ gh pr create error: %s", prOut.String()))
-					}
-				} else {
-					item.Logs = append(item.Logs, fmt.Sprintf("✗ Failed to push branch '%s' to origin", prBranch))
-				}
-			}
-		}
+// CommitPushPRAndSwitchDefault commits unstaged changes, pushes to origin, creates/updates PR, and switches back to default branch.
+func CommitPushPRAndSwitchDefault(item *RepoItem) error {
+	branch := item.OriginalBranch
+	if branch == "" || branch == item.DefaultBranch {
+		return fmt.Errorf("cannot raise PR from default branch")
 	}
 
-	if isUpToDate {
-		item.Status = StatusUpToDate
-		item.StatusMsg = "Up to date"
+	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
+
+	// Stage and commit changes
+	_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
+	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
+	_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
+
+	// Push branch to origin
+	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
+	if err := pushCmd.Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
+		return err
+	}
+
+	// Create PR using gh CLI if no existing PR
+	if item.ExistingPRURL == "" {
+		prCmd := exec.Command("gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
+		prCmd.Dir = item.Path
+		var prOut bytes.Buffer
+		prCmd.Stdout = &prOut
+		prCmd.Stderr = &prOut
+		if err := prCmd.Run(); err == nil {
+			prURL := strings.TrimSpace(prOut.String())
+			item.DraftPRURL = prURL
+			item.ExistingPRURL = prURL
+			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 PR created: %s", prURL))
+		} else {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create notice: %s", prOut.String()))
+		}
 	} else {
-		item.Status = StatusUpdated
-		item.StatusMsg = "Updated"
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
-	item.Logs = append(item.Logs, fmt.Sprintf("[%s] Sync finished for %s", time.Now().Format("15:04:05"), item.Name))
+
+	// Switch back to default branch
+	coCmd := exec.Command("git", "-C", item.Path, "checkout", item.DefaultBranch)
+	if err := coCmd.Run(); err == nil {
+		item.CurrentBranch = item.DefaultBranch
+		item.Status = StatusPRCreated
+		item.StatusMsg = fmt.Sprintf("󰏫 PR Raised & Switched to %s", item.DefaultBranch)
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
+	}
+
+	return nil
 }
 
 // CloneRepo clones a repository from GitHub organization into local path.
@@ -384,9 +408,4 @@ func ScanLocalDirectory(targetDir string) ([]string, error) {
 		}
 	}
 	return dirs, nil
-}
-
-func sanitizeBranchName(branch string) string {
-	reg := regexp.MustCompile(`[^a-zA-Z0-9\-_]+`)
-	return reg.ReplaceAllString(branch, "-")
 }
