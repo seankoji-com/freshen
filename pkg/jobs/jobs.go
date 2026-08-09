@@ -210,6 +210,11 @@ func mergeRunners(newRunners []*RunnerItem, existing []*RunnerItem, jobQueue []*
 		}
 	}
 
+	// Always list runners in strict alphabetical order by name
+	sort.Slice(newRunners, func(i, j int) bool {
+		return strings.ToLower(newRunners[i].Name) < strings.ToLower(newRunners[j].Name)
+	})
+
 	return newRunners
 }
 
@@ -223,7 +228,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 		// Single query for latest workflow runs per repo (includes both in_progress and queued)
 		args := []string{
 			"api",
-			fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=10", org, repo),
+			fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=25", org, repo),
 		}
 		cmd := exec.Command("gh", args...)
 		var out bytes.Buffer

@@ -1742,7 +1742,20 @@ func (m Model) View() string {
 
 	// ------------------ PANEL 3: OVERALL JOB QUEUE ------------------
 	var jobsLines []string
-	jobHeader := fmt.Sprintf(" %s %s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"))
+	runningCount := 0
+	queuedCount := 0
+	for _, j := range m.JobQueue {
+		if j.Status == jobs.JobRunning {
+			runningCount++
+		} else if j.Status == jobs.JobQueued {
+			queuedCount++
+		}
+	}
+	countsStr := ""
+	if runningCount > 0 || queuedCount > 0 {
+		countsStr = fmt.Sprintf(" (%d running, %d queued)", runningCount, queuedCount)
+	}
+	jobHeader := fmt.Sprintf(" %s %s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
 	jobsLines = append(jobsLines, jobHeader)
 	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
 
