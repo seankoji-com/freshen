@@ -50,7 +50,7 @@ var (
 	colorYellow    = lipgloss.Color("#F59E0B") // Warm Amber
 	colorRed       = lipgloss.Color("#EF4444") // Coral Red
 	colorBlue      = lipgloss.Color("#3B82F6") // Bright Blue
-	colorMuted     = lipgloss.Color("#6C7086") // Muted Slate
+	colorMuted     = lipgloss.Color("#6C7086") // Muted Slate Grey
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -370,7 +370,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.triggerTabFetch()
 
 		case "X":
-			// Shortcut: Delete all local non-default branches & prune worktrees for selected repo
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
@@ -409,7 +408,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "b":
-			// Toggle / Switch between feature branch and default branch
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				target := item.OriginalBranch
@@ -438,14 +436,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "d":
-			// Shortcut: Delete selected archived repo from disk & immediately remove from list
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
 					deletedName := item.Name
 
-					// Remove from slice instantly
 					m.Repos = append(m.Repos[:m.SelectedIndex], m.Repos[m.SelectedIndex+1:]...)
 					m.TotalCount = len(m.Repos)
 
@@ -459,7 +455,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "D":
-			// Shortcut: Delete ALL archived repos from disk & immediately remove from list
 			deletedTotal := 0
 			var activeRepos []*git.RepoItem
 			for _, item := range m.Repos {
@@ -564,15 +559,25 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	// Header metadata
+	// Header metadata with styled counts
+	prCountStr := lipgloss.NewStyle().Foreground(colorMuted).Render("0 open")
+	if item.OpenPRsCount > 0 {
+		prCountStr = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d open", item.OpenPRsCount))
+	}
+
+	issueCountStr := lipgloss.NewStyle().Foreground(colorMuted).Render("0 open")
+	if item.OpenIssuesCount > 0 {
+		issueCountStr = lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d open", item.OpenIssuesCount))
+	}
+
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.Name)))
 	sb.WriteString(fmt.Sprintf("%s %s %s | %s %s (Default: %s)\n",
 		lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL:"), iconFolder, item.Path,
 		iconBranch, item.CurrentBranch, item.DefaultBranch,
 	))
-	sb.WriteString(fmt.Sprintf("%s %s  |  %s %d open  |  %s %d open\n\n",
+	sb.WriteString(fmt.Sprintf("%s %s  |  %s %s  |  %s %s\n\n",
 		lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:"), item.StatusMsg,
-		iconPR, item.OpenPRsCount, iconIssue, item.OpenIssuesCount,
+		iconPR, prCountStr, iconIssue, issueCountStr,
 	))
 
 	// Tab Bar Header
@@ -731,7 +736,7 @@ func (m Model) View() string {
 
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
-	
+
 	// Exact Column Alignment Header Matching Data Row Prefixes
 	headerPrefix := "   "
 	tableHeader := fmt.Sprintf("%s%-22s %-12s %-20s %5s %7s", headerPrefix, "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
@@ -754,18 +759,26 @@ func (m Model) View() string {
 				branchCell = "-"
 			}
 			branchCell = truncateString(branchCell, 20)
-			
-			prsCell := "-"
+
+			// Render PRs Count: Grey '-' for zero counts, yellow bold for >0 counts
+			prsStyle := lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
+			var prsCell string
 			if item.OpenPRsCount > 0 {
-				prsCell = fmt.Sprintf("%d", item.OpenPRsCount)
+				prsCell = prsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
+			} else {
+				prsCell = prsStyle.Foreground(colorMuted).Render("-")
 			}
 
-			issuesCell := "-"
+			// Render ISSUES Count: Grey '-' for zero counts, blue bold for >0 counts
+			issuesStyle := lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
+			var issuesCell string
 			if item.OpenIssuesCount > 0 {
-				issuesCell = fmt.Sprintf("%d", item.OpenIssuesCount)
+				issuesCell = issuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
+			} else {
+				issuesCell = issuesStyle.Foreground(colorMuted).Render("-")
 			}
 
-			line := fmt.Sprintf("%s %-22s %-12s %-20s %5s %7s",
+			line := fmt.Sprintf("%s %-22s %-12s %-20s %s %s",
 				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
 			)
 
