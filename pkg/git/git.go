@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -80,6 +81,7 @@ type RepoItem struct {
 	Name               string
 	GHRepoName         string
 	Path               string
+	URL                string
 	IsArchived         bool
 	IsNew              bool
 	CurrentBranch      string
@@ -93,6 +95,8 @@ type RepoItem struct {
 	PRsList            []PRItem
 	HasLoadedIssues    bool
 	HasLoadedPRs       bool
+	IsLoadingIssues    bool
+	IsLoadingPRs       bool
 	BranchDetails      BranchWorktreeDetails
 	Status             RepoStatus
 	StatusMsg          string
@@ -270,19 +274,22 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 	return deletedCount, nil
 }
 
-// FetchOpenIssuesList retrieves open GitHub issues for a repository.
+// FetchOpenIssuesList retrieves open GitHub issues with a 6-second timeout context.
 func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.Command("gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
+	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return []IssueItem{}, err
+		return nil, err
 	}
 
 	var issues []IssueItem
 	if err := json.Unmarshal(out.Bytes(), &issues); err != nil {
-		return []IssueItem{}, err
+		return nil, err
 	}
 	if issues == nil {
 		issues = []IssueItem{}
@@ -290,19 +297,22 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	return issues, nil
 }
 
-// FetchOpenPRsList retrieves open GitHub pull requests for a repository.
+// FetchOpenPRsList retrieves open GitHub pull requests with a 6-second timeout context.
 func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.Command("gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return []PRItem{}, err
+		return nil, err
 	}
 
 	var prs []PRItem
 	if err := json.Unmarshal(out.Bytes(), &prs); err != nil {
-		return []PRItem{}, err
+		return nil, err
 	}
 	if prs == nil {
 		prs = []PRItem{}
