@@ -220,10 +220,15 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 	return details
 }
 
-// PruneBranchesAndWorktrees deletes non-default local branches and prunes worktrees.
+// PruneBranchesAndWorktrees runs git fetch --prune, git worktree prune, and deletes local non-default branches.
 func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
+	// 1. Fetch & prune deleted remote-tracking references from origin
+	_ = exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run()
+
+	// 2. Prune stale worktrees
 	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
 
+	// 3. Delete local non-default branches
 	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
 	var out bytes.Buffer
 	cmd.Stdout = &out
