@@ -397,6 +397,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			if counts, found := orgCounts[ghRepo.Name]; found {
 				item.OpenIssuesCount = counts.Issues
 				item.OpenPRsCount = counts.PRs
+				item.HasLoadedCounts = true
 			}
 
 			if ghRepo.IsArchived {
@@ -425,6 +426,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 					if counts, found := orgCounts[item.GHRepoName]; found {
 						item.OpenIssuesCount = counts.Issues
 						item.OpenPRsCount = counts.PRs
+						item.HasLoadedCounts = true
 					}
 
 					repoMap[name] = item
@@ -1606,11 +1608,22 @@ func (m *Model) updateViewport() {
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
 
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
-			if len(item.BranchDetails.Branches) == 0 {
+			localBranches := item.BranchDetails.GetLocalBranches()
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local Branches:") + "\n")
+			if len(localBranches) == 0 {
 				sb.WriteString("  (None found)\n")
 			} else {
-				for _, b := range item.BranchDetails.Branches {
+				for _, b := range localBranches {
+					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+				}
+			}
+
+			remoteBranches := item.BranchDetails.GetRemoteBranches()
+			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(" Remote Branches:") + "\n")
+			if len(remoteBranches) == 0 {
+				sb.WriteString("  (None found)\n")
+			} else {
+				for _, b := range remoteBranches {
 					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
 				}
 			}
@@ -1901,17 +1914,21 @@ func (m Model) View() string {
 			branchCell := dynCellBranchStyle.Render(branchStyle.Render(displayText))
 
 			var prsCell string
-			if item.OpenPRsCount > 0 {
+			if !item.HasLoadedCounts && !item.HasLoadedPRs {
+				prsCell = cellPRsStyle.Foreground(colorMuted).Render("?")
+			} else if item.OpenPRsCount > 0 {
 				prsCell = cellPRsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
 			} else {
-				prsCell = cellPRsStyle.Foreground(colorMuted).Render("-")
+				prsCell = cellPRsStyle.Foreground(colorMuted).Render("—")
 			}
 
 			var issuesCell string
-			if item.OpenIssuesCount > 0 {
+			if !item.HasLoadedCounts && !item.HasLoadedIssues {
+				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("?")
+			} else if item.OpenIssuesCount > 0 {
 				issuesCell = cellIssuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
 			} else {
-				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("-")
+				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("—")
 			}
 
 			line := fmt.Sprintf("%s%s %s %s %s", statusIconStr, nameCell, branchCell, prsCell, issuesCell)

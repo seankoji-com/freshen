@@ -335,7 +335,6 @@ func TestHyperlinksInView(t *testing.T) {
 		t.Errorf("expected FocusJobs header to contain valid OSC 8 hyperlink for Job ID")
 	}
 }
-
 func TestIssue37Fixes(t *testing.T) {
 	m := NewModel("/tmp/test", "test-org")
 	m.Width = 120
@@ -361,5 +360,86 @@ func TestIssue37Fixes(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "feat/long-branch") {
 		t.Errorf("expected View to contain extended branch name, got:\n%s", view)
+	}
+}
+
+func TestRepoTableCountsDifferentiation(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 120
+	m.Height = 40
+	m.IsOrgSyncing = false
+	m.ActiveFocus = FocusRepos
+
+	m.Repos = []*git.RepoItem{
+		{
+			Name:            "repo-loading",
+			GHRepoName:      "repo-loading",
+			HasLoadedCounts: false,
+			HasLoadedPRs:    false,
+			HasLoadedIssues: false,
+		},
+		{
+			Name:            "repo-zero",
+			GHRepoName:      "repo-zero",
+			HasLoadedCounts: true,
+			OpenPRsCount:    0,
+			OpenIssuesCount: 0,
+		},
+		{
+			Name:            "repo-counts",
+			GHRepoName:      "repo-counts",
+			HasLoadedCounts: true,
+			OpenPRsCount:    5,
+			OpenIssuesCount: 12,
+		},
+	}
+
+	viewContent := m.View()
+	if !strings.Contains(viewContent, "?") {
+		t.Errorf("expected view to contain '?' for loading counts, got:\n%s", viewContent)
+	}
+	if !strings.Contains(viewContent, "—") {
+		t.Errorf("expected view to contain '—' (em-dash) for confirmed zero counts, got:\n%s", viewContent)
+	}
+	if !strings.Contains(viewContent, "5") {
+		t.Errorf("expected view to contain formatted number 5, got:\n%s", viewContent)
+	}
+}
+
+func TestTabBranchesGroupedRendering(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 120
+	m.Height = 40
+	m.IsOrgSyncing = false
+	m.ActiveFocus = FocusRepos
+	m.ActiveTab = TabBranches
+
+	m.Repos = []*git.RepoItem{
+		{
+			Name:          "test-repo",
+			GHRepoName:    "test-repo",
+			CurrentBranch: "main",
+			DefaultBranch: "main",
+			BranchDetails: git.BranchWorktreeDetails{
+				Branches: []string{
+					"* main",
+					"feature-abc",
+					"remotes/origin/HEAD -> origin/main",
+					"remotes/origin/main",
+					"remotes/origin/feature-abc",
+				},
+				Worktrees: []string{"/tmp/test/test-repo  [main]"},
+			},
+		},
+	}
+
+	m.updateViewport()
+	viewContent := m.Viewport.View()
+
+	if !strings.Contains(viewContent, "Local Branches:") {
+		t.Errorf("expected Viewport to contain 'Local Branches:' header, got:\n%s", viewContent)
+	}
+	if !strings.Contains(viewContent, "Remote Branches:") {
+		t.Errorf("expected Viewport to contain 'Remote Branches:' header, got:\n%s", viewContent)
 	}
 }
