@@ -127,6 +127,13 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorSecondary).
 			Padding(0, 1)
+
+	// Explicit Column Width Styles for Pixel-Perfect Table Alignment
+	cellNameStyle   = lipgloss.NewStyle().Width(22)
+	cellStatusStyle = lipgloss.NewStyle().Width(12)
+	cellBranchStyle = lipgloss.NewStyle().Width(20)
+	cellPRsStyle    = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
+	cellIssuesStyle = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
 
 // --- Messages for Bubble Tea Update Loop ---
@@ -347,6 +354,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateViewport()
 			}
 
+		case "J", "ctrl+d", "pgdown":
+			// Scroll right viewport panel down
+			m.Viewport.LineDown(3)
+
+		case "K", "ctrl+u", "pgup":
+			// Scroll right viewport panel up
+			m.Viewport.LineUp(3)
+
 		case "right", "l", "tab":
 			m.ActiveTab = (m.ActiveTab + 1) % 4
 			m.updateViewport()
@@ -515,7 +530,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case orgSyncedMsg:
 		m.IsOrgSyncing = false
 		m.Repos = msg.repos
-		// Keep repositories sorted alphabetically
 		sort.Slice(m.Repos, func(i, j int) bool {
 			return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
 		})
@@ -582,9 +596,6 @@ func (m *Model) updateViewport() {
 		issueCountStr = lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d open", item.OpenIssuesCount))
 	}
 
-	// Clean Detail View Header format:
-	// REPOSITORY: careynas.net
-	// ~/repos/wiki.robot.house | main (default)
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.GHRepoName)))
 
 	branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
@@ -753,10 +764,17 @@ func (m Model) View() string {
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
 
-	// Exact Column Alignment Header Matching Data Row Prefixes
+	// Pixel-Perfect Column Header Layout
 	headerPrefix := "   "
-	tableHeader := fmt.Sprintf("%s%-22s %-12s %-20s %5s %7s", headerPrefix, "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
-	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(tableHeader) + "\n")
+	headerLine := fmt.Sprintf("%s%s %s %s %s %s",
+		headerPrefix,
+		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
+		cellStatusStyle.Bold(true).Foreground(colorPrimary).Render("STATUS"),
+		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
+		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
+		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
+	)
+	leftSb.WriteString(headerLine + "\n")
 	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("   --------------------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
@@ -767,30 +785,31 @@ func (m Model) View() string {
 		for i, item := range m.Repos {
 			statusIcon := renderStatusBadge(item)
 
-			nameCell := truncateString(item.Name, 22)
+			// 1. Name Cell
+			nameCell := cellNameStyle.Render(truncateString(item.Name, 22))
 
-			// Grey out "OK" status
-			statusStyle := lipgloss.NewStyle()
+			// 2. Status Cell
+			stStyle := cellStatusStyle
 			if item.StatusMsg == "OK" {
-				statusStyle = statusStyle.Foreground(colorMuted)
+				stStyle = stStyle.Foreground(colorMuted)
 			}
-			statusCell := statusStyle.Render(truncateString(item.StatusMsg, 12))
+			statusCell := stStyle.Render(truncateString(item.StatusMsg, 12))
 
-			// Grey out Default Branch names (main/master)
+			// 3. Branch Cell
+			brStyle := cellBranchStyle
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
-			branchStyle := lipgloss.NewStyle()
 			if branchStr == item.DefaultBranch || branchStr == "-" {
-				branchStyle = branchStyle.Foreground(colorMuted)
+				brStyle = brStyle.Foreground(colorMuted)
 			} else {
-				branchStyle = branchStyle.Foreground(lipgloss.Color("#CDD6F4")).Bold(true)
+				brStyle = brStyle.Foreground(lipgloss.Color("#CDD6F4")).Bold(true)
 			}
-			branchCell := branchStyle.Render(truncateString(branchStr, 20))
+			branchCell := brStyle.Render(truncateString(branchStr, 20))
 
-			// Render PRs Count: Grey '-' for zero counts, yellow bold for >0 counts
-			prsStyle := lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
+			// 4. PRs Count Cell
+			prsStyle := cellPRsStyle
 			var prsCell string
 			if item.OpenPRsCount > 0 {
 				prsCell = prsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
@@ -798,8 +817,8 @@ func (m Model) View() string {
 				prsCell = prsStyle.Foreground(colorMuted).Render("-")
 			}
 
-			// Render ISSUES Count: Grey '-' for zero counts, blue bold for >0 counts
-			issuesStyle := lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
+			// 5. Issues Count Cell
+			issuesStyle := cellIssuesStyle
 			var issuesCell string
 			if item.OpenIssuesCount > 0 {
 				issuesCell = issuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
@@ -807,7 +826,8 @@ func (m Model) View() string {
 				issuesCell = issuesStyle.Foreground(colorMuted).Render("-")
 			}
 
-			line := fmt.Sprintf("%s %-22s %-12s %-20s %s %s",
+			// Combine cells into a pixel-aligned table line
+			line := fmt.Sprintf("%s %s %s %s %s %s",
 				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
 			)
 
@@ -832,8 +852,8 @@ func (m Model) View() string {
 
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
-	// 3. Footer Keybindings Help with NerdFont Glyphs
-	footerText := "[↑/↓/j/k] Move  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
+	// 3. Footer Keybindings Help with Viewport Scroll Shortcuts
+	footerText := "[↑/↓/j/k] Move  |  [J/K] Scroll Pane  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
