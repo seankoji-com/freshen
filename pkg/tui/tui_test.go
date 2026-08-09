@@ -337,6 +337,7 @@ func TestHyperlinksInView(t *testing.T) {
 		t.Errorf("expected FocusJobs header to contain valid OSC 8 hyperlink for Job ID")
 	}
 }
+
 func TestIssue37Fixes(t *testing.T) {
 	m := NewModel("/tmp/test", "test-org")
 	m.Width = 120
