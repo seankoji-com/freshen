@@ -5,9 +5,114 @@ import (
 	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
+
+func TestFocusedRunViewportRendering(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 120
+	m.Height = 40
+	m.ActiveFocus = FocusJobs
+	m.SelectedJobIndex = 1
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "run-100", Name: "myrepo / ci", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, IsRunHeader: true, Event: "push", Branch: "main"},
+		{ID: "#101", Name: "myrepo / ci / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, Event: "push", Branch: "main", Duration: "1m 30s", RunnerName: "runner-1"},
+		{ID: "#102", Name: "myrepo / ci / test", Repo: "myrepo", Status: jobs.JobPassed, RunID: 100, Event: "push", Branch: "main", Duration: "45s", RunnerName: "runner-2"},
+		{ID: "#103", Name: "myrepo / ci / lint", Repo: "myrepo", Status: jobs.JobQueued, RunID: 100, Event: "push", Branch: "main", Duration: "-", RunnerName: ""},
+	}
+
+	// Test without focus - should show individual job details
+	m.FocusedRunID = 0
+	m.updateViewport()
+	unfocused := m.Viewport.View()
+	if strings.Contains(unfocused, "RUN SUMMARY") || strings.Contains(unfocused, "3 jobs") {
+		t.Errorf("unfocused viewport should not show run summary")
+	}
+	if !strings.Contains(unfocused, "Runner:") {
+		t.Errorf("unfocused viewport should show Runner field")
+	}
+
+	// Test with focus - should show run summary
+	m.FocusedRunID = 100
+	m.updateViewport()
+	focused := m.Viewport.View()
+	if !strings.Contains(focused, "RUN SUMMARY") {
+		t.Errorf("focused viewport should show 'RUN SUMMARY' header, got:\n%s", focused)
+	}
+	if !strings.Contains(focused, "3 jobs") {
+		t.Errorf("focused viewport should show '3 jobs' total")
+	}
+	if !strings.Contains(focused, "build") || !strings.Contains(focused, "test") || !strings.Contains(focused, "lint") {
+		t.Errorf("focused viewport should list all child jobs")
+	}
+	if !strings.Contains(focused, "1 running") {
+		t.Errorf("focused viewport should show count of running jobs")
+	}
+	if !strings.Contains(focused, "1 passed") {
+		t.Errorf("focused viewport should show count of passed jobs")
+	}
+	if !strings.Contains(focused, "1 queued") {
+		t.Errorf("focused viewport should show count of queued jobs")
+	}
+	if !strings.Contains(focused, "Press Enter or Esc to unfocus") {
+		t.Errorf("focused viewport should show unfocus instruction")
+	}
+}
+
+func TestEnterUnfocusesWhenFocusedRunMatches(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.ActiveFocus = FocusJobs
+	m.SelectedJobIndex = 0
+	m.FocusedRunID = 100
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100},
+	}
+
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	newModel, _ := m.Update(msg)
+	updated := newModel.(Model)
+
+	if updated.FocusedRunID != 0 {
+		t.Errorf("pressing Enter when FocusedRunID matches should unfocus (set to 0), got %d", updated.FocusedRunID)
+	}
+}
+
+func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.ActiveFocus = FocusJobs
+	m.SelectedJobIndex = 0
+	m.FocusedRunID = 0
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100},
+	}
+
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	newModel, _ := m.Update(msg)
+	updated := newModel.(Model)
+
+	if updated.FocusedRunID != 100 {
+		t.Errorf("pressing Enter should focus on the selected job's run (100), got %d", updated.FocusedRunID)
+	}
+}
+
+func TestEscUnfocusesRun(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.ActiveFocus = FocusJobs
+	m.FocusedRunID = 100
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100},
+	}
+
+	msg := tea.KeyMsg{Type: tea.KeyEsc}
+	newModel, _ := m.Update(msg)
+	updated := newModel.(Model)
+
+	if updated.FocusedRunID != 0 {
+		t.Errorf("pressing Esc should unfocus (set FocusedRunID to 0), got %d", updated.FocusedRunID)
+	}
+}
 
 func TestViewLineCountNeverExceedsTerminalHeight(t *testing.T) {
 	m := NewModel("/tmp/test", "test-org")
