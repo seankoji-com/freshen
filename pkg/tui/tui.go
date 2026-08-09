@@ -128,13 +128,14 @@ var (
 			Padding(0, 1)
 
 	// Explicit Column Width Styles for Table Alignment
-	cellNameStyle   = lipgloss.NewStyle().Width(24)
-	cellBranchStyle = lipgloss.NewStyle().Width(24)
-	cellPRsStyle    = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
-	cellIssuesStyle = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
+	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
+	cellNameStyle       = lipgloss.NewStyle().Width(24)
+	cellBranchStyle     = lipgloss.NewStyle().Width(26)
+	cellPRsStyle        = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
+	cellIssuesStyle     = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
 
-// renderPowerlinePill creates a rounded NerdFont Powerline pill badge (e.g.  main ).
+// renderPowerlinePill creates a rounded NerdFont Powerline pill badge (e.g.   main ).
 func renderPowerlinePill(text string, bg lipgloss.Color, fg lipgloss.Color) string {
 	leftCap := lipgloss.NewStyle().Foreground(bg).Render(iconCapLeft)
 	body := lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true).Render(text)
@@ -355,22 +356,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 
-		case "up", "k":
+		case "up":
+			// Arrow key UP moves selection up left table
 			if m.SelectedIndex > 0 {
 				m.SelectedIndex--
 				m.updateViewport()
 			}
 
-		case "down", "j":
+		case "down":
+			// Arrow key DOWN moves selection down left table
 			if m.SelectedIndex < len(m.Repos)-1 {
 				m.SelectedIndex++
 				m.updateViewport()
 			}
 
-		case "J", "ctrl+d", "pgdown":
+		case "j", "J", "ctrl+d", "pgdown":
+			// j/J scrolls right viewport panel down
 			m.Viewport.LineDown(3)
 
-		case "K", "ctrl+u", "pgup":
+		case "k", "K", "ctrl+u", "pgup":
+			// k/K scrolls right viewport panel up
 			m.Viewport.LineUp(3)
 
 		case "right", "l", "tab":
@@ -560,7 +565,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Height = msg.Height
 		m.ProgressBar.Width = msg.Width - 20
 		m.Viewport.Width = (msg.Width / 2) - 4
-		m.Viewport.Height = msg.Height - 12
+		m.Viewport.Height = msg.Height - 10
 	}
 
 	var spinnerCmd tea.Cmd
@@ -762,11 +767,22 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Clean Header Banner Subtitle: ~/repos | seankoji-com
+	// 1. Single Compact Line Header Banner with Far-Right Anchored Target Org Info
 	shortTargetDir := git.ShortenHomePath(m.TargetDir)
-	header := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
-		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager") + "\n" +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s %s", shortTargetDir, iconGithub, m.TargetOrg)) + "\n"
+	leftTitle := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
+		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager")
+
+	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s %s", shortTargetDir, iconGithub, m.TargetOrg))
+
+	leftWidthVis := lipgloss.Width(leftTitle)
+	rightWidthVis := lipgloss.Width(rightSubtitle)
+
+	spacingLen := m.Width - leftWidthVis - rightWidthVis
+	if spacingLen < 1 {
+		spacingLen = 1
+	}
+
+	header := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle + "\n"
 
 	// 2. Main Content Split View
 	leftWidth := (m.Width / 2) - 2
@@ -793,12 +809,12 @@ func (m Model) View() string {
 		leftSb.WriteString("No repositories found in target directory.\n")
 	} else {
 		for i, item := range m.Repos {
-			statusIcon := m.renderStatusBadge(item)
+			statusIconStr := cellStatusIconStyle.Render(m.renderStatusBadge(item))
 
 			// 1. Name Cell
 			nameCell := cellNameStyle.Render(truncateString(item.Name, 24))
 
-			// 2. Rounded NerdFont Powerline Dome Pill Badge (\ue0b6 main \ue0b4)
+			// 2. Rounded NerdFont Powerline Dome Pill Badge (\ue0b6  main \ue0b4)
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
@@ -809,11 +825,14 @@ func (m Model) View() string {
 			if item.IsArchived {
 				rawPill = renderPowerlinePill(" Archived ", lipgloss.Color("#313244"), colorMuted)
 			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
-				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#EF4444"), lipgloss.Color("#FFFFFF"))
+				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
+				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#EF4444"), lipgloss.Color("#FFFFFF"))
 			} else if item.HasUnstagedChanges {
-				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#F59E0B"), lipgloss.Color("#11111B"))
+				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
+				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#F59E0B"), lipgloss.Color("#11111B"))
 			} else {
-				rawPill = renderPowerlinePill(" "+branchStr+" ", lipgloss.Color("#10B981"), lipgloss.Color("#11111B"))
+				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
+				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#10B981"), lipgloss.Color("#11111B"))
 			}
 			branchPill := cellBranchStyle.Render(rawPill)
 
@@ -836,8 +855,8 @@ func (m Model) View() string {
 			}
 
 			// Combine cells into a pixel-aligned table line
-			line := fmt.Sprintf("%s %s %s %s %s",
-				statusIcon, nameCell, branchPill, prsCell, issuesCell,
+			line := fmt.Sprintf("%s%s %s %s %s",
+				statusIconStr, nameCell, branchPill, prsCell, issuesCell,
 			)
 
 			if i == m.SelectedIndex {
@@ -850,19 +869,19 @@ func (m Model) View() string {
 
 	leftPane := borderBoxStyle.
 		Width(leftWidth).
-		Height(m.Height - 8).
+		Height(m.Height - 6).
 		Render(leftSb.String())
 
 	// Render Details Viewport (Right)
 	rightPane := logBoxStyle.
 		Width(rightWidth).
-		Height(m.Height - 8).
+		Height(m.Height - 6).
 		Render(m.Viewport.View())
 
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
 	// 3. Footer Keybindings Help
-	footerText := "[↑/↓/j/k] Move  |  [J/K] Scroll Pane  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
+	footerText := "[↑/↓] Move Repo  |  [j/k] Scroll Pane  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
