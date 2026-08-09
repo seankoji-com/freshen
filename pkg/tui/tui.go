@@ -1228,14 +1228,28 @@ func (m *Model) updateViewport() {
 			runnerDisplay = "Awaiting available runner node..."
 		}
 
-		sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  %s %s  |  Duration: %s\n\n",
+		triggerStr := "push"
+		if job.Event != "" {
+			triggerStr = job.Event
+		}
+		if job.PRNumber != 0 {
+			prLabel := fmt.Sprintf("PR #%d", job.PRNumber)
+			prURL := job.PRURL
+			if prURL == "" {
+				prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, job.Repo, job.PRNumber)
+			}
+			triggerStr = fmt.Sprintf("%s (%s)", Hyperlink(prLabel, prURL), job.Event)
+		} else if job.Branch != "" {
+			branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, job.Repo, job.Branch)
+			triggerStr = fmt.Sprintf("%s on %s", triggerStr, Hyperlink(job.Branch, branchURL))
+		}
+
+		sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  Duration: %s\n\n",
 			iconQueue,
 			jobIDLink,
 			statusBadge,
 			iconFolder,
 			lipgloss.NewStyle().Foreground(colorPrimary).Render(job.Repo),
-			iconBranch,
-			lipgloss.NewStyle().Foreground(colorMuted).Render(job.Branch),
 			job.Duration,
 		))
 
@@ -1244,8 +1258,12 @@ func (m *Model) updateViewport() {
 			lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken),
 		))
 		sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Trigger:"),
+			lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(triggerStr),
+		))
+		sb.WriteString(fmt.Sprintf(" %s  %s\n",
 			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Job:"),
-			lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(jobToken),
+			lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobToken),
 		))
 		sb.WriteString(fmt.Sprintf(" %s  %s %s\n",
 			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Runner:"),
@@ -1809,7 +1827,26 @@ func (m Model) View() string {
 			} else {
 				runTitleText = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken)
 			}
-			runHeaderLine := fmt.Sprintf("  %s %s", stBadge, runTitleText)
+
+			// Format Trigger badge with hyperlink
+			triggerBadge := ""
+			if j.PRNumber != 0 {
+				prLabel := fmt.Sprintf("PR #%d", j.PRNumber)
+				prURL := j.PRURL
+				if prURL == "" {
+					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, j.Repo, j.PRNumber)
+				}
+				triggerBadge = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(" (" + Hyperlink(prLabel, prURL) + ")")
+			} else if j.Event != "" {
+				eventText := fmt.Sprintf("(%s)", j.Event)
+				if j.Branch != "" {
+					branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, j.Repo, j.Branch)
+					eventText = fmt.Sprintf("(%s on %s)", j.Event, Hyperlink(j.Branch, branchURL))
+				}
+				triggerBadge = " " + lipgloss.NewStyle().Foreground(colorMuted).Render(eventText)
+			}
+
+			runHeaderLine := fmt.Sprintf("  %s %s%s", stBadge, runTitleText, triggerBadge)
 			jobsLines = append(jobsLines, clipLine(runHeaderLine))
 		}
 
