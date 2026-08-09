@@ -39,6 +39,25 @@ type RepoCounts struct {
 	PRs    int
 }
 
+type IssueItem struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	URL    string `json:"url"`
+}
+
+type PRItem struct {
+	Number      int    `json:"number"`
+	Title       string `json:"title"`
+	HeadRefName string `json:"headRefName"`
+	URL         string `json:"url"`
+}
+
+type BranchWorktreeDetails struct {
+	Branches     []string
+	Worktrees    []string
+	ChangedFiles []string
+}
+
 type GraphQLOrgResponse struct {
 	Data struct {
 		Organization struct {
@@ -70,6 +89,9 @@ type RepoItem struct {
 	ExistingPRURL      string
 	OpenIssuesCount    int
 	OpenPRsCount       int
+	IssuesList         []IssueItem
+	PRsList            []PRItem
+	BranchDetails      BranchWorktreeDetails
 	Status             RepoStatus
 	StatusMsg          string
 	Stashed            bool
@@ -142,6 +164,104 @@ func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 		}
 	}
 	return result, nil
+}
+
+// GetRepoBranchDetails fetches branches, worktrees, and changed file details.
+func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
+	var details BranchWorktreeDetails
+
+	// Branches
+	cmd := exec.Command("git", "-C", path, "branch", "-a")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		for _, line := range strings.Split(out.String(), "\n") {
+			if trimmed := strings.TrimSpace(line); trimmed != "" {
+				details.Branches = append(details.Branches, trimmed)
+			}
+		}
+	}
+
+	// Worktrees
+	cmd = exec.Command("git", "-C", path, "worktree", "list")
+	out.Reset()
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		for _, line := range strings.Split(out.String(), "\n") {
+			if trimmed := strings.TrimSpace(line); trimmed != "" {
+				details.Worktrees = append(details.Worktrees, trimmed)
+			}
+		}
+	}
+
+	// Changed files & status
+	cmd = exec.Command("git", "-C", path, "status", "--short")
+	out.Reset()
+	cmd.Stdout = &out
+	if err := cmd.Run(); err == nil {
+		for _, line := range strings.Split(out.String(), "\n") {
+			if trimmed := strings.TrimSpace(line); trimmed != "" {
+				details.ChangedFiles = append(details.ChangedFiles, trimmed)
+			}
+		}
+	}
+
+	return details
+}
+
+// PruneBranchesAndWorktrees deletes non-default local branches and prunes worktrees.
+func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
+	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
+
+	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return 0, err
+	}
+
+	currentBranch := GetOriginalBranch(path)
+	deletedCount := 0
+	for _, b := range strings.Split(out.String(), "\n") {
+		b = strings.TrimSpace(b)
+		if b != "" && b != defaultBranch && b != currentBranch {
+			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
+			if delCmd.Run() == nil {
+				deletedCount++
+			}
+		}
+	}
+	return deletedCount, nil
+}
+
+// FetchOpenIssuesList retrieves open GitHub issues for a repository.
+func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
+	target := fmt.Sprintf("%s/%s", org, ghRepo)
+	cmd := exec.Command("gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var issues []IssueItem
+	_ = json.Unmarshal(out.Bytes(), &issues)
+	return issues, nil
+}
+
+// FetchOpenPRsList retrieves open GitHub pull requests for a repository.
+func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
+	target := fmt.Sprintf("%s/%s", org, ghRepo)
+	cmd := exec.Command("gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var prs []PRItem
+	_ = json.Unmarshal(out.Bytes(), &prs)
+	return prs, nil
 }
 
 // FetchExistingPRURL checks if an open PR exists on GitHub for the given branch.
@@ -234,6 +354,9 @@ func SyncRepository(item *RepoItem) {
 	item.CurrentBranch = origBranch
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
+
+	// Populate branch details
+	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
 
 	// Check if an open PR exists for this feature branch
 	if origBranch != defaultBranch {
@@ -390,19 +513,16 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 
 	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
 
-	// Stage and commit changes
 	_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
 	_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
 
-	// Push branch to origin
 	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
 	if err := pushCmd.Run(); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
 		return err
 	}
 
-	// Create PR using gh CLI if no existing PR
 	if item.ExistingPRURL == "" {
 		prCmd := exec.Command("gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
 		prCmd.Dir = item.Path
@@ -421,7 +541,6 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
 
-	// Switch back to default branch
 	coCmd := exec.Command("git", "-C", item.Path, "checkout", item.DefaultBranch)
 	if err := coCmd.Run(); err == nil {
 		item.CurrentBranch = item.DefaultBranch
