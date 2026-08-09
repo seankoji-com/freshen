@@ -445,7 +445,7 @@ func SyncRepository(item *RepoItem) {
 			}
 			return
 		} else {
-			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull && git stash apply...", defaultBranch))
+			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch))
 
 			_ = exec.Command("git", "-C", item.Path, "add", ".").Run()
 			stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
@@ -476,7 +476,7 @@ func SyncRepository(item *RepoItem) {
 	}
 
 	if !hasUnstagedChanges {
-		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull...", origBranch, defaultBranch))
+		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull --no-rebase origin %s...", origBranch, defaultBranch, defaultBranch))
 
 		coCmd := exec.Command("git", "-C", item.Path, "checkout", defaultBranch)
 		if err := coCmd.Run(); err != nil {

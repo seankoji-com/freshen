@@ -105,8 +105,8 @@ var (
 			Bold(true)
 
 	badgePR = lipgloss.NewStyle().
-			Foreground(colorYellow).
-			Bold(true)
+		Foreground(colorYellow).
+		Bold(true)
 
 	badgeIssue = lipgloss.NewStyle().
 			Foreground(colorBlue).
@@ -274,8 +274,13 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) loadRunnersCmd() tea.Cmd {
+	// Defensive copies to avoid data race with background goroutine.
+	runnersCopy := make([]*jobs.RunnerItem, len(m.Runners))
+	copy(runnersCopy, m.Runners)
+	queueCopy := make([]*jobs.JobItem, len(m.JobQueue))
+	copy(queueCopy, m.JobQueue)
 	return func() tea.Msg {
-		runners, err := jobs.FetchOrgRunners(m.TargetOrg, m.Runners, m.JobQueue)
+		runners, err := jobs.FetchOrgRunners(m.TargetOrg, runnersCopy, queueCopy)
 		return loadedRunnersMsg{runners: runners, err: err}
 	}
 }
@@ -308,8 +313,11 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 			}
 		}
 	}
+	// Defensive copy to avoid data race with background goroutine.
+	repoList := make([]string, len(repos))
+	copy(repoList, repos)
 	return func() tea.Msg {
-		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repos)
+		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList)
 		return loadedJobQueueMsg{queue: queue, err: err}
 	}
 }
@@ -493,7 +501,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveFocus = (m.ActiveFocus + 1) % 3
 			m.updateViewport()
 
-		case "up":
+		case "up", "k":
 			switch m.ActiveFocus {
 			case FocusRepos:
 				if m.SelectedIndex > 0 {
@@ -522,7 +530,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "down":
+		case "down", "j":
 			switch m.ActiveFocus {
 			case FocusRepos:
 				if m.SelectedIndex < len(m.Repos)-1 {
@@ -760,7 +768,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			// Click in Right Detail View Pane
-			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) && m.ActiveFocus == FocusRepos {
+			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
 				relX := msg.X - (m.Width / 2)
 				if relX >= 0 && relX < 10 {
 					m.ActiveTab = TabLogs
@@ -1038,9 +1046,15 @@ func (m *Model) updateViewport() {
 		}
 
 		sb.WriteString(label("Active Tag", activeTag, colorSecondary))
-		sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
-		sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
-		sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
+		if len(matchingRunners) == 0 {
+			sb.WriteString(label("Runner Count", "No runners matching this tag.", colorMuted))
+		} else {
+			sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
+			sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
+		}
+		if len(tags) > 1 {
+			sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
+		}
 
 		// --- MATCHING RUNNERS TABLE ---
 		sb.WriteString("\n")
@@ -1150,7 +1164,7 @@ func (m *Model) updateViewport() {
 
 	case FocusJobs:
 		if len(m.JobQueue) == 0 || m.SelectedJobIndex >= len(m.JobQueue) {
-			m.Viewport.SetContent("No jobs in queue.")
+			m.Viewport.SetContent("No queued or running workflow jobs.")
 			return
 		}
 		job := m.JobQueue[m.SelectedJobIndex]
@@ -1913,7 +1927,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
 	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [j/k] Scroll  [c] Copy  [q] Quit"
+	footerText := "[w] Panes [←/→/h/l] Tabs/Tags [↑/↓] Select [j/k] Scroll [b] Branch [d] Delete [p] PR [c] Copy [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
