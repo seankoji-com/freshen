@@ -113,7 +113,7 @@ func runNonInteractive(targetDir, targetOrg string) {
 			Logs:       make([]string, 0),
 		}
 
-		git.SyncRepository(item)
+		git.SyncRepository(item, false)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)

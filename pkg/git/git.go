@@ -14,14 +14,16 @@ import (
 type RepoStatus string
 
 const (
-	StatusPending   RepoStatus = "PENDING"
-	StatusSyncing   RepoStatus = "SYNCING"
-	StatusUpToDate  RepoStatus = "UP_TO_DATE"
-	StatusUpdated   RepoStatus = "UPDATED"
-	StatusStashedPR RepoStatus = "STASHED_PR"
-	StatusCloned    RepoStatus = "CLONED"
-	StatusArchived  RepoStatus = "ARCHIVED"
-	StatusError     RepoStatus = "ERROR"
+	StatusPending        RepoStatus = "PENDING"
+	StatusSyncing        RepoStatus = "SYNCING"
+	StatusUpToDate       RepoStatus = "UP_TO_DATE"
+	StatusUpdated        RepoStatus = "UPDATED"
+	StatusRebased        RepoStatus = "REBASED"
+	StatusRebaseConflict RepoStatus = "REBASE_CONFLICT"
+	StatusStashedPR      RepoStatus = "STASHED_PR"
+	StatusCloned         RepoStatus = "CLONED"
+	StatusArchived       RepoStatus = "ARCHIVED"
+	StatusError          RepoStatus = "ERROR"
 )
 
 type GHRepoInfo struct {
@@ -115,7 +117,6 @@ func GetOriginalBranch(path string) string {
 
 // GetDefaultBranch determines default branch (main/master) for a git repository.
 func GetDefaultBranch(path string) string {
-	// Attempt 1: symbolic-ref for origin/HEAD
 	cmd := exec.Command("git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -128,7 +129,6 @@ func GetDefaultBranch(path string) string {
 		}
 	}
 
-	// Attempt 2: gh repo view
 	cmd = exec.Command("gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
 	out.Reset()
 	cmd.Stdout = &out
@@ -136,7 +136,6 @@ func GetDefaultBranch(path string) string {
 		return strings.TrimSpace(out.String())
 	}
 
-	// Attempt 3: local refs check
 	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main")
 	if cmd.Run() == nil {
 		return "main"
@@ -149,13 +148,10 @@ func GetDefaultBranch(path string) string {
 	return GetOriginalBranch(path)
 }
 
-// SyncRepository performs the full workflow on an active local repository:
-// 1. Stash changes if dirty
-// 2. Switch branch to default
-// 3. Pull latest changes
-// 4. Stash apply
-// 5. Create draft PR if stashed changes restored
-func SyncRepository(item *RepoItem) {
+// SyncRepository performs workflow on a repository:
+// - Repos on default branch: auto-runs full sync (stash -> pull -> stash apply -> draft PR)
+// - Repos on feature branch: auto-runs fetch & rebase onto default (unless forceFullSync=true)
+func SyncRepository(item *RepoItem, forceFullSync bool) {
 	item.Status = StatusSyncing
 	item.Logs = append(item.Logs, fmt.Sprintf("[%s] Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
 
@@ -165,6 +161,37 @@ func SyncRepository(item *RepoItem) {
 	item.DefaultBranch = defaultBranch
 
 	item.Logs = append(item.Logs, fmt.Sprintf("Current branch: %s | Default branch: %s", origBranch, defaultBranch))
+
+	// If on feature branch and forceFullSync is false: fetch and rebase onto default branch
+	if origBranch != defaultBranch && !forceFullSync {
+		item.Logs = append(item.Logs, fmt.Sprintf("Repo is on feature branch '%s'. Fetching origin and rebasing onto '%s'...", origBranch, defaultBranch))
+
+		fetchCmd := exec.Command("git", "-C", item.Path, "fetch", "origin")
+		if err := fetchCmd.Run(); err != nil {
+			item.Logs = append(item.Logs, fmt.Sprintf("git fetch error: %v", err))
+		}
+
+		rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
+		rebaseCmd := exec.Command("git", "-C", item.Path, "rebase", rebaseTarget)
+		var rebaseOut bytes.Buffer
+		rebaseCmd.Stdout = &rebaseOut
+		rebaseCmd.Stderr = &rebaseOut
+
+		if err := rebaseCmd.Run(); err == nil {
+			item.Status = StatusRebased
+			item.StatusMsg = fmt.Sprintf("Rebased (%s)", origBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("Successfully rebased '%s' onto '%s'. Hit 'f' to run full PR sync.", origBranch, rebaseTarget))
+		} else {
+			_ = exec.Command("git", "-C", item.Path, "rebase", "--abort").Run()
+			item.Status = StatusRebaseConflict
+			item.StatusMsg = fmt.Sprintf("Rebase Conflict (%s)", origBranch)
+			item.Logs = append(item.Logs, fmt.Sprintf("Rebase conflict output: %s", rebaseOut.String()))
+		}
+		return
+	}
+
+	// Full Sync Workflow (For repos on default branch OR when forceFullSync is true)
+	item.Logs = append(item.Logs, "Executing full workflow (stash -> checkout default -> pull -> stash apply -> draft PR)...")
 
 	// Step 1: Check for uncommitted changes & Stash
 	isDirtyCmd := exec.Command("git", "-C", item.Path, "status", "--porcelain")
@@ -244,14 +271,12 @@ func SyncRepository(item *RepoItem) {
 			cleanBranch := sanitizeBranchName(origBranch)
 			prBranch := fmt.Sprintf("draft/%s-%s", cleanBranch, timestamp)
 
-			// Checkout new branch
 			coBranchCmd := exec.Command("git", "-C", item.Path, "checkout", "-b", prBranch)
 			if err := coBranchCmd.Run(); err == nil {
 				_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
 				commitMsg := fmt.Sprintf("WIP: Restored stashed changes from branch '%s'", origBranch)
 				_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
 
-				// Push to origin
 				pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", prBranch)
 				if err := pushCmd.Run(); err == nil {
 					prTitle := fmt.Sprintf("WIP: Stashed changes (%s)", origBranch)

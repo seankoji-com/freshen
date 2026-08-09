@@ -22,8 +22,6 @@ var (
 	colorRed       = lipgloss.Color("#EF4444") // Coral Red
 	colorBlue      = lipgloss.Color("#3B82F6") // Bright Blue
 	colorMuted     = lipgloss.Color("#6C7086") // Muted Slate
-	colorBgDark    = lipgloss.Color("#181825") // Dark Background
-	colorBgSurface = lipgloss.Color("#1E1E2E") // Card Surface
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -41,6 +39,10 @@ var (
 
 	badgeUpdated = lipgloss.NewStyle().
 			Foreground(colorSecondary).
+			Bold(true)
+
+	badgeRebased = lipgloss.NewStyle().
+			Foreground(colorBlue).
 			Bold(true)
 
 	badgeStashedPR = lipgloss.NewStyle().
@@ -80,11 +82,6 @@ var (
 
 // --- Messages for Bubble Tea Update Loop ---
 
-type repoSyncMsg struct {
-	index int
-	item  *git.RepoItem
-}
-
 type syncFinishedMsg struct{}
 
 type orgSyncedMsg struct {
@@ -101,7 +98,6 @@ type Model struct {
 	SelectedIndex int
 	IsSyncing     bool
 	IsOrgSyncing  bool
-	FinishedCount int
 	TotalCount    int
 
 	Spinner     spinner.Model
@@ -204,13 +200,13 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 	}
 }
 
-func (m Model) startParallelSyncCmd() tea.Cmd {
+func (m Model) startParallelSyncCmd(forceFullSync bool) tea.Cmd {
 	return func() tea.Msg {
 		var wg sync.WaitGroup
 		concurrency := 4
 		sem := make(chan struct{}, concurrency)
 
-		for i, item := range m.Repos {
+		for _, item := range m.Repos {
 			if item.IsArchived {
 				continue
 			}
@@ -218,13 +214,13 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 			wg.Add(1)
 			sem <- struct{}{}
 
-			go func(idx int, r *git.RepoItem) {
+			go func(r *git.RepoItem) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Perform repository sync
-				git.SyncRepository(r)
-			}(i, item)
+				// Perform sync: auto-full sync for default branch repos, fetch & rebase for feature branch repos
+				git.SyncRepository(r, forceFullSync)
+			}(item)
 		}
 
 		wg.Wait()
@@ -256,13 +252,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
-			// Retry / Re-sync selected repo
+			// Re-sync selected repo (auto branch behavior)
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					go git.SyncRepository(item)
+					go git.SyncRepository(item, false)
 					m.updateViewport()
 				}
+			}
+
+		case "f":
+			// Run Full Sync ("do the rest": stash, checkout default, pull, stash apply, draft PR) on selected repo
+			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+				item := m.Repos[m.SelectedIndex]
+				if !item.IsArchived {
+					go git.SyncRepository(item, true)
+					m.updateViewport()
+				}
+			}
+
+		case "F":
+			// Run Full Sync on ALL repositories
+			if !m.IsSyncing && len(m.Repos) > 0 {
+				m.IsSyncing = true
+				return m, m.startParallelSyncCmd(true)
 			}
 
 		case "d":
@@ -276,13 +289,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			}
-
-		case "a":
-			// Start sync for all repos
-			if !m.IsSyncing && len(m.Repos) > 0 {
-				m.IsSyncing = true
-				return m, m.startParallelSyncCmd()
-			}
 		}
 
 	case orgSyncedMsg:
@@ -292,7 +298,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.Repos) > 0 {
 			m.IsSyncing = true
 			m.updateViewport()
-			cmds = append(cmds, m.startParallelSyncCmd())
+			cmds = append(cmds, m.startParallelSyncCmd(false))
 		}
 
 	case syncFinishedMsg:
@@ -322,7 +328,7 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("Repository: %s\n", subtitleStyle.Render(item.Name)))
+	sb.WriteString(fmt.Sprintf("Repository:  %s\n", subtitleStyle.Render(item.Name)))
 	sb.WriteString(fmt.Sprintf("GitHub Name: %s\n", item.GHRepoName))
 	sb.WriteString(fmt.Sprintf("Local Path:  %s\n", item.Path))
 	sb.WriteString(fmt.Sprintf("Branch:      %s (Default: %s)\n", item.CurrentBranch, item.DefaultBranch))
@@ -388,7 +394,7 @@ func (m Model) View() string {
 
 	// 3. Footer Keybindings Help
 	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"[↑/↓ or j/k] Navigate  |  [r] Retry Repo  |  [d] Delete Archived  |  [a] Sync All  |  [q] Quit",
+		"[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [f] Full PR Sync  |  [d] Delete Archived  |  [q] Quit",
 	)
 
 	return header + "\n" + mainView + "\n" + footer
@@ -400,9 +406,11 @@ func renderStatusBadge(item *git.RepoItem) string {
 		return badgeUpToDate.Render("✓")
 	case git.StatusUpdated:
 		return badgeUpdated.Render("✓")
+	case git.StatusRebased:
+		return badgeRebased.Render("🔄")
 	case git.StatusStashedPR:
 		return badgeStashedPR.Render("🔗")
-	case git.StatusError:
+	case git.StatusError, git.StatusRebaseConflict:
 		return badgeError.Render("✗")
 	case git.StatusArchived:
 		return badgeArchived.Render("🗑️")
