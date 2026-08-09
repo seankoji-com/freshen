@@ -45,10 +45,6 @@ var (
 	iconCopy     = "󰅍"
 	iconWorktree = "󰉓"
 
-	// Powerline Pill Half-Dome Rounded Caps
-	iconCapLeft  = "\ue0b6" //  Left Powerline Dome
-	iconCapRight = "\ue0b4" //  Right Powerline Dome
-
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
 	colorGreen     = lipgloss.Color("#10B981") // Emerald Green
@@ -131,18 +127,10 @@ var (
 	// Explicit Column Width Styles for Table Alignment
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
 	cellNameStyle       = lipgloss.NewStyle().Width(24)
-	cellBranchStyle     = lipgloss.NewStyle().Width(26)
+	cellBranchStyle     = lipgloss.NewStyle().Width(22)
 	cellPRsStyle        = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
 	cellIssuesStyle     = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
-
-// renderPowerlinePill creates a rounded NerdFont Powerline pill badge (e.g.   main ).
-func renderPowerlinePill(text string, bg lipgloss.Color, fg lipgloss.Color) string {
-	leftCap := lipgloss.NewStyle().Foreground(bg).Render(iconCapLeft)
-	body := lipgloss.NewStyle().Background(bg).Foreground(fg).Bold(true).Render(text)
-	rightCap := lipgloss.NewStyle().Foreground(bg).Render(iconCapRight)
-	return leftCap + body + rightCap
-}
 
 // --- Messages for Bubble Tea Update Loop ---
 
@@ -368,25 +356,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up":
-			// Arrow UP moves repository selection up in left table pane
 			if m.SelectedIndex > 0 {
 				m.SelectedIndex--
 				m.updateViewport()
 			}
 
 		case "down":
-			// Arrow DOWN moves repository selection down in left table pane
 			if m.SelectedIndex < len(m.Repos)-1 {
 				m.SelectedIndex++
 				m.updateViewport()
 			}
 
 		case "j", "ctrl+d", "pgdown":
-			// j scrolls right detailed viewport pane down
 			m.Viewport.LineDown(3)
 
 		case "k", "ctrl+u", "pgup":
-			// k scrolls right detailed viewport pane up
 			m.Viewport.LineUp(3)
 
 		case "right", "l", "tab":
@@ -807,7 +791,7 @@ func (m Model) View() string {
 	headerLine := fmt.Sprintf("%s%s %s %s %s",
 		headerPrefix,
 		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
-		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH / STATUS"),
+		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
@@ -825,27 +809,33 @@ func (m Model) View() string {
 			// 1. Name Cell
 			nameCell := cellNameStyle.Render(truncateString(item.Name, 24))
 
-			// 2. Rounded NerdFont Powerline Dome Pill Badge (\ue0b6  main \ue0b4)
+			// 2. Branch Text Cell with Color Coding
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
-			branchStr = truncateString(branchStr, 18)
+			branchStr = truncateString(branchStr, 20)
+			displayText := fmt.Sprintf(" %s", branchStr)
 
-			var rawPill string
+			var branchStyle lipgloss.Style
+
 			if item.IsArchived {
-				rawPill = renderPowerlinePill(" Archived ", lipgloss.Color("#313244"), colorMuted)
+				displayText = " Archived"
+				branchStyle = lipgloss.NewStyle().Foreground(colorMuted).Strikethrough(true)
 			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
-				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
-				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#EF4444"), lipgloss.Color("#FFFFFF"))
+				branchStyle = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
 			} else if item.HasUnstagedChanges {
-				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
-				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#F59E0B"), lipgloss.Color("#11111B"))
+				// Dirty branch (both default and feature) -> Yellow text
+				branchStyle = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
+			} else if branchStr == item.DefaultBranch || branchStr == "-" {
+				// Clean default branch -> Greyed out text
+				branchStyle = lipgloss.NewStyle().Foreground(colorMuted)
 			} else {
-				pillText := fmt.Sprintf(" %s %s ", iconBranch, branchStr)
-				rawPill = renderPowerlinePill(pillText, lipgloss.Color("#10B981"), lipgloss.Color("#11111B"))
+				// Clean feature branch -> Green text
+				branchStyle = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 			}
-			branchPill := cellBranchStyle.Render(rawPill)
+
+			branchCell := cellBranchStyle.Render(branchStyle.Render(displayText))
 
 			// 3. PRs Count Cell
 			prsStyle := cellPRsStyle
@@ -867,7 +857,7 @@ func (m Model) View() string {
 
 			// Combine cells into a pixel-aligned table line
 			line := fmt.Sprintf("%s%s %s %s %s",
-				statusIconStr, nameCell, branchPill, prsCell, issuesCell,
+				statusIconStr, nameCell, branchCell, prsCell, issuesCell,
 			)
 
 			if i == m.SelectedIndex {
