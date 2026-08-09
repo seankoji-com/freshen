@@ -1103,7 +1103,11 @@ func (m *Model) updateViewport() {
 
 	case FocusRunners:
 		if len(m.Runners) == 0 {
-			m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org."))
+			if m.IsRunnersLoading {
+				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching registered runners...", m.Spinner.View()))
+			} else {
+				m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org."))
+			}
 			return
 		}
 
@@ -1278,7 +1282,11 @@ func (m *Model) updateViewport() {
 
 	case FocusJobs:
 		if len(m.JobQueue) == 0 || m.SelectedJobIndex >= len(m.JobQueue) {
-			m.Viewport.SetContent("No jobs in queue.")
+			if m.IsJobQueueLoading || m.IsOrgSyncing {
+				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching active workflow jobs...", m.Spinner.View()))
+			} else {
+				m.Viewport.SetContent("No jobs in queue.")
+			}
 			return
 		}
 		job := m.JobQueue[m.SelectedJobIndex]
@@ -1624,7 +1632,7 @@ func (m *Model) updateViewport() {
 				}
 			}
 
-			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
 			if len(item.BranchDetails.ChangedFiles) == 0 {
 				sb.WriteString("  󰄬 Working tree is clean.\n")
 			} else {
@@ -1944,7 +1952,12 @@ func (m Model) View() string {
 		tagTitle = fmt.Sprintf("REGISTERED RUNNERS (%s)", activeTag)
 	}
 
-	runnerHeader := fmt.Sprintf(" %s %s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(tagTitle))
+	runnerHeaderSpinner := ""
+	if m.IsRunnersLoading {
+		runnerHeaderSpinner = " " + m.Spinner.View()
+	}
+
+	runnerHeader := fmt.Sprintf(" %s %s%s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(tagTitle), runnerHeaderSpinner)
 	runnerLines = append(runnerLines, clipLine(runnerHeader))
 	runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
@@ -1994,6 +2007,16 @@ func (m Model) View() string {
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
 	}
 
+	if len(runningNames) == 0 && len(idleNames) == 0 && len(offlineNames) == 0 {
+		if m.IsRunnersLoading {
+			runnerLines = append(runnerLines, clipLine(fmt.Sprintf(" %s Fetching registered runners...", m.Spinner.View())))
+		} else if activeTag != "ALL" {
+			runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf(" No runners matching tag '%s'.", activeTag))))
+		} else {
+			runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found.")))
+		}
+	}
+
 	runnerStyle := borderBoxStyle
 	if m.ActiveFocus == FocusRunners {
 		runnerStyle = borderFocusedStyle
@@ -2018,12 +2041,16 @@ func (m Model) View() string {
 	if runningCount > 0 || queuedCount > 0 {
 		countsStr = fmt.Sprintf(" (%d running, %d queued)", runningCount, queuedCount)
 	}
-	jobHeader := fmt.Sprintf(" %s %s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
+	jobHeaderSpinner := ""
+	if m.IsJobQueueLoading || m.IsOrgSyncing {
+		jobHeaderSpinner = " " + m.Spinner.View()
+	}
+	jobHeader := fmt.Sprintf(" %s %s%s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), jobHeaderSpinner, lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
 	jobsLines = append(jobsLines, jobHeader)
 	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
 
 	if len(m.JobQueue) == 0 {
-		if m.IsJobQueueLoading {
+		if m.IsJobQueueLoading || m.IsOrgSyncing {
 			jobsLines = append(jobsLines, clipLine(fmt.Sprintf(" %s Fetching active workflow jobs...", m.Spinner.View())))
 		} else {
 			jobsLines = append(jobsLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No queued or running workflow jobs.")))

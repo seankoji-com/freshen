@@ -335,3 +335,35 @@ func TestHyperlinksInView(t *testing.T) {
 		t.Errorf("expected FocusJobs header to contain valid OSC 8 hyperlink for Job ID")
 	}
 }
+
+func TestRunnersAndJobQueueLoadingAndEmptyStates(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 120
+	m.Height = 40
+
+	// 1. Initial load state (IsRunnersLoading = true, IsJobQueueLoading = true, IsOrgSyncing = true)
+	m.IsRunnersLoading = true
+	m.IsJobQueueLoading = true
+	m.IsOrgSyncing = true
+	viewInitial := m.View()
+
+	if !strings.Contains(viewInitial, "Fetching registered runners...") {
+		t.Errorf("expected View() to show 'Fetching registered runners...' during initial load, got:\n%s", viewInitial)
+	}
+	if !strings.Contains(viewInitial, "Fetching active workflow jobs...") {
+		t.Errorf("expected View() to show 'Fetching active workflow jobs...' during initial load, got:\n%s", viewInitial)
+	}
+
+	// 2. Loaded state with empty runners and empty jobs (IsRunnersLoading = false, IsJobQueueLoading = false, IsOrgSyncing = false)
+	m.IsRunnersLoading = false
+	m.IsJobQueueLoading = false
+	m.IsOrgSyncing = false
+	viewEmpty := m.View()
+
+	if !strings.Contains(viewEmpty, "No registered runners found.") {
+		t.Errorf("expected View() to show 'No registered runners found.' when runners list is empty, got:\n%s", viewEmpty)
+	}
+	if !strings.Contains(viewEmpty, "No queued or running workflow jobs.") {
+		t.Errorf("expected View() to show 'No queued or running workflow jobs.' when job queue is empty, got:\n%s", viewEmpty)
+	}
+}
