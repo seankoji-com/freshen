@@ -15,6 +15,16 @@ import (
 	"github.com/seankoji-com/freshen/pkg/git"
 )
 
+// --- Active Right-Pane Detail View Tab ---
+type TabType int
+
+const (
+	TabLogs TabType = iota
+	TabBranches
+	TabIssues
+	TabPRs
+)
+
 // --- NerdFont Glyphs & Color Palette ---
 var (
 	iconLeaf     = "🍃"
@@ -32,6 +42,7 @@ var (
 	iconSyncing  = "⏳"
 	iconPending  = "•"
 	iconCopy     = "󰅍"
+	iconWorktree = "󰉓"
 
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
@@ -50,6 +61,17 @@ var (
 	subtitleStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary).
 			Bold(true)
+
+	tabActiveStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FFFFFF")).
+			Background(colorPrimary).
+			Padding(0, 1)
+
+	tabInactiveStyle = lipgloss.NewStyle().
+				Foreground(colorMuted).
+				Background(lipgloss.Color("#313244")).
+				Padding(0, 1)
 
 	badgeUpToDate = lipgloss.NewStyle().
 			Foreground(colorGreen).
@@ -115,6 +137,16 @@ type orgSyncedMsg struct {
 	err   error
 }
 
+type loadedIssuesMsg struct {
+	repoName string
+	issues   []git.IssueItem
+}
+
+type loadedPRsMsg struct {
+	repoName string
+	prs      []git.PRItem
+}
+
 // --- Bubble Tea Model ---
 
 type Model struct {
@@ -122,6 +154,7 @@ type Model struct {
 	TargetOrg     string
 	Repos         []*git.RepoItem
 	SelectedIndex int
+	ActiveTab     TabType
 	IsSyncing     bool
 	IsOrgSyncing  bool
 	TotalCount    int
@@ -153,6 +186,7 @@ func NewModel(targetDir, targetOrg string) Model {
 		TargetOrg:     targetOrg,
 		Repos:         make([]*git.RepoItem, 0),
 		SelectedIndex: 0,
+		ActiveTab:     TabLogs,
 		IsOrgSyncing:  true,
 		Spinner:       s,
 		ProgressBar:   p,
@@ -172,7 +206,6 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 		orgRepos, _ := git.FetchOrgRepos(m.TargetOrg)
 		orgCounts, _ := git.FetchOrgRepoCounts(m.TargetOrg)
 
-		// Discover existing local repos in target directory
 		entries, err := git.ScanLocalDirectory(m.TargetDir)
 		if err != nil {
 			return orgSyncedMsg{repos: nil, err: err}
@@ -180,7 +213,6 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 
 		repoMap := make(map[string]*git.RepoItem)
 
-		// Process org repos first
 		for _, ghRepo := range orgRepos {
 			localDir := git.GetLocalDirName(ghRepo.Name)
 			localPath := fmt.Sprintf("%s/%s", m.TargetDir, localDir)
@@ -207,7 +239,6 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			repoMap[localDir] = item
 		}
 
-		// Process local entries that might not be in org list
 		for _, name := range entries {
 			if _, exists := repoMap[name]; !exists {
 				path := fmt.Sprintf("%s/%s", m.TargetDir, name)
@@ -239,6 +270,20 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 	}
 }
 
+func (m Model) fetchIssuesCmd(repoName, ghRepoName string) tea.Cmd {
+	return func() tea.Msg {
+		issues, _ := git.FetchOpenIssuesList(m.TargetOrg, ghRepoName)
+		return loadedIssuesMsg{repoName: repoName, issues: issues}
+	}
+}
+
+func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
+	return func() tea.Msg {
+		prs, _ := git.FetchOpenPRsList(m.TargetOrg, ghRepoName)
+		return loadedPRsMsg{repoName: repoName, prs: prs}
+	}
+}
+
 func (m Model) startParallelSyncCmd() tea.Cmd {
 	return func() tea.Msg {
 		var wg sync.WaitGroup
@@ -257,7 +302,6 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Perform sync according to branch state
 				git.SyncRepository(r)
 			}(item)
 		}
@@ -297,8 +341,48 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateViewport()
 			}
 
+		case "right", "l", "tab":
+			m.ActiveTab = (m.ActiveTab + 1) % 4
+			m.updateViewport()
+			return m, m.triggerTabFetch()
+
+		case "left", "h", "shift+tab":
+			m.ActiveTab = (m.ActiveTab + 3) % 4
+			m.updateViewport()
+			return m, m.triggerTabFetch()
+
+		case "1":
+			m.ActiveTab = TabLogs
+			m.updateViewport()
+
+		case "2":
+			m.ActiveTab = TabBranches
+			m.updateViewport()
+
+		case "3":
+			m.ActiveTab = TabIssues
+			m.updateViewport()
+			return m, m.triggerTabFetch()
+
+		case "4":
+			m.ActiveTab = TabPRs
+			m.updateViewport()
+			return m, m.triggerTabFetch()
+
+		case "X":
+			// Shortcut: Delete all local non-default branches and prune worktrees
+			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+				item := m.Repos[m.SelectedIndex]
+				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
+				if err == nil {
+					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned stale worktrees and deleted %d non-default local branches.", count))
+					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+					m.ToastMsg = fmt.Sprintf(" 󰄬 Deleted %d stale branches & pruned worktrees!", count)
+					m.updateViewport()
+				}
+			}
+
 		case "r":
-			// Re-sync selected repo
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
@@ -308,7 +392,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "c", "y":
-			// Copy PR URL or Repo Path to system clipboard
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				targetCopy := item.DraftPRURL
@@ -325,7 +408,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "b":
-			// Switch back to feature branch (or default branch)
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				target := item.OriginalBranch
@@ -337,7 +419,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "p":
-			// Commit, push to PR, and switch back to default branch
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
@@ -349,7 +430,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "d":
-			// Delete archived repo if selected
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
@@ -361,8 +441,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case loadedIssuesMsg:
+		for _, item := range m.Repos {
+			if item.Name == msg.repoName {
+				item.IssuesList = msg.issues
+				break
+			}
+		}
+		m.updateViewport()
+
+	case loadedPRsMsg:
+		for _, item := range m.Repos {
+			if item.Name == msg.repoName {
+				item.PRsList = msg.prs
+				break
+			}
+		}
+		m.updateViewport()
+
 	case tea.MouseMsg:
-		// Handle mouse clicks to select repo rows or scroll viewport
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			if msg.X < m.Width/2 && msg.Y >= 4 {
 				clickedIdx := msg.Y - 4
@@ -406,6 +503,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m Model) triggerTabFetch() tea.Cmd {
+	if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+		return nil
+	}
+	item := m.Repos[m.SelectedIndex]
+	if m.ActiveTab == TabIssues && len(item.IssuesList) == 0 {
+		return m.fetchIssuesCmd(item.Name, item.GHRepoName)
+	}
+	if m.ActiveTab == TabPRs && len(item.PRsList) == 0 {
+		return m.fetchPRsCmd(item.Name, item.GHRepoName)
+	}
+	return nil
+}
+
 func (m *Model) updateViewport() {
 	if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
 		return
@@ -414,27 +525,121 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
+	// Header metadata
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.Name)))
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("GITHUB NAME:"), item.GHRepoName))
-	sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL PATH: "), iconFolder, item.Path))
-	sb.WriteString(fmt.Sprintf("%s %s %s (Default: %s)\n", lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render("BRANCH:     "), iconBranch, item.CurrentBranch, item.DefaultBranch))
-	sb.WriteString(fmt.Sprintf("%s %s %d open  |  %s %d open\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("METRICS:    "), iconPR, item.OpenPRsCount, iconIssue, item.OpenIssuesCount))
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:     "), item.StatusMsg))
-	
-	if item.ExistingPRURL != "" {
-		sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR:    "), iconPR, badgePR.Render(item.ExistingPRURL)))
-	}
-	if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
-		sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:   "), iconPR, badgePR.Render(item.DraftPRURL)))
-	}
-	
-	sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
+	sb.WriteString(fmt.Sprintf("%s %s %s | %s %s (%s)\n",
+		lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL:"), iconFolder, item.Path,
+		iconBranch, item.CurrentBranch, item.DefaultBranch,
+	))
+	sb.WriteString(fmt.Sprintf("%s %s  |  %s %d open  |  %s %d open\n\n",
+		lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:"), item.StatusMsg,
+		iconPR, item.OpenPRsCount, iconIssue, item.OpenIssuesCount,
+	))
 
-	for _, logLine := range item.Logs {
-		sb.WriteString(highlightLogLine(logLine) + "\n")
+	// Tab Bar Header
+	sb.WriteString(m.renderTabBar() + "\n\n")
+
+	// Render Content Based on Selected Tab
+	switch m.ActiveTab {
+
+	case TabLogs:
+		if item.ExistingPRURL != "" {
+			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL)))
+		}
+		if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
+			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
+		}
+		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
+		for _, logLine := range item.Logs {
+			sb.WriteString(highlightLogLine(logLine) + "\n")
+		}
+
+	case TabBranches:
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to delete all non-default branches & prune worktrees)") + "\n\n")
+
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
+		if len(item.BranchDetails.Branches) == 0 {
+			sb.WriteString("  (None found)\n")
+		} else {
+			for _, b := range item.BranchDetails.Branches {
+				sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+			}
+		}
+
+		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰉓 Git Worktrees:") + "\n")
+		if len(item.BranchDetails.Worktrees) == 0 {
+			sb.WriteString("  (No worktrees found)\n")
+		} else {
+			for _, w := range item.BranchDetails.Worktrees {
+				sb.WriteString(fmt.Sprintf("  %s %s\n", iconWorktree, w))
+			}
+		}
+
+		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
+		if len(item.BranchDetails.ChangedFiles) == 0 {
+			sb.WriteString("  󰄬 Working tree is clean.\n")
+		} else {
+			for _, f := range item.BranchDetails.ChangedFiles {
+				sb.WriteString(fmt.Sprintf("  %s\n", f))
+			}
+		}
+
+	case TabIssues:
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + "\n\n")
+		if len(item.IssuesList) == 0 {
+			if item.OpenIssuesCount == 0 {
+				sb.WriteString("  󰄬 No open issues found for this repository.\n")
+			} else {
+				sb.WriteString("  ⏳ Loading open issues from GitHub...\n")
+			}
+		} else {
+			for _, issue := range item.IssuesList {
+				sb.WriteString(fmt.Sprintf("  %s #%-4d %s\n     %s\n\n",
+					badgeIssue.Render("⊙"), issue.Number, issue.Title,
+					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
+				))
+			}
+		}
+
+	case TabPRs:
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + "\n\n")
+		if len(item.PRsList) == 0 {
+			if item.OpenPRsCount == 0 {
+				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
+			} else {
+				sb.WriteString("  ⏳ Loading open pull requests from GitHub...\n")
+			}
+		} else {
+			for _, pr := range item.PRsList {
+				sb.WriteString(fmt.Sprintf("  %s #%-4d %s (%s %s)\n     %s\n\n",
+					badgePR.Render("󰏫"), pr.Number, pr.Title, iconBranch, pr.HeadRefName,
+					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
+				))
+			}
+		}
 	}
 
 	m.Viewport.SetContent(sb.String())
+}
+
+func (m Model) renderTabBar() string {
+	t1 := " [1 Logs] "
+	t2 := " [2 Branches & Worktrees] "
+	t3 := " [3 Issues] "
+	t4 := " [4 PRs] "
+
+	switch m.ActiveTab {
+	case TabLogs:
+		return tabActiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
+	case TabBranches:
+		return tabInactiveStyle.Render(t1) + tabActiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
+	case TabIssues:
+		return tabInactiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabActiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
+	case TabPRs:
+		return tabInactiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabActiveStyle.Render(t4)
+	}
+	return ""
 }
 
 // highlightLogLine applies NerdFont styling & syntax highlighting to log text.
@@ -443,30 +648,25 @@ func highlightLogLine(line string) string {
 		return line
 	}
 
-	// 1. Highlight timestamps [15:04:05]
 	line = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`).ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(m)
 	})
 
-	// 2. Highlight Git / GH commands
 	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list)\b`)
 	line = cmdRegex.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
 	})
 
-	// 3. Highlight URLs (https://...)
 	urlRegex := regexp.MustCompile(`https?://[^\s]+`)
 	line = urlRegex.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(m)
 	})
 
-	// 4. Highlight Quoted Strings / Branches ('main', 'master', etc.)
 	quoteRegex := regexp.MustCompile(`'[^']+'`)
 	line = quoteRegex.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(m)
 	})
 
-	// 5. Highlight Success / Error prefix markers
 	if strings.Contains(line, "󰄬") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
 		line = lipgloss.NewStyle().Foreground(colorGreen).Render(line)
 	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
@@ -490,9 +690,13 @@ func (m Model) View() string {
 	leftWidth := (m.Width / 2) - 2
 	rightWidth := (m.Width / 2) - 2
 
-	// Render Repo List (Left)
+	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
-	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰓦 REPOSITORIES") + "\n\n")
+	
+	// Table Column Headers
+	tableHeader := fmt.Sprintf("%-18s %-16s %-12s %-5s %-5s", "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
+	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(tableHeader) + "\n")
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -501,18 +705,24 @@ func (m Model) View() string {
 	} else {
 		for i, item := range m.Repos {
 			statusIcon := renderStatusBadge(item)
+
+			nameCell := truncateString(item.Name, 18)
+			statusCell := truncateString(item.StatusMsg, 16)
+			branchCell := truncateString(item.CurrentBranch, 12)
 			
-			// Build PR & Issue count badges
-			countsStr := ""
+			prsCell := "-"
 			if item.OpenPRsCount > 0 {
-				countsStr += fmt.Sprintf(" %s%d", iconPR, item.OpenPRsCount)
-			}
-			if item.OpenIssuesCount > 0 {
-				countsStr += fmt.Sprintf(" %s%d", iconIssue, item.OpenIssuesCount)
+				prsCell = fmt.Sprintf("%d", item.OpenPRsCount)
 			}
 
-			repoNameFormatted := fmt.Sprintf("%-20s", item.Name)
-			line := fmt.Sprintf("%s %s %-16s %s", statusIcon, repoNameFormatted, item.StatusMsg, countsStr)
+			issuesCell := "-"
+			if item.OpenIssuesCount > 0 {
+				issuesCell = fmt.Sprintf("%d", item.OpenIssuesCount)
+			}
+
+			line := fmt.Sprintf("%s %-16s %-16s %-12s %-5s %-5s",
+				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
+			)
 
 			if i == m.SelectedIndex {
 				leftSb.WriteString(selectedRowStyle.Width(leftWidth - 4).Render("> "+line) + "\n")
@@ -536,7 +746,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
 	// 3. Footer Keybindings Help with NerdFont Glyphs
-	footerText := "[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [c] Copy Link  |  [b] Switch Branch  |  [p] Push/PR  |  [q] Quit"
+	footerText := "[↑/↓/j/k] Move  |  [←/→/h/l] Switch Tab  |  [X] Prune Branches  |  [b] Switch Branch  |  [p] Push/PR  |  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
@@ -569,4 +779,14 @@ func renderStatusBadge(item *git.RepoItem) string {
 	default:
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(iconPending)
 	}
+}
+
+func truncateString(str string, maxLen int) string {
+	if len(str) <= maxLen {
+		return str
+	}
+	if maxLen <= 3 {
+		return str[:maxLen]
+	}
+	return str[:maxLen-3] + "..."
 }
