@@ -1,0 +1,11 @@
+# Binaries
+freshen
+*.exe
+*.exe.manifest
+*.dll
+*.so
+*.dylib
+
+# Test & OS files
+.DS_Store
+*.test
