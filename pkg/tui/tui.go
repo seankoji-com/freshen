@@ -1776,8 +1776,12 @@ func (m Model) View() string {
 		}
 	}
 
+	renderedRuns := make(map[int64]bool)
+
 	for i := jobStartIdx; i < jobEndIdx; i++ {
 		j := m.JobQueue[i]
+		runToken, jobToken := parseJobHierarchy(j.Name, j.Repo)
+
 		stSymbol := "⏳"
 		stColor := colorYellow
 		if j.Status == jobs.JobRunning {
@@ -1793,32 +1797,18 @@ func (m Model) View() string {
 
 		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
 
-		// Tree branch connector if part of a multi-job workflow run
-		treePrefix := ""
-		if count := runCounts[j.RunID]; count > 1 {
-			indices := runIndices[j.RunID]
-			if indices[len(indices)-1] == i {
-				treePrefix = "└─ "
+		// If this job is part of a multi-job run and we haven't rendered the parent run header yet:
+		if runCounts[j.RunID] > 1 && !renderedRuns[j.RunID] {
+			renderedRuns[j.RunID] = true
+			runTitleText := runToken
+			if j.RunID != 0 {
+				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+				runTitleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken), runURL)
 			} else {
-				treePrefix = "├─ "
+				runTitleText = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken)
 			}
-		}
-
-		idW := len(j.ID)
-		if idW < 8 {
-			idW = 8
-		}
-		if idW > 14 {
-			idW = 14
-		}
-
-		idStrText := lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Width(idW).Render(truncateString(j.ID, idW))
-		if j.RunID != 0 {
-			jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
-			if j.GHJobID != 0 {
-				jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, j.Repo, j.RunID, j.GHJobID)
-			}
-			idStrText = Hyperlink(idStrText, jobURL)
+			runHeaderLine := fmt.Sprintf("  %s %s", stBadge, runTitleText)
+			jobsLines = append(jobsLines, clipLine(runHeaderLine))
 		}
 
 		runnerStr := j.RunnerName
@@ -1834,23 +1824,34 @@ func (m Model) View() string {
 		}
 		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render("→ " + truncateString(runnerStr, runnerW-2))
 
-		// Give all remaining inner pane space to job name
-		prefixLen := lipgloss.Width(treePrefix)
-		nameW := paneInnerWidth - 4 - prefixLen - 9 - 1 - idW - 1 - runnerW - 1
-		if nameW < 10 {
-			nameW = 10
+		var line string
+		if runCounts[j.RunID] > 1 {
+			// Child matrix job row
+			indices := runIndices[j.RunID]
+			treeConnector := "├─ "
+			if indices[len(indices)-1] == i {
+				treeConnector = "└─ "
+			}
+
+			nameW := paneInnerWidth - 4 - 5 - runnerW - 1
+			if nameW < 10 {
+				nameW = 10
+			}
+			jobStr := lipgloss.NewStyle().Foreground(colorSecondary).Width(nameW).Render(truncateString(jobToken, nameW))
+			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStr, runnerAssigned)
+		} else {
+			// Single job run
+			nameW := paneInnerWidth - 4 - 9 - 1 - runnerW - 1
+			if nameW < 10 {
+				nameW = 10
+			}
+			jobStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(jobToken, nameW))
+			if j.RunID != 0 {
+				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+				jobStr = Hyperlink(jobStr, runURL)
+			}
+			line = fmt.Sprintf("%s %s %s", stBadge, jobStr, runnerAssigned)
 		}
-
-		// Smart display name: strip redundant repo prefix if job name starts with "repo / "
-		displayName := j.Name
-		repoPrefix := j.Repo + " / "
-		if strings.HasPrefix(displayName, repoPrefix) {
-			displayName = strings.TrimPrefix(displayName, repoPrefix)
-		}
-
-		nameStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(displayName, nameW))
-
-		line := fmt.Sprintf("%s%s %s %s %s", treePrefix, stBadge, idStrText, nameStr, runnerAssigned)
 
 		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
 			jobsLines = append(jobsLines, clipLine(selectedRowStyle.MaxWidth(paneInnerWidth).Render("> "+line)))
