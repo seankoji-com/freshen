@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"regexp"
@@ -150,6 +151,12 @@ var (
 	cellBranchStyle     = lipgloss.NewStyle().Width(16)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
 	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
+
+	// Pre-compiled regex for highlightLogLine (package level to avoid re-compiling on every call)
+	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
+	reCmd       = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
+	reURL       = regexp.MustCompile(`https?://[^\s]+`)
+	reQuoted    = regexp.MustCompile(`'[^']+'`)
 )
 
 // Hyperlink formats text as an OSC 8 terminal hyperlink.
@@ -219,9 +226,14 @@ type Model struct {
 	IsSyncing           bool
 	IsOrgSyncing        bool
 	IsJobQueueLoading   bool
+	IsRunnersLoading    bool
 	TotalCount          int
 	ToastMsg            string
 	FocusedRunID        int64 // When non-zero, a specific workflow run is focused
+	ToastPriority       int   // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	ConsecutiveErrors   int
+	RunnerFetchFailed   bool
+	JobQueueFetchFailed bool
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -257,6 +269,7 @@ func NewModel(targetDir, targetOrg string) Model {
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
 		IsJobQueueLoading:   true,
+		IsRunnersLoading:    true,
 		Spinner:             s,
 		ProgressBar:         p,
 		Viewport:            vp,
@@ -276,7 +289,7 @@ func (m Model) Init() tea.Cmd {
 
 func (m Model) loadRunnersCmd() tea.Cmd {
 	return func() tea.Msg {
-		runners, err := jobs.FetchOrgRunners(m.TargetOrg, m.Runners, m.JobQueue)
+		runners, err := jobs.FetchOrgRunners(m.TargetOrg)
 		return loadedRunnersMsg{runners: runners, err: err}
 	}
 }
@@ -298,19 +311,21 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 			repos = append(repos, repoName)
 		}
 	}
-	// If repos not loaded yet, try fetching from org API
-	if len(repos) == 0 {
-		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
-		if err == nil {
-			for _, r := range orgRepos {
-				if !r.IsArchived {
-					repos = append(repos, r.Name)
+	return func() tea.Msg {
+		// If repos not loaded yet, fetch from org API inside the closure
+		// to avoid blocking the main goroutine (was a main-thread-blocking bug).
+		repoList := repos
+		if len(repoList) == 0 {
+			orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+			if err == nil {
+				for _, r := range orgRepos {
+					if !r.IsArchived {
+						repoList = append(repoList, r.Name)
+					}
 				}
 			}
 		}
-	}
-	return func() tea.Msg {
-		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repos)
+		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList)
 		return loadedJobQueueMsg{queue: queue, err: err}
 	}
 }
@@ -477,13 +492,23 @@ func copyToClipboard(text string) error {
 	return cmd.Run()
 }
 
+// setToast sets a toast message with the given priority. Higher priority toasts
+// (error=2) override lower ones (info=1), and equal priorities replace.
+// Priority 0 clears on next keypress.
+func (m *Model) setToast(msg string, priority int) {
+	if priority >= m.ToastPriority {
+		m.ToastMsg = msg
+		m.ToastPriority = priority
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
-		m.ToastMsg = ""
+		m.setToast("", 0)
 		switch msg.String() {
 
 		case "q", "ctrl+c":
@@ -635,7 +660,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					item.CurrentBranch = git.GetOriginalBranch(item.Path)
 					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
 					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
-					m.ToastMsg = fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count)
+					m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
 					m.updateViewport()
 				}
 			}
@@ -661,17 +686,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				if err := copyToClipboard(targetCopy); err == nil {
-					m.ToastMsg = fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy)
+					m.setToast(fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy), 1)
 				}
 			} else if m.ActiveFocus == FocusRunners && len(m.Runners) > 0 && m.SelectedRunnerIndex < len(m.Runners) {
 				r := m.Runners[m.SelectedRunnerIndex]
 				if err := copyToClipboard(r.ID); err == nil {
-					m.ToastMsg = fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID)
+					m.setToast(fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID), 1)
 				}
 			} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 				j := m.JobQueue[m.SelectedJobIndex]
 				if err := copyToClipboard(j.ID); err == nil {
-					m.ToastMsg = fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID)
+					m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
 				}
 			}
 
@@ -717,7 +742,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.SelectedIndex = len(m.Repos) - 1
 					}
 
-					m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName)
+					m.setToast(fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName), 1)
 					m.updateViewport()
 				}
 			}
@@ -753,26 +778,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			// Click in Left Column Panes
 			if msg.X < m.Width/2 {
-				repoPaneEnd := 4 + len(m.Repos) + 2
-				runnersPaneEnd := repoPaneEnd + 3 + len(m.Runners)
+				// Use panel heights from View() layout instead of content lengths
+				rightBoxHeight := m.Height - 3
+				if rightBoxHeight < 13 {
+					rightBoxHeight = 13
+				}
+				totalInner := rightBoxHeight - 4
+				if totalInner < 9 {
+					totalInner = 9
+				}
+				runnersBoxHeight := 4
+				repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
+				if repoBoxHeight < 4 {
+					repoBoxHeight = 4
+				}
 
-				if msg.Y >= 2 && msg.Y <= repoPaneEnd {
+				// Y=0 is header, Y=1 starts the first panel
+				// Each bordered panel: 1 top border + innerHeight + 1 bottom border = innerHeight + 2
+				repoPaneStart := 1 + 1 // header + top border
+				repoPaneEnd := repoPaneStart + repoBoxHeight
+				runnersPaneStart := repoPaneEnd + 1 // bottom border of repo + top border of runners
+				runnersPaneEnd := runnersPaneStart + runnersBoxHeight
+
+				if msg.Y >= repoPaneStart && msg.Y <= repoPaneEnd {
 					m.ActiveFocus = FocusRepos
-					clickedIdx := msg.Y - 4
+					clickedIdx := msg.Y - repoPaneStart - 1 // -1 for header row
 					if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
 						m.SelectedIndex = clickedIdx
 					}
 					m.updateViewport()
 				} else if msg.Y > repoPaneEnd && msg.Y <= runnersPaneEnd {
 					m.ActiveFocus = FocusRunners
-					clickedIdx := msg.Y - repoPaneEnd - 2
+					clickedIdx := msg.Y - runnersPaneStart
 					if clickedIdx >= 0 && clickedIdx < len(m.Runners) {
 						m.SelectedRunnerIndex = clickedIdx
 					}
 					m.updateViewport()
 				} else if msg.Y > runnersPaneEnd {
 					m.ActiveFocus = FocusJobs
-					clickedIdx := msg.Y - runnersPaneEnd - 2
+					jobsPaneStart := runnersPaneEnd + 1
+					clickedIdx := msg.Y - jobsPaneStart - 2
 					if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
 						m.SelectedJobIndex = clickedIdx
 					}
@@ -821,99 +866,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmdsToAdd...)
 
 	case loadedRunnersMsg:
-		if msg.err == nil && len(msg.runners) > 0 {
-			m.Runners = msg.runners
+		m.IsRunnersLoading = false
+		if msg.err != nil {
+			m.RunnerFetchFailed = true
+			m.ConsecutiveErrors++
+			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+		} else {
+			m.RunnerFetchFailed = false
+			m.ConsecutiveErrors = 0
+			// Always update runners, even if empty
+			merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
+			m.Runners = merged
+
+			if len(m.Runners) == 0 {
+				m.setToast(" No registered runners found for org.", 1)
+			}
+
 			m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
 			m.updateViewport()
 		}
 
 	case loadedJobQueueMsg:
 		m.IsJobQueueLoading = false
-		if msg.err == nil {
-			// Compare with previous queue to trigger toast notifications
-			if len(m.JobQueue) > 0 {
-				oldJobs := make(map[string]*jobs.JobItem)
-				for _, j := range m.JobQueue {
-					oldJobs[j.ID] = j
-				}
-
-				newJobsMap := make(map[string]*jobs.JobItem)
-				for _, j := range msg.queue {
-					newJobsMap[j.ID] = j
-				}
-
-				// Check for status changes or new jobs
-				for _, newJ := range msg.queue {
-					if oldJ, ok := oldJobs[newJ.ID]; ok {
-						if oldJ.Status != newJ.Status {
-							if newJ.Status == jobs.JobRunning {
-								runnerStr := newJ.RunnerName
-								if runnerStr == "" {
-									runnerStr = "worker"
-								}
-								m.ToastMsg = fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr)
-							} else if newJ.Status == jobs.JobPassed {
-								m.ToastMsg = fmt.Sprintf(" 󰄬 Job %s passed (%s)", newJ.ID, newJ.Name)
-							} else if newJ.Status == jobs.JobFailed {
-								m.ToastMsg = fmt.Sprintf(" 󰅙 Job %s failed (%s)", newJ.ID, newJ.Name)
-							}
-						}
-					} else {
-						// Brand new job detected during polling
-						if newJ.Status == jobs.JobRunning {
-							runnerStr := newJ.RunnerName
-							if runnerStr == "" {
-								runnerStr = "worker"
-							}
-							m.ToastMsg = fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr)
-						} else if newJ.Status == jobs.JobQueued {
-							m.ToastMsg = fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name)
-						}
-					}
-				}
-
-				// Check for jobs that finished and left the queue
-				for _, oldJ := range m.JobQueue {
-					if _, stillThere := newJobsMap[oldJ.ID]; !stillThere {
-						if oldJ.Status == jobs.JobRunning {
-							m.ToastMsg = fmt.Sprintf(" 󰄬 Job %s completed (%s)", oldJ.ID, oldJ.Name)
-						}
-					}
-				}
+		if msg.err != nil {
+			m.JobQueueFetchFailed = true
+			m.ConsecutiveErrors++
+			slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
+			if len(msg.queue) > 0 {
+				m.processJobQueueUpdate(msg.queue)
+				cmds = append(cmds, m.triggerLogFetchForSelectedJob())
 			}
-
-			// Preserve existing logs on jobs we already have
-			existingLogs := make(map[string][]string)
-			existingGHJobID := make(map[string]int64)
-			for _, j := range m.JobQueue {
-				if len(j.Logs) > 0 {
-					existingLogs[j.ID] = j.Logs
-					existingGHJobID[j.ID] = j.GHJobID
-				}
-			}
-			for _, j := range msg.queue {
-				if logs, ok := existingLogs[j.ID]; ok {
-					j.Logs = logs
-					j.GHJobID = existingGHJobID[j.ID]
-				}
-			}
-			m.JobQueue = reconcileRunnerJobs(m.Runners, msg.queue, m.TargetOrg)
-			// Kick off log fetch for selected running job
-			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-				selJob := m.JobQueue[m.SelectedJobIndex]
-				if selJob.Status == jobs.JobRunning {
-					cmds = append(cmds, m.loadJobLogsCmd(selJob))
-				}
-			}
+			m.updateViewport()
+		} else {
+			m.JobQueueFetchFailed = false
+			m.ConsecutiveErrors = 0
+			m.processJobQueueUpdate(msg.queue)
+			cmds = append(cmds, m.triggerLogFetchForSelectedJob())
 			m.updateViewport()
 		}
 
 	case loadedJobLogsMsg:
-		if msg.err == nil && len(msg.logs) > 0 {
+		if msg.err != nil {
+			slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
+		}
+		if len(msg.logs) > 0 {
 			for _, j := range m.JobQueue {
 				if j.ID == msg.jobID {
 					j.Logs = msg.logs
 					j.GHJobID = msg.ghJobID
+					break
+				}
+			}
+			m.updateViewport()
+		} else if msg.err != nil {
+			for _, j := range m.JobQueue {
+				if j.ID == msg.jobID {
+					j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
 					break
 				}
 			}
@@ -929,7 +939,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			for _, newR := range msg.repos {
 				if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
-					m.ToastMsg = fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch)
+					m.setToast(fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
 				}
 			}
 		}
@@ -974,6 +984,100 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, vpCmd)
 
 	return m, tea.Batch(cmds...)
+}
+
+// processJobQueueUpdate processes a freshly loaded job queue, comparing to the
+// old queue for status-change notifications with proper priority handling.
+func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem) {
+	if len(m.JobQueue) > 0 {
+		oldJobs := make(map[string]*jobs.JobItem)
+		for _, j := range m.JobQueue {
+			oldJobs[j.ID] = j
+		}
+
+		newJobsMap := make(map[string]*jobs.JobItem)
+		for _, j := range queue {
+			newJobsMap[j.ID] = j
+		}
+
+		// Status changes — failure toasts (priority 2) survive info toasts (priority 1)
+		for _, newJ := range queue {
+			if oldJ, ok := oldJobs[newJ.ID]; ok {
+				if oldJ.Status != newJ.Status {
+					if newJ.Status == jobs.JobFailed {
+						runnerStr := newJ.RunnerName
+						if runnerStr == "" {
+							runnerStr = "worker"
+						}
+						m.setToast(fmt.Sprintf(" ❌ Job %s failed (%s) on %s", newJ.ID, newJ.Name, runnerStr), 2)
+					} else if newJ.Status == jobs.JobRunning {
+						runnerStr := newJ.RunnerName
+						if runnerStr == "" {
+							runnerStr = "worker"
+						}
+						m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+					} else if newJ.Status == jobs.JobPassed {
+						m.setToast(fmt.Sprintf(" ✅ Job %s passed (%s)", newJ.ID, newJ.Name), 1)
+					}
+				}
+			} else {
+				if newJ.Status == jobs.JobRunning {
+					runnerStr := newJ.RunnerName
+					if runnerStr == "" {
+						runnerStr = "worker"
+					}
+					m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+				} else if newJ.Status == jobs.JobQueued {
+					m.setToast(fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name), 1)
+				}
+			}
+		}
+
+		// Jobs that finished and left the queue
+		for _, oldJ := range m.JobQueue {
+			if _, stillThere := newJobsMap[oldJ.ID]; !stillThere {
+				if oldJ.Status == jobs.JobRunning {
+					m.setToast(fmt.Sprintf(" ✅ Job %s completed (%s)", oldJ.ID, oldJ.Name), 1)
+				}
+			}
+		}
+	}
+
+	// Preserve existing logs
+	existingLogs := make(map[string][]string)
+	existingGHJobID := make(map[string]int64)
+	for _, j := range m.JobQueue {
+		if len(j.Logs) > 0 {
+			existingLogs[j.ID] = j.Logs
+			existingGHJobID[j.ID] = j.GHJobID
+		}
+	}
+	for _, j := range queue {
+		if logs, ok := existingLogs[j.ID]; ok {
+			j.Logs = logs
+			j.GHJobID = existingGHJobID[j.ID]
+		}
+	}
+	m.JobQueue = reconcileRunnerJobs(m.Runners, queue, m.TargetOrg)
+
+	// Bounds validation after queue update
+	if len(m.JobQueue) > 0 && m.SelectedJobIndex >= len(m.JobQueue) {
+		m.SelectedJobIndex = len(m.JobQueue) - 1
+	}
+	if len(m.Runners) > 0 && m.SelectedRunnerIndex >= len(m.Runners) {
+		m.SelectedRunnerIndex = len(m.Runners) - 1
+	}
+}
+
+// triggerLogFetchForSelectedJob returns a log-fetch command if a running job is selected.
+func (m Model) triggerLogFetchForSelectedJob() tea.Cmd {
+	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		selJob := m.JobQueue[m.SelectedJobIndex]
+		if selJob.Status == jobs.JobRunning {
+			return m.loadJobLogsCmd(selJob)
+		}
+	}
+	return nil
 }
 
 func (m *Model) triggerTabFetch() tea.Cmd {
@@ -1061,7 +1165,9 @@ func (m *Model) updateViewport() {
 		sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
 		sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
 		if len(tags) > 1 {
-			sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
+			if len(tags) > 1 {
+				sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
+			}
 		}
 
 		// --- MATCHING RUNNERS TABLE ---
@@ -1600,22 +1706,19 @@ func highlightLogLine(line string) string {
 		return line
 	}
 
-	line = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`).ReplaceAllStringFunc(line, func(m string) string {
+	line = reTimestamp.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(m)
 	})
 
-	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
-	line = cmdRegex.ReplaceAllStringFunc(line, func(m string) string {
+	line = reCmd.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
 	})
 
-	urlRegex := regexp.MustCompile(`https?://[^\s]+`)
-	line = urlRegex.ReplaceAllStringFunc(line, func(m string) string {
+	line = reURL.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(m)
 	})
 
-	quoteRegex := regexp.MustCompile(`'[^']+'`)
-	line = quoteRegex.ReplaceAllStringFunc(line, func(m string) string {
+	line = reQuoted.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(m)
 	})
 
@@ -2094,7 +2197,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
 	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [j/k] Scroll  [c] Copy  [q] Quit"
+	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [d] Del Archived  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
@@ -2183,12 +2286,7 @@ func findJobForRunner(r *jobs.RunnerItem, queue []*jobs.JobItem) *jobs.JobItem {
 			return j
 		}
 	}
-	// 4. Try any running job in queue
-	for _, j := range queue {
-		if j.Status == jobs.JobRunning {
-			return j
-		}
-	}
+	// No more fallback — returning a random running job would be misleading.
 	return nil
 }
 
@@ -2236,7 +2334,7 @@ func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targ
 				result = append(result, &jobs.JobItem{
 					ID:         jobID,
 					Name:       jobTitle,
-					Repo:       targetOrg,
+					Repo:       "", // unknown — synthetic entry; URL construction guarded by RunID==0
 					Status:     jobs.JobRunning,
 					RunnerName: r.Name,
 					RunnerID:   r.ID,
