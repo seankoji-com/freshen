@@ -1165,9 +1165,7 @@ func (m *Model) updateViewport() {
 		sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
 		sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
 		if len(tags) > 1 {
-			if len(tags) > 1 {
-				sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
-			}
+			sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
 		}
 
 		// --- MATCHING RUNNERS TABLE ---
