@@ -22,6 +22,7 @@ var (
 	iconFolder   = "󰉋"
 	iconBranch   = ""
 	iconPR       = "󰏫"
+	iconIssue    = "⊙"
 	iconSuccess  = "󰄬"
 	iconError    = "󰅙"
 	iconRebase   = "󰚰"
@@ -68,6 +69,10 @@ var (
 
 	badgePR = lipgloss.NewStyle().
 			Foreground(colorYellow).
+			Bold(true)
+
+	badgeIssue = lipgloss.NewStyle().
+			Foreground(colorBlue).
 			Bold(true)
 
 	badgeError = lipgloss.NewStyle().
@@ -165,6 +170,7 @@ func (m Model) Init() tea.Cmd {
 func (m Model) loadOrgReposCmd() tea.Cmd {
 	return func() tea.Msg {
 		orgRepos, _ := git.FetchOrgRepos(m.TargetOrg)
+		orgCounts, _ := git.FetchOrgRepoCounts(m.TargetOrg)
 
 		// Discover existing local repos in target directory
 		entries, err := git.ScanLocalDirectory(m.TargetDir)
@@ -188,6 +194,11 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 				Logs:       make([]string, 0),
 			}
 
+			if counts, found := orgCounts[ghRepo.Name]; found {
+				item.OpenIssuesCount = counts.Issues
+				item.OpenPRsCount = counts.PRs
+			}
+
 			if ghRepo.IsArchived {
 				item.Status = git.StatusArchived
 				item.StatusMsg = "Archived (Press 'd' to delete)"
@@ -208,6 +219,12 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 						Status:     git.StatusPending,
 						Logs:       make([]string, 0),
 					}
+
+					if counts, found := orgCounts[item.GHRepoName]; found {
+						item.OpenIssuesCount = counts.Issues
+						item.OpenPRsCount = counts.PRs
+					}
+
 					repoMap[name] = item
 				}
 			}
@@ -401,6 +418,7 @@ func (m *Model) updateViewport() {
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("GITHUB NAME:"), item.GHRepoName))
 	sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL PATH: "), iconFolder, item.Path))
 	sb.WriteString(fmt.Sprintf("%s %s %s (Default: %s)\n", lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render("BRANCH:     "), iconBranch, item.CurrentBranch, item.DefaultBranch))
+	sb.WriteString(fmt.Sprintf("%s %s %d open  |  %s %d open\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("METRICS:    "), iconPR, item.OpenPRsCount, iconIssue, item.OpenIssuesCount))
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:     "), item.StatusMsg))
 	
 	if item.ExistingPRURL != "" {
@@ -483,7 +501,18 @@ func (m Model) View() string {
 	} else {
 		for i, item := range m.Repos {
 			statusIcon := renderStatusBadge(item)
-			line := fmt.Sprintf("%s %-22s %s", statusIcon, item.Name, item.StatusMsg)
+			
+			// Build PR & Issue count badges
+			countsStr := ""
+			if item.OpenPRsCount > 0 {
+				countsStr += fmt.Sprintf(" %s%d", iconPR, item.OpenPRsCount)
+			}
+			if item.OpenIssuesCount > 0 {
+				countsStr += fmt.Sprintf(" %s%d", iconIssue, item.OpenIssuesCount)
+			}
+
+			repoNameFormatted := fmt.Sprintf("%-20s", item.Name)
+			line := fmt.Sprintf("%s %s %-16s %s", statusIcon, repoNameFormatted, item.StatusMsg, countsStr)
 
 			if i == m.SelectedIndex {
 				leftSb.WriteString(selectedRowStyle.Width(leftWidth - 4).Render("> "+line) + "\n")
