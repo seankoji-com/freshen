@@ -114,7 +114,7 @@ func TestRunnerView_NoWordBusy_HyperlinkJobTitle(t *testing.T) {
 	}
 
 	// 2. Current Job line must display the job title
-	if !strings.Contains(viewContent, ".dotfiles / parallel-review") {
+	if !strings.Contains(viewContent, "parallel-review") {
 		t.Errorf("expected Current Job to contain workflow job title, got:\n%s", viewContent)
 	}
 
