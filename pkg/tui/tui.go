@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -232,6 +233,16 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			localDir := git.GetLocalDirName(ghRepo.Name)
 			localPath := fmt.Sprintf("%s/%s", m.TargetDir, localDir)
 
+			localExists := false
+			if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
+				localExists = true
+			}
+
+			// Filter out archived repos if they are NOT cloned locally
+			if ghRepo.IsArchived && !localExists {
+				continue
+			}
+
 			item := &git.RepoItem{
 				Name:       localDir,
 				GHRepoName: ghRepo.Name,
@@ -357,25 +368,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up":
-			// Arrow key UP moves selection up left table
+			// Arrow UP moves repository selection up in left table pane
 			if m.SelectedIndex > 0 {
 				m.SelectedIndex--
 				m.updateViewport()
 			}
 
 		case "down":
-			// Arrow key DOWN moves selection down left table
+			// Arrow DOWN moves repository selection down in left table pane
 			if m.SelectedIndex < len(m.Repos)-1 {
 				m.SelectedIndex++
 				m.updateViewport()
 			}
 
-		case "j", "J", "ctrl+d", "pgdown":
-			// j/J scrolls right viewport panel down
+		case "j", "ctrl+d", "pgdown":
+			// j scrolls right detailed viewport pane down
 			m.Viewport.LineDown(3)
 
-		case "k", "K", "ctrl+u", "pgup":
-			// k/K scrolls right viewport panel up
+		case "k", "ctrl+u", "pgup":
+			// k scrolls right detailed viewport pane up
 			m.Viewport.LineUp(3)
 
 		case "right", "l", "tab":
