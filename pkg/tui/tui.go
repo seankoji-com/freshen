@@ -132,6 +132,14 @@ var (
 	cellIssuesStyle     = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
 )
 
+// Hyperlink formats text as an OSC 8 terminal hyperlink.
+func Hyperlink(text, url string) string {
+	if url == "" {
+		return text
+	}
+	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text)
+}
+
 // --- Messages for Bubble Tea Update Loop ---
 
 type syncFinishedMsg struct{}
@@ -529,11 +537,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			if msg.X < m.Width/2 && msg.Y >= 4 {
-				clickedIdx := msg.Y - 4
+			// Click in Left Repo Table Pane (Row 0 starts at Y = 5)
+			if msg.X < m.Width/2 && msg.Y >= 5 {
+				clickedIdx := msg.Y - 5
 				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
 					m.SelectedIndex = clickedIdx
 					m.updateViewport()
+				}
+			}
+			// Click in Right Detail View Pane (Tab Bar at Y = 6)
+			if msg.X >= m.Width/2 && msg.Y >= 5 && msg.Y <= 7 {
+				relX := msg.X - (m.Width / 2)
+				if relX >= 0 && relX < 12 {
+					m.ActiveTab = TabLogs
+					m.updateViewport()
+				} else if relX >= 12 && relX < 36 {
+					m.ActiveTab = TabBranches
+					m.updateViewport()
+				} else if relX >= 36 && relX < 48 {
+					m.ActiveTab = TabIssues
+					m.updateViewport()
+					cmds = append(cmds, m.triggerTabFetch())
+				} else if relX >= 48 {
+					m.ActiveTab = TabPRs
+					m.updateViewport()
+					cmds = append(cmds, m.triggerTabFetch())
 				}
 			}
 		}
@@ -596,29 +624,35 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	// Header metadata with styled counts
-	prCountStr := lipgloss.NewStyle().Foreground(colorMuted).Render("0 open")
-	if item.OpenPRsCount > 0 {
-		prCountStr = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d open", item.OpenPRsCount))
-	}
-
-	issueCountStr := lipgloss.NewStyle().Foreground(colorMuted).Render("0 open")
-	if item.OpenIssuesCount > 0 {
-		issueCountStr = lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d open", item.OpenIssuesCount))
-	}
-
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.GHRepoName)))
+	// Build Clickable Hyperlinks for Right Pane Top Metadata Line
+	repoURL := fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, item.GHRepoName)
+	repoLink := Hyperlink(fmt.Sprintf("%s %s", iconGithub, subtitleStyle.Render(item.GHRepoName)), repoURL)
 
 	branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
 	if item.CurrentBranch != item.DefaultBranch {
 		branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
 	}
+	branchURL := fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch)
+	branchLink := Hyperlink(fmt.Sprintf("%s %s", iconBranch, branchDetail), branchURL)
 
-	shortPath := git.ShortenHomePath(item.Path)
-	sb.WriteString(fmt.Sprintf(" %s  |  %s %s\n", shortPath, iconBranch, branchDetail))
-	sb.WriteString(fmt.Sprintf("%s %s  |  %s %s  |  %s %s\n\n",
-		lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:"), item.StatusMsg,
-		iconPR, prCountStr, iconIssue, issueCountStr,
+	prCountStr := "0 open"
+	if item.OpenPRsCount > 0 {
+		prCountStr = fmt.Sprintf("%d open", item.OpenPRsCount)
+	}
+	prURL := fmt.Sprintf("%s/pulls", repoURL)
+	prLink := Hyperlink(fmt.Sprintf("%s %s", iconPR, prCountStr), prURL)
+
+	issueCountStr := "0 open"
+	if item.OpenIssuesCount > 0 {
+		issueCountStr = fmt.Sprintf("%d open", item.OpenIssuesCount)
+	}
+	issueURL := fmt.Sprintf("%s/issues", repoURL)
+	issueLink := Hyperlink(fmt.Sprintf("%s %s", iconIssue, issueCountStr), issueURL)
+
+	// Sleek 1-Line Clickable Metadata Header:
+	//  carey-finance  |   master (default)  |  OK  |  󰏫 0 open  |  ⊙ 125 open
+	sb.WriteString(fmt.Sprintf(" %s  |  %s  |  %s  |  %s  |  %s\n\n",
+		repoLink, branchLink, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(item.StatusMsg), prLink, issueLink,
 	))
 
 	// Tab Bar Header
@@ -762,15 +796,17 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Single Compact Line Header Banner with Far-Right Anchored Target Org Info
+	// 1. Single Compact Line Header Banner with Far-Right Anchored Clickable Target Org Link
 	shortTargetDir := git.ShortenHomePath(m.TargetDir)
 	leftTitle := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
 		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager")
 
-	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s %s", shortTargetDir, iconGithub, m.TargetOrg))
+	orgURL := fmt.Sprintf("https://github.com/%s", m.TargetOrg)
+	clickableOrg := Hyperlink(fmt.Sprintf("%s %s", iconGithub, m.TargetOrg), orgURL)
+	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s", shortTargetDir, clickableOrg))
 
 	leftWidthVis := lipgloss.Width(leftTitle)
-	rightWidthVis := lipgloss.Width(rightSubtitle)
+	rightWidthVis := lipgloss.Width(shortTargetDir + " |  " + iconGithub + " " + m.TargetOrg)
 
 	spacingLen := m.Width - leftWidthVis - rightWidthVis
 	if spacingLen < 1 {
@@ -786,8 +822,8 @@ func (m Model) View() string {
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
 
-	// Pixel-Perfect Column Header Layout
-	headerPrefix := "  "
+	// Pixel-Perfect Column Header Layout (Header Prefix = "    " [4 spaces] matching data row prefix)
+	headerPrefix := "    "
 	headerLine := fmt.Sprintf("%s%s %s %s %s",
 		headerPrefix,
 		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
@@ -796,7 +832,7 @@ func (m Model) View() string {
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
 	leftSb.WriteString(headerLine + "\n")
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  --------------------------------------------------------------------------------") + "\n")
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("    --------------------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -819,6 +855,9 @@ func (m Model) View() string {
 
 			var branchStyle lipgloss.Style
 
+			// Feature branch rule: A branch is default ONLY if branchStr == "main" or "master"
+			isDefaultBranch := branchStr == "main" || branchStr == "master"
+
 			if item.IsArchived {
 				displayText = " Archived"
 				branchStyle = lipgloss.NewStyle().Foreground(colorMuted).Strikethrough(true)
@@ -827,11 +866,11 @@ func (m Model) View() string {
 			} else if item.HasUnstagedChanges {
 				// Dirty branch (both default and feature) -> Yellow text
 				branchStyle = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
-			} else if branchStr == item.DefaultBranch || branchStr == "-" {
-				// Clean default branch -> Greyed out text
+			} else if isDefaultBranch || branchStr == "-" {
+				// Clean default branch (main/master) -> Greyed out text
 				branchStyle = lipgloss.NewStyle().Foreground(colorMuted)
 			} else {
-				// Clean feature branch -> Green text
+				// Clean feature branch (scaffold/initial, etc.) -> Green text
 				branchStyle = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 			}
 
