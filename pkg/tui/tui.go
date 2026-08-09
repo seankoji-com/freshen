@@ -152,11 +152,13 @@ type orgSyncedMsg struct {
 type loadedIssuesMsg struct {
 	repoName string
 	issues   []git.IssueItem
+	err      error
 }
 
 type loadedPRsMsg struct {
 	repoName string
 	prs      []git.PRItem
+	err      error
 }
 
 // --- Bubble Tea Model ---
@@ -243,6 +245,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 				Name:       localDir,
 				GHRepoName: ghRepo.Name,
 				Path:       localPath,
+				URL:        ghRepo.URL,
 				IsArchived: ghRepo.IsArchived,
 				Status:     git.StatusPending,
 				Logs:       make([]string, 0),
@@ -274,6 +277,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 						Name:          name,
 						GHRepoName:    git.GetGHRepoName(name),
 						Path:          path,
+						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
 						CurrentBranch: git.GetOriginalBranch(path),
 						DefaultBranch: git.GetDefaultBranch(path),
 						Status:        git.StatusPending,
@@ -306,15 +310,15 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 
 func (m Model) fetchIssuesCmd(repoName, ghRepoName string) tea.Cmd {
 	return func() tea.Msg {
-		issues, _ := git.FetchOpenIssuesList(m.TargetOrg, ghRepoName)
-		return loadedIssuesMsg{repoName: repoName, issues: issues}
+		issues, err := git.FetchOpenIssuesList(m.TargetOrg, ghRepoName)
+		return loadedIssuesMsg{repoName: repoName, issues: issues, err: err}
 	}
 }
 
 func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
 	return func() tea.Msg {
-		prs, _ := git.FetchOpenPRsList(m.TargetOrg, ghRepoName)
-		return loadedPRsMsg{repoName: repoName, prs: prs}
+		prs, err := git.FetchOpenPRsList(m.TargetOrg, ghRepoName)
+		return loadedPRsMsg{repoName: repoName, prs: prs, err: err}
 	}
 }
 
@@ -518,8 +522,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loadedIssuesMsg:
 		for _, item := range m.Repos {
 			if item.Name == msg.repoName {
-				item.IssuesList = msg.issues
+				item.IsLoadingIssues = false
 				item.HasLoadedIssues = true
+				if msg.err == nil && msg.issues != nil {
+					item.IssuesList = msg.issues
+				}
 				break
 			}
 		}
@@ -528,8 +535,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loadedPRsMsg:
 		for _, item := range m.Repos {
 			if item.Name == msg.repoName {
-				item.PRsList = msg.prs
+				item.IsLoadingPRs = false
 				item.HasLoadedPRs = true
+				if msg.err == nil && msg.prs != nil {
+					item.PRsList = msg.prs
+				}
 				break
 			}
 		}
@@ -537,28 +547,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Click in Left Repo Table Pane (Row 0 starts at Y = 5)
-			if msg.X < m.Width/2 && msg.Y >= 5 {
-				clickedIdx := msg.Y - 5
+			// Click in Left Repo Table Pane (Row 0 starts at Y = 4)
+			if msg.X < m.Width/2 && msg.Y >= 4 {
+				clickedIdx := msg.Y - 4
 				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
 					m.SelectedIndex = clickedIdx
 					m.updateViewport()
 				}
 			}
-			// Click in Right Detail View Pane (Tab Bar at Y = 6)
-			if msg.X >= m.Width/2 && msg.Y >= 5 && msg.Y <= 7 {
+			// Click in Right Detail View Pane (Tab Bar at Y = 4 or Y = 5)
+			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
 				relX := msg.X - (m.Width / 2)
-				if relX >= 0 && relX < 12 {
+				if relX >= 0 && relX < 10 {
 					m.ActiveTab = TabLogs
 					m.updateViewport()
-				} else if relX >= 12 && relX < 36 {
+				} else if relX >= 10 && relX < 35 {
 					m.ActiveTab = TabBranches
 					m.updateViewport()
-				} else if relX >= 36 && relX < 48 {
+				} else if relX >= 35 && relX < 47 {
 					m.ActiveTab = TabIssues
 					m.updateViewport()
 					cmds = append(cmds, m.triggerTabFetch())
-				} else if relX >= 48 {
+				} else if relX >= 47 {
 					m.ActiveTab = TabPRs
 					m.updateViewport()
 					cmds = append(cmds, m.triggerTabFetch())
@@ -602,15 +612,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m Model) triggerTabFetch() tea.Cmd {
+func (m *Model) triggerTabFetch() tea.Cmd {
 	if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
 		return nil
 	}
 	item := m.Repos[m.SelectedIndex]
-	if m.ActiveTab == TabIssues && !item.HasLoadedIssues {
+	if m.ActiveTab == TabIssues {
+		item.IsLoadingIssues = true
 		return m.fetchIssuesCmd(item.Name, item.GHRepoName)
 	}
-	if m.ActiveTab == TabPRs && !item.HasLoadedPRs {
+	if m.ActiveTab == TabPRs {
+		item.IsLoadingPRs = true
 		return m.fetchPRsCmd(item.Name, item.GHRepoName)
 	}
 	return nil
@@ -625,7 +637,10 @@ func (m *Model) updateViewport() {
 	var sb strings.Builder
 
 	// Build Clickable Hyperlinks for Right Pane Top Metadata Line
-	repoURL := fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, item.GHRepoName)
+	repoURL := item.URL
+	if repoURL == "" {
+		repoURL = fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, item.GHRepoName)
+	}
 	repoLink := Hyperlink(fmt.Sprintf("%s %s", iconGithub, subtitleStyle.Render(item.GHRepoName)), repoURL)
 
 	branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
@@ -705,9 +720,14 @@ func (m *Model) updateViewport() {
 		}
 
 	case TabIssues:
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + "\n\n")
-		if !item.HasLoadedIssues {
-			sb.WriteString("  ⏳ Loading open issues from GitHub...\n")
+		spinnerStr := ""
+		if item.IsLoadingIssues {
+			spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+		}
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
+
+		if len(item.IssuesList) == 0 && item.IsLoadingIssues {
+			sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", m.Spinner.View()))
 		} else if len(item.IssuesList) == 0 {
 			sb.WriteString("  󰄬 No open issues found for this repository.\n")
 		} else {
@@ -720,9 +740,14 @@ func (m *Model) updateViewport() {
 		}
 
 	case TabPRs:
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + "\n\n")
-		if !item.HasLoadedPRs {
-			sb.WriteString("  ⏳ Loading open pull requests from GitHub...\n")
+		spinnerStr := ""
+		if item.IsLoadingPRs {
+			spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+		}
+		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
+
+		if len(item.PRsList) == 0 && item.IsLoadingPRs {
+			sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", m.Spinner.View()))
 		} else if len(item.PRsList) == 0 {
 			sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
 		} else {
