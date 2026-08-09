@@ -421,8 +421,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err == nil {
 					item.CurrentBranch = git.GetOriginalBranch(item.Path)
 					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
-					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned stale worktrees and deleted %d non-default local branches.", count))
-					m.ToastMsg = fmt.Sprintf(" 󰄬 Deleted %d stale branches & pruned worktrees!", count)
+					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), pruned worktrees, and deleted %d non-default local branches.", count))
+					m.ToastMsg = fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, deleted %d stale branches & pruned worktrees!", count)
 					m.updateViewport()
 				}
 			}
@@ -654,7 +654,7 @@ func (m *Model) updateViewport() {
 
 	case TabBranches:
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to delete non-default local branches & prune worktrees)") + "\n\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
 
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
 		if len(item.BranchDetails.Branches) == 0 {
