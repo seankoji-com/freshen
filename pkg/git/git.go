@@ -424,8 +424,8 @@ func SyncRepository(item *RepoItem) {
 
 	if origBranch == defaultBranch {
 		if !hasUnstagedChanges {
-			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (clean). Running git pull...", defaultBranch))
-			pullCmd := exec.Command("git", "-C", item.Path, "pull")
+			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (clean). Running git pull --no-rebase origin %s...", defaultBranch, defaultBranch))
+			pullCmd := exec.Command("git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
 			var pullOut bytes.Buffer
 			pullCmd.Stdout = &pullOut
 			pullCmd.Stderr = &pullOut
@@ -458,7 +458,7 @@ func SyncRepository(item *RepoItem) {
 			}
 			item.Stashed = true
 
-			pullCmd := exec.Command("git", "-C", item.Path, "pull")
+			pullCmd := exec.Command("git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
 			_ = pullCmd.Run()
 
 			applyCmd := exec.Command("git", "-C", item.Path, "stash", "apply")
@@ -487,7 +487,7 @@ func SyncRepository(item *RepoItem) {
 		}
 		item.CurrentBranch = defaultBranch
 
-		pullCmd := exec.Command("git", "-C", item.Path, "pull")
+		pullCmd := exec.Command("git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
 		var pullOut bytes.Buffer
 		pullCmd.Stdout = &pullOut
 		pullCmd.Stderr = &pullOut
