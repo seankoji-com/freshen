@@ -146,11 +146,14 @@ func TestTableOrderInFocusRunners(t *testing.T) {
 	m.updateViewport()
 	viewContent := m.Viewport.View()
 
-	allRunnersIdx := strings.Index(viewContent, "ALL RUNNERS")
-	queuedJobsIdx := strings.Index(viewContent, "QUEUED / RUNNING JOBS ON THIS RUNNER")
+	allRunnersIdx := strings.Index(viewContent, "RUNNERS MATCHING")
+	if allRunnersIdx == -1 {
+		allRunnersIdx = strings.Index(viewContent, "ALL RUNNERS")
+	}
+	queuedJobsIdx := strings.Index(viewContent, "QUEUED / RUNNING JOBS ON")
 
 	if allRunnersIdx == -1 || queuedJobsIdx == -1 {
-		t.Fatalf("expected both 'ALL RUNNERS' and 'QUEUED / RUNNING JOBS ON THIS RUNNER' headers in view")
+		t.Fatalf("expected both 'RUNNERS MATCHING' and 'QUEUED / RUNNING JOBS ON' headers in view")
 	}
 
 	if allRunnersIdx > queuedJobsIdx {
