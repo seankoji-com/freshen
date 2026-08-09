@@ -684,8 +684,16 @@ func (m *Model) updateViewport() {
 			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
 		}
 		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
+
+		wrapWidth := m.Viewport.Width - 2
+		if wrapWidth < 20 {
+			wrapWidth = 40
+		}
+		logWrapper := lipgloss.NewStyle().Width(wrapWidth)
+
 		for _, logLine := range item.Logs {
-			sb.WriteString(highlightLogLine(logLine) + "\n")
+			styled := highlightLogLine(logLine)
+			sb.WriteString(logWrapper.Render(styled) + "\n")
 		}
 
 	case TabBranches:
