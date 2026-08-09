@@ -445,12 +445,27 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			if seenRunIDs[run.ID] {
 				continue
 			}
-			seenRunIDs[run.ID] = true
 
 			repoName := run.Repository.Name
 			if repoName == "" {
 				repoName = "unknown"
 			}
+
+			// Filter to tracked repositories if repos filter is provided
+			if len(repos) > 0 {
+				matched := false
+				for _, r := range repos {
+					if strings.EqualFold(r, repoName) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+
+			seenRunIDs[run.ID] = true
 
 			jobsOut, err := runGHCommand(
 				"api",

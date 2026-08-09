@@ -397,6 +397,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			if counts, found := orgCounts[ghRepo.Name]; found {
 				item.OpenIssuesCount = counts.Issues
 				item.OpenPRsCount = counts.PRs
+				item.HasLoadedCounts = true
 			}
 
 			if ghRepo.IsArchived {
@@ -425,6 +426,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 					if counts, found := orgCounts[item.GHRepoName]; found {
 						item.OpenIssuesCount = counts.Issues
 						item.OpenPRsCount = counts.PRs
+						item.HasLoadedCounts = true
 					}
 
 					repoMap[name] = item
@@ -546,9 +548,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			case FocusRunners:
-				if len(m.Repos) > 0 {
+				if m.SelectedRunnerIndex > 0 {
+					m.SelectedRunnerIndex--
+					m.updateViewport()
+				} else if len(m.Repos) > 0 {
 					m.ActiveFocus = FocusRepos
 					m.SelectedIndex = len(m.Repos) - 1
+					m.setToast(" Focused Repositories Panel", 1)
 					m.updateViewport()
 				}
 			case FocusJobs:
@@ -563,6 +569,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					m.ActiveFocus = FocusRunners
+					matching := m.getMatchingRunners()
+					if len(matching) > 0 {
+						m.SelectedRunnerIndex = len(matching) - 1
+					} else {
+						m.SelectedRunnerIndex = 0
+					}
+					m.setToast(" Focused Runners Panel", 1)
 					m.updateViewport()
 				}
 			}
@@ -575,16 +588,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				} else {
 					m.ActiveFocus = FocusRunners
+					m.SelectedRunnerIndex = 0
+					m.setToast(" Focused Runners Panel", 1)
 					m.updateViewport()
 				}
 			case FocusRunners:
-				m.ActiveFocus = FocusJobs
-				m.SelectedJobIndex = 0
-				m.updateViewport()
-				if len(m.JobQueue) > 0 {
-					j := m.JobQueue[0]
-					if j.Status == jobs.JobRunning {
-						cmds = append(cmds, m.loadJobLogsCmd(j))
+				matching := m.getMatchingRunners()
+				if m.SelectedRunnerIndex < len(matching)-1 {
+					m.SelectedRunnerIndex++
+					m.updateViewport()
+				} else {
+					m.ActiveFocus = FocusJobs
+					m.SelectedJobIndex = 0
+					m.setToast(" Focused Jobs Panel", 1)
+					m.updateViewport()
+					if len(m.JobQueue) > 0 {
+						j := m.JobQueue[0]
+						if j.Status == jobs.JobRunning {
+							cmds = append(cmds, m.loadJobLogsCmd(j))
+						}
 					}
 				}
 			case FocusJobs:
@@ -779,13 +801,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Click in Left Column Panes
 			if msg.X < m.Width/2 {
 				// Use panel heights from View() layout instead of content lengths
-				rightBoxHeight := m.Height - 3
-				if rightBoxHeight < 13 {
-					rightBoxHeight = 13
+				rightBoxHeight := m.Height - 4
+				if rightBoxHeight < 12 {
+					rightBoxHeight = 12
 				}
 				totalInner := rightBoxHeight - 4
-				if totalInner < 9 {
-					totalInner = 9
+				if totalInner < 8 {
+					totalInner = 8
 				}
 				runnersBoxHeight := 4
 				repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
@@ -964,9 +986,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ProgressBar.Width = msg.Width - 20
 
 		// Mirror the same height budget as View()
-		rightBoxH := msg.Height - 3
-		if rightBoxH < 13 {
-			rightBoxH = 13
+		rightBoxH := msg.Height - 4
+		if rightBoxH < 12 {
+			rightBoxH = 12
 		}
 		halfWidth := msg.Width / 2
 		leftWidth := halfWidth - 1
@@ -1182,7 +1204,7 @@ func (m *Model) updateViewport() {
 			maxJobLen = 15
 		}
 
-		for _, r := range matchingRunners {
+		for idx, r := range matchingRunners {
 			var rColor lipgloss.Color
 			var rGlyph string
 			switch r.Status {
@@ -1195,7 +1217,6 @@ func (m *Model) updateViewport() {
 			default:
 				rColor, rGlyph = colorGreen, "●"
 			}
-			marker := "  "
 			glyphCell := lipgloss.NewStyle().Foreground(rColor).Width(2).Render(rGlyph)
 			var currentJobStr string
 			switch {
@@ -1218,12 +1239,18 @@ func (m *Model) updateViewport() {
 			default:
 				currentJobStr = lipgloss.NewStyle().Foreground(colorMuted).Render("idle")
 			}
-			sb.WriteString(fmt.Sprintf("%s%s %s  %s\n",
-				marker,
+
+			isSelected := m.ActiveFocus == FocusRunners && idx == m.SelectedRunnerIndex
+			rowContent := fmt.Sprintf("%s %s  %s",
 				glyphCell,
 				lipgloss.NewStyle().Foreground(colorSecondary).Width(20).Render(r.Name),
 				currentJobStr,
-			))
+			)
+			if isSelected {
+				sb.WriteString(selectedRowStyle.Render("> "+rowContent) + "\n")
+			} else {
+				sb.WriteString(normalRowStyle.Render("  "+rowContent) + "\n")
+			}
 		}
 
 		// --- QUEUED / RUNNING JOBS ON MATCHING RUNNERS ---
@@ -1606,11 +1633,22 @@ func (m *Model) updateViewport() {
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
 
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
-			if len(item.BranchDetails.Branches) == 0 {
+			localBranches := item.BranchDetails.GetLocalBranches()
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local Branches:") + "\n")
+			if len(localBranches) == 0 {
 				sb.WriteString("  (None found)\n")
 			} else {
-				for _, b := range item.BranchDetails.Branches {
+				for _, b := range localBranches {
+					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+				}
+			}
+
+			remoteBranches := item.BranchDetails.GetRemoteBranches()
+			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(" Remote Branches:") + "\n")
+			if len(remoteBranches) == 0 {
+				sb.WriteString("  (None found)\n")
+			} else {
+				for _, b := range remoteBranches {
 					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
 				}
 			}
@@ -1754,7 +1792,9 @@ func (m Model) View() string {
 	}
 
 	headerText := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle
-	header := lipgloss.NewStyle().MaxWidth(m.Width).Render(headerText) + "\n"
+	headerStr := lipgloss.NewStyle().MaxWidth(m.Width).Render(headerText)
+	headerLines := strings.Split(headerStr, "\n")
+	header := headerLines[0] + "\n"
 
 	// 2. Split Layout Dimensions
 	//
@@ -1771,10 +1811,10 @@ func (m Model) View() string {
 	// We size rightBoxHeight so right = left: rightBoxHeight + 2 = totalInner + 6
 	//   => rightBoxHeight = totalInner + 4
 	//
-	// Total output lines = 1 (header\n) + mainView lines = 1 + (rightBoxHeight + 2)
-	// We need: 1 + rightBoxHeight + 2 = m.Height
-	//   => rightBoxHeight = m.Height - 3
-	//   => totalInner = rightBoxHeight - 4 = m.Height - 7
+	// Total output lines = 1 (header\n) + mainView lines + 1 (footer) = 1 + (rightBoxHeight + 2) + 1
+	// We need: 1 + rightBoxHeight + 2 + 1 = m.Height
+	//   => rightBoxHeight = m.Height - 4
+	//   => totalInner = rightBoxHeight - 4 = m.Height - 8
 	//
 	halfWidth := m.Width / 2
 	leftWidth := halfWidth - 1
@@ -1786,15 +1826,15 @@ func (m Model) View() string {
 		paneInnerWidth = 30
 	}
 
-	rightBoxHeight := m.Height - 3
-	if rightBoxHeight < 13 {
-		rightBoxHeight = 13
+	rightBoxHeight := m.Height - 4
+	if rightBoxHeight < 12 {
+		rightBoxHeight = 12
 	}
 
 	// totalInner is the sum of content heights for the 3 left boxes
 	totalInner := rightBoxHeight - 4
-	if totalInner < 9 {
-		totalInner = 9
+	if totalInner < 8 {
+		totalInner = 8
 	}
 
 	// runnersBoxHeight=4 means inner content=4 lines, outer rendered=6 (top+4+bottom)
@@ -1901,17 +1941,21 @@ func (m Model) View() string {
 			branchCell := dynCellBranchStyle.Render(branchStyle.Render(displayText))
 
 			var prsCell string
-			if item.OpenPRsCount > 0 {
+			if !item.HasLoadedCounts && !item.HasLoadedPRs {
+				prsCell = cellPRsStyle.Foreground(colorMuted).Render("?")
+			} else if item.OpenPRsCount > 0 {
 				prsCell = cellPRsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
 			} else {
-				prsCell = cellPRsStyle.Foreground(colorMuted).Render("-")
+				prsCell = cellPRsStyle.Foreground(colorMuted).Render("—")
 			}
 
 			var issuesCell string
-			if item.OpenIssuesCount > 0 {
+			if !item.HasLoadedCounts && !item.HasLoadedIssues {
+				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("?")
+			} else if item.OpenIssuesCount > 0 {
 				issuesCell = cellIssuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
 			} else {
-				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("-")
+				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("—")
 			}
 
 			line := fmt.Sprintf("%s%s %s %s %s", statusIconStr, nameCell, branchCell, prsCell, issuesCell)
@@ -2201,16 +2245,26 @@ func (m Model) View() string {
 	// 3. Footer Keybindings Help (on its own line below mainView)
 	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [d] Del Archived  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
-		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
+		msgText := m.ToastMsg
+		if lipgloss.Width(msgText) > m.Width {
+			msgText = truncateString(msgText, m.Width)
+		}
+		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(msgText)
+	} else if lipgloss.Width(footerText) > m.Width {
+		footerText = truncateString(footerText, m.Width)
 	}
 
 	footer := lipgloss.NewStyle().Foreground(colorMuted).MaxWidth(m.Width).Render(footerText)
+	footerLines := strings.Split(footer, "\n")
+	if len(footerLines) > 0 {
+		footer = footerLines[0]
+	}
 
 	// header has trailing \n (1 newline)
-	// mainView has (availableHeight-1) internal newlines = availableHeight lines
-	// footer is concatenated to last line of mainView (no extra newline)
-	// strings.Split gives: availableHeight+1 lines total = m.Height ✓
-	return header + mainView + footer
+	// mainView has (rightBoxHeight + 2) lines
+	// footer is placed on its own line preceded by \n
+	// strings.Split gives: 1 + (rightBoxHeight + 2) + 1 = rightBoxHeight + 4 = m.Height lines total ✓
+	return header + mainView + "\n" + footer
 }
 
 func (m Model) renderStatusBadge(item *git.RepoItem) string {
@@ -2364,4 +2418,28 @@ func (m Model) getAvailableTags() []string {
 	}
 	sort.Strings(keys)
 	return append(tags, keys...)
+}
+
+func (m Model) getMatchingRunners() []*jobs.RunnerItem {
+	tags := m.getAvailableTags()
+	tagIdx := m.SelectedTagIndex
+	if tagIdx >= len(tags) {
+		tagIdx = 0
+	}
+	activeTag := tags[tagIdx]
+
+	var matching []*jobs.RunnerItem
+	for _, r := range m.Runners {
+		if activeTag == "ALL" {
+			matching = append(matching, r)
+		} else {
+			for _, tag := range r.Tags {
+				if tag == activeTag {
+					matching = append(matching, r)
+					break
+				}
+			}
+		}
+	}
+	return matching
 }
