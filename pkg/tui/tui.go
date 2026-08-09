@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -266,6 +267,11 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			result = append(result, item)
 		}
 
+		// Sort repositories alphabetically by Name
+		sort.Slice(result, func(i, j int) bool {
+			return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+		})
+
 		return orgSyncedMsg{repos: result, err: nil}
 	}
 }
@@ -479,6 +485,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, item := range m.Repos {
 			if item.Name == msg.repoName {
 				item.IssuesList = msg.issues
+				item.HasLoadedIssues = true
 				break
 			}
 		}
@@ -488,6 +495,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, item := range m.Repos {
 			if item.Name == msg.repoName {
 				item.PRsList = msg.prs
+				item.HasLoadedPRs = true
 				break
 			}
 		}
@@ -507,6 +515,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case orgSyncedMsg:
 		m.IsOrgSyncing = false
 		m.Repos = msg.repos
+		// Keep repositories sorted alphabetically
+		sort.Slice(m.Repos, func(i, j int) bool {
+			return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
+		})
 		m.TotalCount = len(m.Repos)
 		if len(m.Repos) > 0 {
 			m.IsSyncing = true
@@ -542,10 +554,10 @@ func (m Model) triggerTabFetch() tea.Cmd {
 		return nil
 	}
 	item := m.Repos[m.SelectedIndex]
-	if m.ActiveTab == TabIssues && len(item.IssuesList) == 0 {
+	if m.ActiveTab == TabIssues && !item.HasLoadedIssues {
 		return m.fetchIssuesCmd(item.Name, item.GHRepoName)
 	}
-	if m.ActiveTab == TabPRs && len(item.PRsList) == 0 {
+	if m.ActiveTab == TabPRs && !item.HasLoadedPRs {
 		return m.fetchPRsCmd(item.Name, item.GHRepoName)
 	}
 	return nil
@@ -570,11 +582,18 @@ func (m *Model) updateViewport() {
 		issueCountStr = lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d open", item.OpenIssuesCount))
 	}
 
-	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.Name)))
-	sb.WriteString(fmt.Sprintf("%s %s %s | %s %s (Default: %s)\n",
-		lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL:"), iconFolder, item.Path,
-		iconBranch, item.CurrentBranch, item.DefaultBranch,
-	))
+	// Clean Detail View Header format:
+	// REPOSITORY: careynas.net
+	// ~/repos/wiki.robot.house | main (default)
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.GHRepoName)))
+
+	branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
+	if item.CurrentBranch != item.DefaultBranch {
+		branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+	}
+
+	shortPath := git.ShortenHomePath(item.Path)
+	sb.WriteString(fmt.Sprintf(" %s  |  %s %s\n", shortPath, iconBranch, branchDetail))
 	sb.WriteString(fmt.Sprintf("%s %s  |  %s %s  |  %s %s\n\n",
 		lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:"), item.StatusMsg,
 		iconPR, prCountStr, iconIssue, issueCountStr,
@@ -631,12 +650,10 @@ func (m *Model) updateViewport() {
 
 	case TabIssues:
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + "\n\n")
-		if len(item.IssuesList) == 0 {
-			if item.OpenIssuesCount == 0 {
-				sb.WriteString("  󰄬 No open issues found for this repository.\n")
-			} else {
-				sb.WriteString("  ⏳ Loading open issues from GitHub...\n")
-			}
+		if !item.HasLoadedIssues {
+			sb.WriteString("  ⏳ Loading open issues from GitHub...\n")
+		} else if len(item.IssuesList) == 0 {
+			sb.WriteString("  󰄬 No open issues found for this repository.\n")
 		} else {
 			for _, issue := range item.IssuesList {
 				sb.WriteString(fmt.Sprintf("  %s #%-4d %s\n     %s\n\n",
@@ -648,12 +665,10 @@ func (m *Model) updateViewport() {
 
 	case TabPRs:
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + "\n\n")
-		if len(item.PRsList) == 0 {
-			if item.OpenPRsCount == 0 {
-				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
-			} else {
-				sb.WriteString("  ⏳ Loading open pull requests from GitHub...\n")
-			}
+		if !item.HasLoadedPRs {
+			sb.WriteString("  ⏳ Loading open pull requests from GitHub...\n")
+		} else if len(item.PRsList) == 0 {
+			sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
 		} else {
 			for _, pr := range item.PRsList {
 				sb.WriteString(fmt.Sprintf("  %s #%-4d %s (%s %s)\n     %s\n\n",
@@ -725,10 +740,11 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Header Banner with NerdFont icons
+	// 1. Clean Header Banner Subtitle: ~/repos | seankoji-com
+	shortTargetDir := git.ShortenHomePath(m.TargetDir)
 	header := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
 		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager") + "\n" +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s Target Directory: %s | %s Org: %s", iconFolder, m.TargetDir, iconGithub, m.TargetOrg)) + "\n"
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s %s", shortTargetDir, iconGithub, m.TargetOrg)) + "\n"
 
 	// 2. Main Content Split View
 	leftWidth := (m.Width / 2) - 2
@@ -752,13 +768,26 @@ func (m Model) View() string {
 			statusIcon := renderStatusBadge(item)
 
 			nameCell := truncateString(item.Name, 22)
-			statusCell := truncateString(item.StatusMsg, 12)
 
-			branchCell := item.CurrentBranch
-			if branchCell == "" {
-				branchCell = "-"
+			// Grey out "OK" status
+			statusStyle := lipgloss.NewStyle()
+			if item.StatusMsg == "OK" {
+				statusStyle = statusStyle.Foreground(colorMuted)
 			}
-			branchCell = truncateString(branchCell, 20)
+			statusCell := statusStyle.Render(truncateString(item.StatusMsg, 12))
+
+			// Grey out Default Branch names (main/master)
+			branchStr := item.CurrentBranch
+			if branchStr == "" {
+				branchStr = "-"
+			}
+			branchStyle := lipgloss.NewStyle()
+			if branchStr == item.DefaultBranch || branchStr == "-" {
+				branchStyle = branchStyle.Foreground(colorMuted)
+			} else {
+				branchStyle = branchStyle.Foreground(lipgloss.Color("#CDD6F4")).Bold(true)
+			}
+			branchCell := branchStyle.Render(truncateString(branchStr, 20))
 
 			// Render PRs Count: Grey '-' for zero counts, yellow bold for >0 counts
 			prsStyle := lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
