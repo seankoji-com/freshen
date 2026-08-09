@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -17,7 +18,7 @@ import (
 // --- NerdFont Glyphs & Color Palette ---
 var (
 	iconLeaf     = "🍃"
-	iconGithub   = "󰊤"
+	iconGithub   = "\uea84" //  GitHub Octocat NerdFont Icon
 	iconFolder   = "󰉋"
 	iconBranch   = ""
 	iconPR       = "󰏫"
@@ -29,6 +30,7 @@ var (
 	iconTrash    = "🗑️"
 	iconSyncing  = "⏳"
 	iconPending  = "•"
+	iconCopy     = "󰅍"
 
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
@@ -118,6 +120,7 @@ type Model struct {
 	IsSyncing     bool
 	IsOrgSyncing  bool
 	TotalCount    int
+	ToastMsg      string
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -247,12 +250,19 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 	}
 }
 
+func copyToClipboard(text string) error {
+	cmd := exec.Command("pbcopy")
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
+		m.ToastMsg = ""
 		switch msg.String() {
 
 		case "q", "ctrl+c":
@@ -277,6 +287,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if !item.IsArchived {
 					go git.SyncRepository(item)
 					m.updateViewport()
+				}
+			}
+
+		case "c", "y":
+			// Copy PR URL or Repo Path to system clipboard
+			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+				item := m.Repos[m.SelectedIndex]
+				targetCopy := item.DraftPRURL
+				if targetCopy == "" {
+					targetCopy = item.ExistingPRURL
+				}
+				if targetCopy == "" {
+					targetCopy = item.Path
+				}
+
+				if err := copyToClipboard(targetCopy); err == nil {
+					m.ToastMsg = fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy)
 				}
 			}
 
@@ -317,6 +344,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseMsg:
+		// Handle mouse clicks to select repo rows or scroll viewport
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+			if msg.X < m.Width/2 && msg.Y >= 4 {
+				clickedIdx := msg.Y - 4
+				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
+					m.SelectedIndex = clickedIdx
+					m.updateViewport()
+				}
+			}
+		}
+
 	case orgSyncedMsg:
 		m.IsOrgSyncing = false
 		m.Repos = msg.repos
@@ -342,6 +381,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var spinnerCmd tea.Cmd
 	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
 	cmds = append(cmds, spinnerCmd)
+
+	var vpCmd tea.Cmd
+	m.Viewport, vpCmd = m.Viewport.Update(msg)
+	cmds = append(cmds, vpCmd)
 
 	return m, tea.Batch(cmds...)
 }
@@ -464,9 +507,12 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
 	// 3. Footer Keybindings Help with NerdFont Glyphs
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [b] Switch Branch  |  [p] Push/PR  |  [d] Delete Archived  |  [q] Quit",
-	)
+	footerText := "[↑/↓ or j/k] Navigate  |  [r] Re-sync  |  [c] Copy Link  |  [b] Switch Branch  |  [p] Push/PR  |  [q] Quit"
+	if m.ToastMsg != "" {
+		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
+	}
+
+	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(footerText)
 
 	return header + "\n" + mainView + "\n" + footer
 }
