@@ -370,6 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.triggerTabFetch()
 
 		case "X":
+			// Shortcut: Delete all local non-default branches and prune worktrees for selected repo
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
@@ -407,6 +408,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "b":
+			// Toggle / Switch between feature branch and default branch
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				target := item.OriginalBranch
@@ -429,15 +431,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "d":
+			// Shortcut: Delete selected archived repo from disk
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
 					item.StatusMsg = "Deleted"
 					item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
+					m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", item.Name)
 					m.updateViewport()
 				}
 			}
+
+		case "D":
+			// Shortcut: Delete ALL archived repos from disk
+			deletedTotal := 0
+			for _, item := range m.Repos {
+				if item.IsArchived {
+					if err := git.DeleteLocalRepo(item.Path); err == nil {
+						deletedTotal++
+						item.StatusMsg = "Deleted"
+						item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
+					}
+				}
+			}
+			m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted all %d archived repositories from disk!", deletedTotal)
+			m.updateViewport()
 		}
 
 	case loadedIssuesMsg:
@@ -526,7 +545,7 @@ func (m *Model) updateViewport() {
 
 	// Header metadata
 	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY: "), subtitleStyle.Render(item.Name)))
-	sb.WriteString(fmt.Sprintf("%s %s %s | %s %s (%s)\n",
+	sb.WriteString(fmt.Sprintf("%s %s %s | %s %s (Default: %s)\n",
 		lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL:"), iconFolder, item.Path,
 		iconBranch, item.CurrentBranch, item.DefaultBranch,
 	))
@@ -555,7 +574,7 @@ func (m *Model) updateViewport() {
 
 	case TabBranches:
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to delete all non-default branches & prune worktrees)") + "\n\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to delete non-default local branches & prune worktrees)") + "\n\n")
 
 		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
 		if len(item.BranchDetails.Branches) == 0 {
@@ -692,10 +711,11 @@ func (m Model) View() string {
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
 	
-	// Table Column Headers with Expanded Whitespace for Branch Column
-	tableHeader := fmt.Sprintf("%-22s %-12s %-20s %-5s %-5s", "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
+	// Exact Column Alignment Header Matching Data Row Prefixes
+	headerPrefix := "   "
+	tableHeader := fmt.Sprintf("%s%-22s %-12s %-20s %5s %7s", headerPrefix, "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
 	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(tableHeader) + "\n")
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("----------------------------------------------------------------------------------") + "\n")
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("   --------------------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -707,7 +727,12 @@ func (m Model) View() string {
 
 			nameCell := truncateString(item.Name, 22)
 			statusCell := truncateString(item.StatusMsg, 12)
-			branchCell := truncateString(item.CurrentBranch, 20)
+
+			branchCell := item.CurrentBranch
+			if branchCell == "" {
+				branchCell = "-"
+			}
+			branchCell = truncateString(branchCell, 20)
 			
 			prsCell := "-"
 			if item.OpenPRsCount > 0 {
@@ -719,7 +744,7 @@ func (m Model) View() string {
 				issuesCell = fmt.Sprintf("%d", item.OpenIssuesCount)
 			}
 
-			line := fmt.Sprintf("%s %-22s %-12s %-20s %-5s %-5s",
+			line := fmt.Sprintf("%s %-22s %-12s %-20s %5s %7s",
 				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
 			)
 
@@ -745,7 +770,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
 
 	// 3. Footer Keybindings Help with NerdFont Glyphs
-	footerText := "[↑/↓/j/k] Move  |  [←/→/h/l] Switch Tab  |  [X] Prune Branches  |  [b] Switch Branch  |  [p] Push/PR  |  [q] Quit"
+	footerText := "[↑/↓/j/k] Move  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
