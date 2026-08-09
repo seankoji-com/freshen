@@ -76,7 +76,7 @@ func TestMergeRunnersCrossReference(t *testing.T) {
 		{ID: "#101", Name: ".dotfiles / test", Status: JobRunning, RunnerName: "carey-mac-alpha"},
 	}
 
-	merged := mergeRunners(newRunners, existingRunners, jobQueue)
+	merged := MergeRunners(newRunners, existingRunners, jobQueue)
 
 	if len(merged) != 2 {
 		t.Fatalf("expected 2 merged runners, got %d", len(merged))
