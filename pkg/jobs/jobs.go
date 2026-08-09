@@ -43,24 +43,25 @@ type RunnerItem struct {
 }
 
 type JobItem struct {
-	ID         string
-	Name       string
-	Repo       string
-	Branch     string
-	Event      string
-	PRNumber   int
-	PRTitle    string
-	PRURL      string
-	Status     JobStatus
-	RunnerID   string
-	RunnerName string
-	QueuedAt   string
-	Duration   string
-	Logs       []string
-	Seconds    int
-	StartedAt  time.Time
-	RunID      int64 // GitHub workflow run ID
-	GHJobID    int64 // GitHub job ID within the run (populated lazily)
+	ID          string
+	Name        string
+	Repo        string
+	Branch      string
+	Event       string
+	PRNumber    int
+	PRTitle     string
+	PRURL       string
+	Status      JobStatus
+	RunnerID    string
+	RunnerName  string
+	QueuedAt    string
+	Duration    string
+	Logs        []string
+	Seconds     int
+	StartedAt   time.Time
+	RunID       int64 // GitHub workflow run ID
+	GHJobID     int64 // GitHub job ID within the run (populated lazily)
+	IsRunHeader bool  // True if this item represents a focusable parent workflow run
 }
 
 // --- GitHub API response types ---
@@ -113,21 +114,21 @@ type GHWorkflowRunsResponse struct {
 }
 
 type GHJobStep struct {
-	Name        string `json:"name"`
-	Status      string `json:"status"`
-	Conclusion  string `json:"conclusion"`
-	Number      int    `json:"number"`
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	Number     int    `json:"number"`
 }
 
 type GHJobInfo struct {
-	ID          int64       `json:"id"`
-	Name        string      `json:"name"`
-	Status      string      `json:"status"`
-	Conclusion  string      `json:"conclusion"`
-	StartedAt   string      `json:"started_at"`
-	RunnerName  string      `json:"runner_name"`
-	RunnerID    int64       `json:"runner_id"`
-	Steps       []GHJobStep `json:"steps"`
+	ID         int64       `json:"id"`
+	Name       string      `json:"name"`
+	Status     string      `json:"status"`
+	Conclusion string      `json:"conclusion"`
+	StartedAt  string      `json:"started_at"`
+	RunnerName string      `json:"runner_name"`
+	RunnerID   int64       `json:"runner_id"`
+	Steps      []GHJobStep `json:"steps"`
 }
 
 type GHJobsResponse struct {
@@ -264,153 +265,19 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			}
 			seenRunIDs[run.ID] = true
 
-				// Query individual jobs for this workflow run
-				jobsArgs := []string{
-					"api",
-					fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
-				}
-				jobsCmd := exec.Command("gh", jobsArgs...)
-				var jobsOut bytes.Buffer
-				jobsCmd.Stdout = &jobsOut
+			// Query individual jobs for this workflow run
+			jobsArgs := []string{
+				"api",
+				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
+			}
+			jobsCmd := exec.Command("gh", jobsArgs...)
+			var jobsOut bytes.Buffer
+			jobsCmd.Stdout = &jobsOut
 
-				var parsedJobsFromRun int
-				if err := jobsCmd.Run(); err == nil {
-					var jobsResp GHJobsResponse
-					if err := json.Unmarshal(jobsOut.Bytes(), &jobsResp); err == nil && len(jobsResp.Jobs) > 0 {
-						for _, j := range jobsResp.Jobs {
-							if seenJobIDs[j.ID] {
-								continue
-							}
-							seenJobIDs[j.ID] = true
-
-							// Filter out completed success/skipped jobs
-							if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {
-								continue
-							}
-
-							js := JobQueued
-							if j.Status == "in_progress" {
-								js = JobRunning
-							} else if j.Conclusion == "failure" {
-								js = JobFailed
-							}
-
-							displayName := fmt.Sprintf("%s / %s", repo, j.Name)
-
-							duration := "-"
-							var startedAt time.Time
-							var secs int
-							if j.StartedAt != "" {
-								if t, err := time.Parse(time.RFC3339, j.StartedAt); err == nil {
-									startedAt = t
-									secs = int(time.Since(t).Seconds())
-									if secs > 0 {
-										if secs >= 60 {
-											duration = fmt.Sprintf("%dm %ds", secs/60, secs%60)
-										} else {
-											duration = fmt.Sprintf("%ds", secs)
-										}
-									}
-								}
-							}
-
-							queuedAgo := "-"
-							if run.CreatedAt != "" {
-								if t, err := time.Parse(time.RFC3339, run.CreatedAt); err == nil {
-									ago := int(time.Since(t).Seconds())
-									if ago >= 60 {
-										queuedAgo = fmt.Sprintf("%dm ago", ago/60)
-									} else {
-										queuedAgo = fmt.Sprintf("%ds ago", ago)
-									}
-								}
-							}
-
-							prNum := 0
-							prTitle := ""
-							prURL := ""
-							if len(run.PullRequests) > 0 {
-								prNum = run.PullRequests[0].Number
-								prTitle = run.PullRequests[0].Title
-								prURL = run.PullRequests[0].URL
-								if prURL == "" && prNum != 0 {
-									prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
-								}
-							}
-							if prTitle == "" && run.DisplayTitle != "" {
-								prTitle = run.DisplayTitle
-							}
-
-							jobItem := &JobItem{
-								ID:         fmt.Sprintf("#%d", j.ID),
-								Name:       displayName,
-								Repo:       repo,
-								Branch:     run.HeadBranch,
-								Event:      run.Event,
-								PRNumber:   prNum,
-								PRTitle:    prTitle,
-								PRURL:      prURL,
-								Status:     js,
-								RunnerName: j.RunnerName,
-								QueuedAt:   queuedAgo,
-								Duration:   duration,
-								Seconds:    secs,
-								StartedAt:  startedAt,
-								RunID:      run.ID,
-								GHJobID:    j.ID,
-							}
-							if j.RunnerID != 0 {
-								jobItem.RunnerID = fmt.Sprintf("runner-%d", j.RunnerID)
-							}
-
-							allJobs = append(allJobs, jobItem)
-							parsedJobsFromRun++
-						}
-					}
-				}
-
-				// Fallback if jobs endpoint returned no jobs
-				if parsedJobsFromRun == 0 {
-					js := JobQueued
-					if run.Status == "in_progress" {
-						js = JobRunning
-					}
-
-					name := run.DisplayTitle
-					if name == "" {
-						name = run.Name
-					}
-					displayName := fmt.Sprintf("%s / %s", repo, name)
-
-					duration := "-"
-					var startedAt time.Time
-					var secs int
-					if run.RunStartedAt != "" {
-						if t, err := time.Parse(time.RFC3339, run.RunStartedAt); err == nil {
-							startedAt = t
-							secs = int(time.Since(t).Seconds())
-							if secs > 0 {
-								if secs >= 60 {
-									duration = fmt.Sprintf("%dm %ds", secs/60, secs%60)
-								} else {
-									duration = fmt.Sprintf("%ds", secs)
-								}
-							}
-						}
-					}
-
-					queuedAgo := "-"
-					if run.CreatedAt != "" {
-						if t, err := time.Parse(time.RFC3339, run.CreatedAt); err == nil {
-							ago := int(time.Since(t).Seconds())
-							if ago >= 60 {
-								queuedAgo = fmt.Sprintf("%dm ago", ago/60)
-							} else {
-								queuedAgo = fmt.Sprintf("%ds ago", ago)
-							}
-						}
-					}
-
+			var parsedJobsFromRun int
+			if err := jobsCmd.Run(); err == nil {
+				var jobsResp GHJobsResponse
+				if err := json.Unmarshal(jobsOut.Bytes(), &jobsResp); err == nil && len(jobsResp.Jobs) > 0 {
 					prNum := 0
 					prTitle := ""
 					prURL := ""
@@ -426,31 +293,189 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 						prTitle = run.DisplayTitle
 					}
 
-					job := &JobItem{
-						ID:         fmt.Sprintf("#%d", run.ID),
-						Name:       displayName,
-						Repo:       repo,
-						Branch:     run.HeadBranch,
-						Event:      run.Event,
-						PRNumber:   prNum,
-						PRTitle:    prTitle,
-						PRURL:      prURL,
-						Status:     js,
-						RunnerName: run.RunnerName,
-						QueuedAt:   queuedAgo,
-						Duration:   duration,
-						Seconds:    secs,
-						StartedAt:  startedAt,
-						RunID:      run.ID,
+					runTitle := run.DisplayTitle
+					if runTitle == "" {
+						runTitle = run.Name
 					}
-					if run.RunnerID != 0 {
-						job.RunnerID = fmt.Sprintf("runner-%d", run.RunnerID)
+					runStatus := JobQueued
+					if run.Status == "in_progress" {
+						runStatus = JobRunning
 					}
 
-					allJobs = append(allJobs, job)
+					parentRunItem := &JobItem{
+						ID:          fmt.Sprintf("run-%d", run.ID),
+						Name:        fmt.Sprintf("%s / %s", repo, runTitle),
+						Repo:        repo,
+						Branch:      run.HeadBranch,
+						Event:       run.Event,
+						PRNumber:    prNum,
+						PRTitle:     prTitle,
+						PRURL:       prURL,
+						Status:      runStatus,
+						RunID:       run.ID,
+						IsRunHeader: true,
+					}
+					allJobs = append(allJobs, parentRunItem)
+
+					for _, j := range jobsResp.Jobs {
+						if seenJobIDs[j.ID] {
+							continue
+						}
+						seenJobIDs[j.ID] = true
+
+						// Filter out completed success/skipped jobs
+						if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {
+							continue
+						}
+
+						js := JobQueued
+						if j.Status == "in_progress" {
+							js = JobRunning
+						} else if j.Conclusion == "failure" {
+							js = JobFailed
+						}
+
+						displayName := fmt.Sprintf("%s / %s", repo, j.Name)
+
+						duration := "-"
+						var startedAt time.Time
+						var secs int
+						if j.StartedAt != "" {
+							if t, err := time.Parse(time.RFC3339, j.StartedAt); err == nil {
+								startedAt = t
+								secs = int(time.Since(t).Seconds())
+								if secs > 0 {
+									if secs >= 60 {
+										duration = fmt.Sprintf("%dm %ds", secs/60, secs%60)
+									} else {
+										duration = fmt.Sprintf("%ds", secs)
+									}
+								}
+							}
+						}
+
+						queuedAgo := "-"
+						if run.CreatedAt != "" {
+							if t, err := time.Parse(time.RFC3339, run.CreatedAt); err == nil {
+								ago := int(time.Since(t).Seconds())
+								if ago >= 60 {
+									queuedAgo = fmt.Sprintf("%dm ago", ago/60)
+								} else {
+									queuedAgo = fmt.Sprintf("%ds ago", ago)
+								}
+							}
+						}
+
+						jobItem := &JobItem{
+							ID:         fmt.Sprintf("#%d", j.ID),
+							Name:       displayName,
+							Repo:       repo,
+							Branch:     run.HeadBranch,
+							Event:      run.Event,
+							PRNumber:   prNum,
+							PRTitle:    prTitle,
+							PRURL:      prURL,
+							Status:     js,
+							RunnerName: j.RunnerName,
+							QueuedAt:   queuedAgo,
+							Duration:   duration,
+							Seconds:    secs,
+							StartedAt:  startedAt,
+							RunID:      run.ID,
+							GHJobID:    j.ID,
+						}
+						if j.RunnerID != 0 {
+							jobItem.RunnerID = fmt.Sprintf("runner-%d", j.RunnerID)
+						}
+
+						allJobs = append(allJobs, jobItem)
+						parsedJobsFromRun++
+					}
 				}
 			}
+
+			// Fallback if jobs endpoint returned no jobs
+			if parsedJobsFromRun == 0 {
+				js := JobQueued
+				if run.Status == "in_progress" {
+					js = JobRunning
+				}
+
+				name := run.DisplayTitle
+				if name == "" {
+					name = run.Name
+				}
+				displayName := fmt.Sprintf("%s / %s", repo, name)
+
+				duration := "-"
+				var startedAt time.Time
+				var secs int
+				if run.RunStartedAt != "" {
+					if t, err := time.Parse(time.RFC3339, run.RunStartedAt); err == nil {
+						startedAt = t
+						secs = int(time.Since(t).Seconds())
+						if secs > 0 {
+							if secs >= 60 {
+								duration = fmt.Sprintf("%dm %ds", secs/60, secs%60)
+							} else {
+								duration = fmt.Sprintf("%ds", secs)
+							}
+						}
+					}
+				}
+
+				queuedAgo := "-"
+				if run.CreatedAt != "" {
+					if t, err := time.Parse(time.RFC3339, run.CreatedAt); err == nil {
+						ago := int(time.Since(t).Seconds())
+						if ago >= 60 {
+							queuedAgo = fmt.Sprintf("%dm ago", ago/60)
+						} else {
+							queuedAgo = fmt.Sprintf("%ds ago", ago)
+						}
+					}
+				}
+
+				prNum := 0
+				prTitle := ""
+				prURL := ""
+				if len(run.PullRequests) > 0 {
+					prNum = run.PullRequests[0].Number
+					prTitle = run.PullRequests[0].Title
+					prURL = run.PullRequests[0].URL
+					if prURL == "" && prNum != 0 {
+						prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
+					}
+				}
+				if prTitle == "" && run.DisplayTitle != "" {
+					prTitle = run.DisplayTitle
+				}
+
+				job := &JobItem{
+					ID:         fmt.Sprintf("#%d", run.ID),
+					Name:       displayName,
+					Repo:       repo,
+					Branch:     run.HeadBranch,
+					Event:      run.Event,
+					PRNumber:   prNum,
+					PRTitle:    prTitle,
+					PRURL:      prURL,
+					Status:     js,
+					RunnerName: run.RunnerName,
+					QueuedAt:   queuedAgo,
+					Duration:   duration,
+					Seconds:    secs,
+					StartedAt:  startedAt,
+					RunID:      run.ID,
+				}
+				if run.RunnerID != 0 {
+					job.RunnerID = fmt.Sprintf("runner-%d", run.RunnerID)
+				}
+
+				allJobs = append(allJobs, job)
+			}
 		}
+	}
 
 	return FilterAndSortJobQueue(allJobs), nil
 }
@@ -569,13 +594,26 @@ func FilterAndSortJobQueue(queue []*JobItem) []*JobItem {
 	}
 
 	sort.SliceStable(filtered, func(i, j int) bool {
-		if filtered[i].Status == JobRunning && filtered[j].Status != JobRunning {
-			return true
+		a, b := filtered[i], filtered[j]
+
+		// 1. Running jobs always come first, regardless of RunID
+		aRunning := a.Status == JobRunning
+		bRunning := b.Status == JobRunning
+		if aRunning != bRunning {
+			return aRunning
 		}
-		if filtered[i].Status != JobRunning && filtered[j].Status == JobRunning {
-			return false
+
+		// 2. Group by workflow run (newer RunID first) so matrix children stay together
+		if a.RunID != b.RunID {
+			return a.RunID > b.RunID
 		}
-		return filtered[i].ID < filtered[j].ID
+
+		// 3. Within the same run: the IsRunHeader rows comes before matrix children
+		if a.IsRunHeader != b.IsRunHeader {
+			return a.IsRunHeader
+		}
+
+		return a.ID < b.ID
 	})
 
 	return filtered
