@@ -328,10 +328,12 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 	org := m.TargetOrg
 	repo := job.Repo
 	runID := job.RunID
+	ghJobID := job.GHJobID
+	jobName := job.Name
 	jobID := job.ID
 	return func() tea.Msg {
-		lines, ghJobID, err := jobs.FetchJobLogs(org, repo, runID, 200)
-		return loadedJobLogsMsg{jobID: jobID, ghJobID: ghJobID, logs: lines, err: err}
+		lines, resolvedGHJobID, err := jobs.FetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
+		return loadedJobLogsMsg{jobID: jobID, ghJobID: resolvedGHJobID, logs: lines, err: err}
 	}
 }
 

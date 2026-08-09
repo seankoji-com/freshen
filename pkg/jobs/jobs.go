@@ -400,13 +400,12 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 	return FilterAndSortJobQueue(allJobs), nil
 }
 
-// FetchJobLogs fetches the step log output for a running workflow job.
-// It first resolves the GH job ID from the run, then fetches the raw log text.
-// Returns up to maxLines of the most recent log output.
-func FetchJobLogs(org, repo string, runID int64, maxLines int) ([]string, int64, error) {
-	// Step 1: get jobs list for this run to find the in_progress job ID
+// FetchJobLogs fetches the step log output for a specific running workflow job.
+// It matches the specific targetGHJobID or targetJobName within the run, then fetches raw log text.
+func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
+	// Step 1: get jobs list for this run to find the target job ID
 	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=10", org, repo, runID),
+		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, runID),
 	)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -419,20 +418,48 @@ func FetchJobLogs(org, repo string, runID int64, maxLines int) ([]string, int64,
 		return nil, 0, fmt.Errorf("jobs parse: %w", err)
 	}
 
-	// Find the in_progress (or most recent) job
 	var jobID int64
 	var steps []GHJobStep
-	for _, j := range jobsResp.Jobs {
-		if j.Status == "in_progress" {
-			jobID = j.ID
-			steps = j.Steps
-			break
+
+	// 1. Try matching targetGHJobID directly
+	if targetGHJobID != 0 {
+		for _, j := range jobsResp.Jobs {
+			if j.ID == targetGHJobID {
+				jobID = j.ID
+				steps = j.Steps
+				break
+			}
 		}
 	}
+
+	// 2. Try matching targetJobName
+	if jobID == 0 && targetJobName != "" {
+		for _, j := range jobsResp.Jobs {
+			if j.Name == targetJobName || strings.Contains(targetJobName, j.Name) || strings.Contains(j.Name, targetJobName) {
+				jobID = j.ID
+				steps = j.Steps
+				break
+			}
+		}
+	}
+
+	// 3. Fallback to first in_progress job
+	if jobID == 0 {
+		for _, j := range jobsResp.Jobs {
+			if j.Status == "in_progress" {
+				jobID = j.ID
+				steps = j.Steps
+				break
+			}
+		}
+	}
+
+	// 4. Fallback to first job in response
 	if jobID == 0 && len(jobsResp.Jobs) > 0 {
 		jobID = jobsResp.Jobs[0].ID
 		steps = jobsResp.Jobs[0].Steps
 	}
+
 	if jobID == 0 {
 		return nil, 0, fmt.Errorf("no job found for run %d", runID)
 	}
