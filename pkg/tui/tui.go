@@ -1821,8 +1821,8 @@ func (m Model) View() string {
 		if runnerW < 10 {
 			runnerW = 10
 		}
-		if runnerW > 16 {
-			runnerW = 16
+		if runnerW > 28 {
+			runnerW = 28
 		}
 		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render("→ " + truncateString(runnerStr, runnerW-2))
 
@@ -1839,20 +1839,30 @@ func (m Model) View() string {
 			if nameW < 10 {
 				nameW = 10
 			}
-			jobStr := lipgloss.NewStyle().Foreground(colorSecondary).Width(nameW).Render(truncateString(jobToken, nameW))
-			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStr, runnerAssigned)
+			jobStrText := lipgloss.NewStyle().Foreground(colorSecondary).Width(nameW).Render(truncateString(jobToken, nameW))
+			if j.RunID != 0 {
+				jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+				if j.GHJobID != 0 {
+					jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, j.Repo, j.RunID, j.GHJobID)
+				}
+				jobStrText = Hyperlink(jobStrText, jobURL)
+			}
+			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStrText, runnerAssigned)
 		} else {
 			// Single job run
 			nameW := paneInnerWidth - 4 - 9 - 1 - runnerW - 1
 			if nameW < 10 {
 				nameW = 10
 			}
-			jobStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(jobToken, nameW))
+			jobStrText := lipgloss.NewStyle().Width(nameW).Render(truncateString(jobToken, nameW))
 			if j.RunID != 0 {
-				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
-				jobStr = Hyperlink(jobStr, runURL)
+				jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+				if j.GHJobID != 0 {
+					jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, j.Repo, j.RunID, j.GHJobID)
+				}
+				jobStrText = Hyperlink(jobStrText, jobURL)
 			}
-			line = fmt.Sprintf("%s %s %s", stBadge, jobStr, runnerAssigned)
+			line = fmt.Sprintf("%s %s %s", stBadge, jobStrText, runnerAssigned)
 		}
 
 		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
@@ -1988,19 +1998,38 @@ func findJobForRunner(r *jobs.RunnerItem, queue []*jobs.JobItem) *jobs.JobItem {
 }
 
 func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targetOrg string) []*jobs.JobItem {
-	result := make([]*jobs.JobItem, len(queue))
-	copy(result, queue)
+	var realJobs []*jobs.JobItem
+	for _, j := range queue {
+		if j.RunID != 0 {
+			realJobs = append(realJobs, j)
+		}
+	}
+
+	result := make([]*jobs.JobItem, 0, len(queue))
+	if len(realJobs) > 0 {
+		result = append(result, realJobs...)
+	} else {
+		result = append(result, queue...)
+	}
 
 	for _, r := range runners {
 		if r.Status == jobs.RunnerRunning {
 			found := false
 			for _, j := range result {
-				if j.RunnerName == r.Name || j.RunnerID == r.ID {
+				if j.RunnerName == r.Name || j.RunnerID == r.ID || strings.EqualFold(j.RunnerName, r.Name) {
 					found = true
 					break
 				}
+				if j.Name != "" && r.CurrentJob != "" && r.CurrentJob != "-" && (strings.Contains(j.Name, r.CurrentJob) || strings.Contains(r.CurrentJob, j.Name)) {
+					found = true
+					if j.RunnerName == "" {
+						j.RunnerName = r.Name
+						j.RunnerID = r.ID
+					}
+					break
+				}
 			}
-			if !found {
+			if !found && len(realJobs) == 0 {
 				jobTitle := r.CurrentJob
 				if jobTitle == "" || jobTitle == "-" {
 					jobTitle = fmt.Sprintf("%s active workflow job", r.Name)
