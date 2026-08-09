@@ -1063,15 +1063,21 @@ func (m *Model) updateViewport() {
 				jobText = fmt.Sprintf("%s  %s", curJobID, curJobName)
 			}
 
+			maxCurJobLen := m.Viewport.Width - 17
+			if maxCurJobLen < 15 {
+				maxCurJobLen = 15
+			}
+			jobTextTrunc := truncateString(jobText, maxCurJobLen)
+
 			var jobLink string
 			if activeJob != nil && activeJob.RunID != 0 {
 				jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID)
 				if activeJob.GHJobID != 0 {
 					jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID, activeJob.GHJobID)
 				}
-				jobLink = Hyperlink(lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobText), jobURL)
+				jobLink = Hyperlink(lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobTextTrunc), jobURL)
 			} else {
-				jobLink = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobText)
+				jobLink = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobTextTrunc)
 			}
 			sb.WriteString(fmt.Sprintf(" %s  %s\n",
 				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
@@ -1096,9 +1102,9 @@ func (m *Model) updateViewport() {
 			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
 		) + "\n")
 
-		maxJobLen := m.Viewport.Width - 28
-		if maxJobLen < 28 {
-			maxJobLen = 28
+		maxJobLen := m.Viewport.Width - 29
+		if maxJobLen < 15 {
+			maxJobLen = 15
 		}
 
 		for i, r := range m.Runners {
@@ -1162,6 +1168,12 @@ func (m *Model) updateViewport() {
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 				fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
 			) + "\n")
+
+			nameMaxLen := m.Viewport.Width - 32
+			if nameMaxLen < 12 {
+				nameMaxLen = 12
+			}
+
 			for _, j := range assignedJobs {
 				var jColor lipgloss.Color
 				var jGlyph string
@@ -1178,10 +1190,11 @@ func (m *Model) updateViewport() {
 					}
 					jLink = Hyperlink(jLink, jobURL)
 				}
+				jNameTrunc := truncateString(j.Name, nameMaxLen)
 				sb.WriteString(fmt.Sprintf(" %s  %s  %s  %s\n",
 					lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
 					jLink,
-					lipgloss.NewStyle().Foreground(colorSecondary).Render(j.Name),
+					lipgloss.NewStyle().Foreground(colorSecondary).Render(jNameTrunc),
 					lipgloss.NewStyle().Foreground(colorMuted).Render(j.Duration),
 				))
 			}
@@ -1483,14 +1496,15 @@ func (m Model) View() string {
 	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s", shortTargetDir, clickableOrg))
 
 	leftWidthVis := lipgloss.Width(leftTitle)
-	rightWidthVis := lipgloss.Width(shortTargetDir + " |  " + iconGithub + " " + m.TargetOrg)
+	rightWidthVis := lipgloss.Width(shortTargetDir+" | "+m.TargetOrg) + 3
 
 	spacingLen := m.Width - leftWidthVis - rightWidthVis
 	if spacingLen < 1 {
 		spacingLen = 1
 	}
 
-	header := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle + "\n"
+	headerText := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle
+	header := lipgloss.NewStyle().MaxWidth(m.Width).Render(headerText) + "\n"
 
 	// 2. Split Layout Dimensions
 	//
@@ -1751,7 +1765,6 @@ func (m Model) View() string {
 		// Keep job row within pane using dynamic column widths
 		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
 
-		availW := paneInnerWidth - 4
 		idW := len(j.ID)
 		if idW < 8 {
 			idW = 8
@@ -1770,20 +1783,28 @@ func (m Model) View() string {
 		}
 
 		runnerW := len(j.RunnerName)
-		if runnerW < 12 {
-			runnerW = 12
+		if runnerW < 10 {
+			runnerW = 10
 		}
-		if runnerW > 18 {
-			runnerW = 18
+		if runnerW > 16 {
+			runnerW = 16
 		}
 		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render(truncateString(j.RunnerName, runnerW))
 
 		// Give all remaining inner pane space to job name
-		nameW := availW - 10 - idW - runnerW - 3
+		nameW := paneInnerWidth - 2 - 9 - 1 - idW - 1 - runnerW - 1
 		if nameW < 15 {
 			nameW = 15
 		}
-		nameStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(j.Name, nameW))
+
+		// Smart display name: strip redundant repo prefix if job name starts with "repo / "
+		displayName := j.Name
+		repoPrefix := j.Repo + " / "
+		if strings.HasPrefix(displayName, repoPrefix) {
+			displayName = strings.TrimPrefix(displayName, repoPrefix)
+		}
+
+		nameStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(displayName, nameW))
 
 		line := fmt.Sprintf("%s %s %s %s", stBadge, idStrText, nameStr, runnerAssigned)
 
