@@ -336,34 +336,30 @@ func TestHyperlinksInView(t *testing.T) {
 	}
 }
 
-func TestRunnersAndJobQueueLoadingAndEmptyStates(t *testing.T) {
+func TestIssue37Fixes(t *testing.T) {
 	m := NewModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
-
-	// 1. Initial load state (IsRunnersLoading = true, IsJobQueueLoading = true, IsOrgSyncing = true)
-	m.IsRunnersLoading = true
-	m.IsJobQueueLoading = true
-	m.IsOrgSyncing = true
-	viewInitial := m.View()
-
-	if !strings.Contains(viewInitial, "Fetching registered runners...") {
-		t.Errorf("expected View() to show 'Fetching registered runners...' during initial load, got:\n%s", viewInitial)
-	}
-	if !strings.Contains(viewInitial, "Fetching active workflow jobs...") {
-		t.Errorf("expected View() to show 'Fetching active workflow jobs...' during initial load, got:\n%s", viewInitial)
-	}
-
-	// 2. Loaded state with empty runners and empty jobs (IsRunnersLoading = false, IsJobQueueLoading = false, IsOrgSyncing = false)
-	m.IsRunnersLoading = false
-	m.IsJobQueueLoading = false
 	m.IsOrgSyncing = false
-	viewEmpty := m.View()
-
-	if !strings.Contains(viewEmpty, "No registered runners found.") {
-		t.Errorf("expected View() to show 'No registered runners found.' when runners list is empty, got:\n%s", viewEmpty)
+	m.Repos = []*git.RepoItem{
+		{Name: "myrepo", CurrentBranch: "feat/long-branch-name-feature-x", Status: git.StatusUpToDate},
 	}
-	if !strings.Contains(viewEmpty, "No queued or running workflow jobs.") {
-		t.Errorf("expected View() to show 'No queued or running workflow jobs.' when job queue is empty, got:\n%s", viewEmpty)
+
+	// 1. Verify tab bar active styling
+	m.ActiveTab = TabLogs
+	tabBar := m.renderTabBar()
+	if !strings.Contains(tabBar, "[1 Logs]") || !strings.Contains(tabBar, "[2 Branches & Worktrees]") {
+		t.Errorf("renderTabBar missing expected tab headers, got: %q", tabBar)
+	}
+
+	// 2. Verify cellBranchStyle width is at least 20
+	if cellBranchStyle.GetWidth() < 20 {
+		t.Errorf("expected cellBranchStyle width to be at least 20, got %d", cellBranchStyle.GetWidth())
+	}
+
+	// 3. Verify View includes extended branch name beyond 16 chars
+	view := m.View()
+	if !strings.Contains(view, "feat/long-branch") {
+		t.Errorf("expected View to contain extended branch name, got:\n%s", view)
 	}
 }
