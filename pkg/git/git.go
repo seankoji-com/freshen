@@ -91,6 +91,8 @@ type RepoItem struct {
 	OpenPRsCount       int
 	IssuesList         []IssueItem
 	PRsList            []PRItem
+	HasLoadedIssues    bool
+	HasLoadedPRs       bool
 	BranchDetails      BranchWorktreeDetails
 	Status             RepoStatus
 	StatusMsg          string
@@ -98,6 +100,15 @@ type RepoItem struct {
 	DraftPRURL         string
 	Logs               []string
 	ErrorErr           error
+}
+
+// ShortenHomePath replaces user home directory prefix with ~.
+func ShortenHomePath(path string) string {
+	home, err := os.UserHomeDir()
+	if err == nil && strings.HasPrefix(path, home) {
+		return "~" + strings.TrimPrefix(path, home)
+	}
+	return path
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
@@ -241,11 +252,16 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return []IssueItem{}, err
 	}
 
 	var issues []IssueItem
-	_ = json.Unmarshal(out.Bytes(), &issues)
+	if err := json.Unmarshal(out.Bytes(), &issues); err != nil {
+		return []IssueItem{}, err
+	}
+	if issues == nil {
+		issues = []IssueItem{}
+	}
 	return issues, nil
 }
 
@@ -256,11 +272,16 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return []PRItem{}, err
 	}
 
 	var prs []PRItem
-	_ = json.Unmarshal(out.Bytes(), &prs)
+	if err := json.Unmarshal(out.Bytes(), &prs); err != nil {
+		return []PRItem{}, err
+	}
+	if prs == nil {
+		prs = []PRItem{}
+	}
 	return prs, nil
 }
 
@@ -337,14 +358,7 @@ func GetDefaultBranch(path string) string {
 	return GetOriginalBranch(path)
 }
 
-// SyncRepository performs the exact branch workflow with brief status messages:
-// A. If on DEFAULT branch:
-//   - No unstaged changes: git pull, done. (StatusMsg: "OK" / "Updated")
-//   - Unstaged changes: git add . && git stash && git pull && git stash apply, done. (StatusMsg: "Stashed")
-// B. If on DIFFERENT branch:
-//   - Fetch link to any existing open PR.
-//   - No unstaged changes: checkout default branch, git pull, done. (StatusMsg: "Switched")
-//   - Unstaged changes: git fetch && git rebase to default branch. (StatusMsg: "Rebased")
+// SyncRepository performs the exact branch workflow with brief status messages.
 func SyncRepository(item *RepoItem) {
 	item.Status = StatusSyncing
 	item.Logs = append(item.Logs, fmt.Sprintf("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
@@ -355,10 +369,8 @@ func SyncRepository(item *RepoItem) {
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
 
-	// Populate branch details
 	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
 
-	// Check if an open PR exists for this feature branch
 	if origBranch != defaultBranch {
 		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
 		if item.ExistingPRURL != "" {
@@ -366,7 +378,6 @@ func SyncRepository(item *RepoItem) {
 		}
 	}
 
-	// Check for unstaged / uncommitted changes
 	isDirtyCmd := exec.Command("git", "-C", item.Path, "status", "--porcelain")
 	var dirtyOut bytes.Buffer
 	isDirtyCmd.Stdout = &dirtyOut
@@ -376,12 +387,8 @@ func SyncRepository(item *RepoItem) {
 
 	item.Logs = append(item.Logs, fmt.Sprintf(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges))
 
-	// =========================================================================
-	// CASE A: Repository is on DEFAULT branch
-	// =========================================================================
 	if origBranch == defaultBranch {
 		if !hasUnstagedChanges {
-			// A1: No unstaged changes -> git pull, done.
 			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (clean). Running git pull...", defaultBranch))
 			pullCmd := exec.Command("git", "-C", item.Path, "pull")
 			var pullOut bytes.Buffer
@@ -403,7 +410,6 @@ func SyncRepository(item *RepoItem) {
 			}
 			return
 		} else {
-			// A2: Unstaged changes -> git add . && git stash && git pull && git stash apply, done.
 			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull && git stash apply...", defaultBranch))
 
 			_ = exec.Command("git", "-C", item.Path, "add", ".").Run()
@@ -434,11 +440,7 @@ func SyncRepository(item *RepoItem) {
 		}
 	}
 
-	// =========================================================================
-	// CASE B: Repository is on DIFFERENT branch (origBranch != defaultBranch)
-	// =========================================================================
 	if !hasUnstagedChanges {
-		// B1: No unstaged changes -> checkout default branch, git pull, done.
 		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull...", origBranch, defaultBranch))
 
 		coCmd := exec.Command("git", "-C", item.Path, "checkout", defaultBranch)
@@ -465,7 +467,6 @@ func SyncRepository(item *RepoItem) {
 		}
 		return
 	} else {
-		// B2: Unstaged changes -> git fetch and rebase to default branch.
 		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch))
 
 		_ = exec.Command("git", "-C", item.Path, "fetch", "origin").Run()
