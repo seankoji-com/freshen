@@ -49,6 +49,7 @@ type JobItem struct {
 	Branch     string
 	Event      string
 	PRNumber   int
+	PRTitle    string
 	PRURL      string
 	Status     JobStatus
 	RunnerID   string
@@ -84,6 +85,7 @@ type GHRunnersResponse struct {
 
 type GHPullRequestInfo struct {
 	Number int    `json:"number"`
+	Title  string `json:"title"`
 	URL    string `json:"html_url"`
 }
 
@@ -320,13 +322,18 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 							}
 
 							prNum := 0
+							prTitle := ""
 							prURL := ""
 							if len(run.PullRequests) > 0 {
 								prNum = run.PullRequests[0].Number
+								prTitle = run.PullRequests[0].Title
 								prURL = run.PullRequests[0].URL
 								if prURL == "" && prNum != 0 {
 									prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
 								}
+							}
+							if prTitle == "" && run.DisplayTitle != "" {
+								prTitle = run.DisplayTitle
 							}
 
 							jobItem := &JobItem{
@@ -336,6 +343,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 								Branch:     run.HeadBranch,
 								Event:      run.Event,
 								PRNumber:   prNum,
+								PRTitle:    prTitle,
 								PRURL:      prURL,
 								Status:     js,
 								RunnerName: j.RunnerName,
@@ -399,13 +407,18 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 					}
 
 					prNum := 0
+					prTitle := ""
 					prURL := ""
 					if len(run.PullRequests) > 0 {
 						prNum = run.PullRequests[0].Number
+						prTitle = run.PullRequests[0].Title
 						prURL = run.PullRequests[0].URL
 						if prURL == "" && prNum != 0 {
 							prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
 						}
+					}
+					if prTitle == "" && run.DisplayTitle != "" {
+						prTitle = run.DisplayTitle
 					}
 
 					job := &JobItem{
@@ -415,6 +428,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 						Branch:     run.HeadBranch,
 						Event:      run.Event,
 						PRNumber:   prNum,
+						PRTitle:    prTitle,
 						PRURL:      prURL,
 						Status:     js,
 						RunnerName: run.RunnerName,
