@@ -148,7 +148,7 @@ var (
 	// Total: 2 + 20 + 16 + 4 + 6 + spaces = ~51 chars, fits in a ~55 char inner pane
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
 	cellNameStyle       = lipgloss.NewStyle().Width(20)
-	cellBranchStyle     = lipgloss.NewStyle().Width(16)
+	cellBranchStyle     = lipgloss.NewStyle().Width(20)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
 	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
 
@@ -1636,12 +1636,12 @@ func (m *Model) updateViewport() {
 		case TabIssues:
 			spinnerStr := ""
 			if item.IsLoadingIssues {
-				spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+				spinnerStr = fmt.Sprintf("  %s %s", cellStatusIconStyle.Render(m.Spinner.View()), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
 			}
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
 
 			if len(item.IssuesList) == 0 && item.IsLoadingIssues {
-				sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", m.Spinner.View()))
+				sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View())))
 			} else if len(item.IssuesList) == 0 {
 				sb.WriteString("  󰄬 No open issues found for this repository.\n")
 			} else {
@@ -1658,12 +1658,12 @@ func (m *Model) updateViewport() {
 		case TabPRs:
 			spinnerStr := ""
 			if item.IsLoadingPRs {
-				spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+				spinnerStr = fmt.Sprintf("  %s %s", cellStatusIconStyle.Render(m.Spinner.View()), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
 			}
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
 
 			if len(item.PRsList) == 0 && item.IsLoadingPRs {
-				sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", m.Spinner.View()))
+				sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View())))
 			} else if len(item.PRsList) == 0 {
 				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
 			} else {
@@ -1683,10 +1683,10 @@ func (m *Model) updateViewport() {
 }
 
 func (m Model) renderTabBar() string {
-	t1 := " [1 Logs] "
-	t2 := " [2 Branches & Worktrees] "
-	t3 := " [3 Issues] "
-	t4 := " [4 PRs] "
+	t1 := "[1 Logs]"
+	t2 := "[2 Branches & Worktrees]"
+	t3 := "[3 Issues]"
+	t4 := "[4 PRs]"
 
 	switch m.ActiveTab {
 	case TabLogs:
@@ -1823,17 +1823,19 @@ func (m Model) View() string {
 
 	// ------------------ PANEL 1: REPOSITORIES ------------------
 	var repoLines []string
-	availRepoW := paneInnerWidth - 18
-	if availRepoW < 24 {
-		availRepoW = 24
+	availRepoW := paneInnerWidth - 14
+	if availRepoW < 38 {
+		availRepoW = 38
 	}
-	repoNameW := (availRepoW * 55) / 100
+	repoNameW := (availRepoW * 45) / 100
 	if repoNameW < 18 {
 		repoNameW = 18
 	}
 	branchW := availRepoW - repoNameW
-	if branchW < 12 {
-		branchW = 12
+	if branchW < 20 {
+		branchW = 20
+	} else if branchW > 35 {
+		branchW = 35
 	}
 
 	dynCellNameStyle := lipgloss.NewStyle().Width(repoNameW)
@@ -1850,7 +1852,7 @@ func (m Model) View() string {
 	repoLines = append(repoLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
 	if m.IsOrgSyncing {
-		repoLines = append(repoLines, clipLine(m.Spinner.View()+" Fetching GitHub repositories..."))
+		repoLines = append(repoLines, clipLine(cellStatusIconStyle.Render(m.Spinner.View())+" Fetching GitHub repositories..."))
 	} else if len(m.Repos) == 0 {
 		repoLines = append(repoLines, clipLine("No repositories found in target directory."))
 	} else {
@@ -2024,7 +2026,7 @@ func (m Model) View() string {
 
 	if len(m.JobQueue) == 0 {
 		if m.IsJobQueueLoading {
-			jobsLines = append(jobsLines, clipLine(fmt.Sprintf(" %s Fetching active workflow jobs...", m.Spinner.View())))
+			jobsLines = append(jobsLines, clipLine(fmt.Sprintf(" %s Fetching active workflow jobs...", cellStatusIconStyle.Render(m.Spinner.View()))))
 		} else {
 			jobsLines = append(jobsLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No queued or running workflow jobs.")))
 		}
