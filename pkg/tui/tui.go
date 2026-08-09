@@ -217,6 +217,7 @@ type Model struct {
 	ActiveTab           TabType
 	IsSyncing           bool
 	IsOrgSyncing        bool
+	IsJobQueueLoading   bool
 	TotalCount          int
 	ToastMsg            string
 
@@ -253,6 +254,7 @@ func NewModel(targetDir, targetOrg string) Model {
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
+		IsJobQueueLoading:   true,
 		Spinner:             s,
 		ProgressBar:         p,
 		Viewport:            vp,
@@ -804,10 +806,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case loadedRunnersMsg:
 		if msg.err == nil && len(msg.runners) > 0 {
 			m.Runners = msg.runners
+			m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
 			m.updateViewport()
 		}
 
 	case loadedJobQueueMsg:
+		m.IsJobQueueLoading = false
 		if msg.err == nil {
 			// Compare with previous queue to trigger toast notifications
 			if len(m.JobQueue) > 0 {
@@ -876,7 +880,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					j.GHJobID = existingGHJobID[j.ID]
 				}
 			}
-			m.JobQueue = msg.queue
+			m.JobQueue = reconcileRunnerJobs(m.Runners, msg.queue, m.TargetOrg)
 			// Kick off log fetch for selected running job
 			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 				selJob := m.JobQueue[m.SelectedJobIndex]
@@ -1740,6 +1744,14 @@ func (m Model) View() string {
 	jobsLines = append(jobsLines, jobHeader)
 	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
 
+	if len(m.JobQueue) == 0 {
+		if m.IsJobQueueLoading {
+			jobsLines = append(jobsLines, clipLine(fmt.Sprintf(" %s Fetching active workflow jobs...", m.Spinner.View())))
+		} else {
+			jobsLines = append(jobsLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No queued or running workflow jobs.")))
+		}
+	}
+
 	// maxJobRows: inner content area of jobs box minus header and divider lines
 	maxJobRows := jobsBoxHeight - 2
 	if maxJobRows < 1 {
@@ -1970,4 +1982,41 @@ func findJobForRunner(r *jobs.RunnerItem, queue []*jobs.JobItem) *jobs.JobItem {
 		}
 	}
 	return nil
+}
+
+func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targetOrg string) []*jobs.JobItem {
+	result := make([]*jobs.JobItem, len(queue))
+	copy(result, queue)
+
+	for _, r := range runners {
+		if r.Status == jobs.RunnerRunning {
+			found := false
+			for _, j := range result {
+				if j.RunnerName == r.Name || j.RunnerID == r.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				jobTitle := r.CurrentJob
+				if jobTitle == "" || jobTitle == "-" {
+					jobTitle = fmt.Sprintf("%s active workflow job", r.Name)
+				}
+				jobID := r.CurrentJobID
+				if jobID == "" || jobID == "-" {
+					jobID = fmt.Sprintf("#%s", strings.TrimPrefix(r.ID, "runner-"))
+				}
+				result = append(result, &jobs.JobItem{
+					ID:         jobID,
+					Name:       jobTitle,
+					Repo:       targetOrg,
+					Status:     jobs.JobRunning,
+					RunnerName: r.Name,
+					RunnerID:   r.ID,
+					Duration:   "active",
+				})
+			}
+		}
+	}
+	return result
 }
