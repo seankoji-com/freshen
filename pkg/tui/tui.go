@@ -370,13 +370,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.triggerTabFetch()
 
 		case "X":
-			// Shortcut: Delete all local non-default branches and prune worktrees for selected repo
+			// Shortcut: Delete all local non-default branches & prune worktrees for selected repo
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
 				if err == nil {
-					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned stale worktrees and deleted %d non-default local branches.", count))
+					item.CurrentBranch = git.GetOriginalBranch(item.Path)
 					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned stale worktrees and deleted %d non-default local branches.", count))
 					m.ToastMsg = fmt.Sprintf(" 󰄬 Deleted %d stale branches & pruned worktrees!", count)
 					m.updateViewport()
 				}
@@ -415,8 +416,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item.CurrentBranch == item.OriginalBranch {
 					target = item.DefaultBranch
 				}
-				_ = git.SwitchBranch(item, target)
-				m.updateViewport()
+				if err := git.SwitchBranch(item, target); err == nil {
+					item.CurrentBranch = git.GetOriginalBranch(item.Path)
+					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+					m.updateViewport()
+				}
 			}
 
 		case "p":
@@ -424,36 +428,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
 					go func(r *git.RepoItem) {
-						_ = git.CommitPushPRAndSwitchDefault(r)
+						if err := git.CommitPushPRAndSwitchDefault(r); err == nil {
+							r.CurrentBranch = git.GetOriginalBranch(r.Path)
+							r.BranchDetails = git.GetRepoBranchDetails(r.Path, r.DefaultBranch)
+						}
 					}(item)
 					m.updateViewport()
 				}
 			}
 
 		case "d":
-			// Shortcut: Delete selected archived repo from disk
+			// Shortcut: Delete selected archived repo from disk & immediately remove from list
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
-					item.StatusMsg = "Deleted"
-					item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
-					m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", item.Name)
+					deletedName := item.Name
+
+					// Remove from slice instantly
+					m.Repos = append(m.Repos[:m.SelectedIndex], m.Repos[m.SelectedIndex+1:]...)
+					m.TotalCount = len(m.Repos)
+
+					if m.SelectedIndex >= len(m.Repos) && len(m.Repos) > 0 {
+						m.SelectedIndex = len(m.Repos) - 1
+					}
+
+					m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName)
 					m.updateViewport()
 				}
 			}
 
 		case "D":
-			// Shortcut: Delete ALL archived repos from disk
+			// Shortcut: Delete ALL archived repos from disk & immediately remove from list
 			deletedTotal := 0
+			var activeRepos []*git.RepoItem
 			for _, item := range m.Repos {
 				if item.IsArchived {
 					if err := git.DeleteLocalRepo(item.Path); err == nil {
 						deletedTotal++
-						item.StatusMsg = "Deleted"
-						item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
 					}
+				} else {
+					activeRepos = append(activeRepos, item)
 				}
+			}
+			m.Repos = activeRepos
+			m.TotalCount = len(m.Repos)
+			if m.SelectedIndex >= len(m.Repos) && len(m.Repos) > 0 {
+				m.SelectedIndex = len(m.Repos) - 1
 			}
 			m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted all %d archived repositories from disk!", deletedTotal)
 			m.updateViewport()
