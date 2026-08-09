@@ -168,7 +168,18 @@ func runGHCommand(args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("gh api call timed out after %s: args=%v", ghCommandTimeout, args)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("gh api: %w\nstderr: %s", err, stderr.String())
+		errStr := strings.TrimSpace(stderr.String())
+		if strings.Contains(errStr, "API rate limit exceeded") {
+			return nil, fmt.Errorf("GitHub API rate limit exceeded")
+		}
+		// Take only the first line of stderr to avoid multiline dumps in UI toasts
+		if firstLine, _, ok := strings.Cut(errStr, "\n"); ok && firstLine != "" {
+			errStr = firstLine
+		}
+		if errStr != "" {
+			return nil, fmt.Errorf("gh api: %s", errStr)
+		}
+		return nil, fmt.Errorf("gh api: %w", err)
 	}
 	return stdout.Bytes(), nil
 }
@@ -487,7 +498,16 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 	}
 
 	if len(fetchErrors) > 0 {
-		return FilterAndSortJobQueue(allJobs), fmt.Errorf("partial results: %d repo(s) had errors: %s", len(fetchErrors), strings.Join(fetchErrors, "; "))
+		rateLimitCount := 0
+		for _, e := range fetchErrors {
+			if strings.Contains(e, "rate limit") {
+				rateLimitCount++
+			}
+		}
+		if rateLimitCount > 0 {
+			return FilterAndSortJobQueue(allJobs), fmt.Errorf("rate limit exceeded across %d repo(s)", rateLimitCount)
+		}
+		return FilterAndSortJobQueue(allJobs), fmt.Errorf("%d repo(s) had errors (%s)", len(fetchErrors), fetchErrors[0])
 	}
 	return FilterAndSortJobQueue(allJobs), nil
 }
