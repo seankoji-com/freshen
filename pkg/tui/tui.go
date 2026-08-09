@@ -233,7 +233,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 
 			if ghRepo.IsArchived {
 				item.Status = git.StatusArchived
-				item.StatusMsg = "Archived (Press 'd' to delete)"
+				item.StatusMsg = "Archived"
 			}
 
 			repoMap[localDir] = item
@@ -370,7 +370,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.triggerTabFetch()
 
 		case "X":
-			// Shortcut: Delete all local non-default branches and prune worktrees
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
@@ -434,7 +433,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
-					item.StatusMsg = "Deleted from disk"
+					item.StatusMsg = "Deleted"
 					item.Logs = append(item.Logs, "󰄬 Local folder deleted successfully.")
 					m.updateViewport()
 				}
@@ -693,10 +692,10 @@ func (m Model) View() string {
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
 	
-	// Table Column Headers
-	tableHeader := fmt.Sprintf("%-18s %-16s %-12s %-5s %-5s", "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
+	// Table Column Headers with Expanded Whitespace for Branch Column
+	tableHeader := fmt.Sprintf("%-22s %-12s %-20s %-5s %-5s", "REPOSITORY", "STATUS", "BRANCH", "PRs", "ISSUES")
 	leftSb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(tableHeader) + "\n")
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("------------------------------------------------------------------") + "\n")
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("----------------------------------------------------------------------------------") + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
@@ -706,9 +705,9 @@ func (m Model) View() string {
 		for i, item := range m.Repos {
 			statusIcon := renderStatusBadge(item)
 
-			nameCell := truncateString(item.Name, 18)
-			statusCell := truncateString(item.StatusMsg, 16)
-			branchCell := truncateString(item.CurrentBranch, 12)
+			nameCell := truncateString(item.Name, 22)
+			statusCell := truncateString(item.StatusMsg, 12)
+			branchCell := truncateString(item.CurrentBranch, 20)
 			
 			prsCell := "-"
 			if item.OpenPRsCount > 0 {
@@ -720,7 +719,7 @@ func (m Model) View() string {
 				issuesCell = fmt.Sprintf("%d", item.OpenIssuesCount)
 			}
 
-			line := fmt.Sprintf("%s %-16s %-16s %-12s %-5s %-5s",
+			line := fmt.Sprintf("%s %-22s %-12s %-20s %-5s %-5s",
 				statusIcon, nameCell, statusCell, branchCell, prsCell, issuesCell,
 			)
 

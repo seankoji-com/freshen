@@ -337,14 +337,14 @@ func GetDefaultBranch(path string) string {
 	return GetOriginalBranch(path)
 }
 
-// SyncRepository performs the exact branch workflow:
+// SyncRepository performs the exact branch workflow with brief status messages:
 // A. If on DEFAULT branch:
-//   - No unstaged changes: git pull, done.
-//   - Unstaged changes: git add . && git stash && git pull && git stash apply, done.
+//   - No unstaged changes: git pull, done. (StatusMsg: "OK" / "Updated")
+//   - Unstaged changes: git add . && git stash && git pull && git stash apply, done. (StatusMsg: "Stashed")
 // B. If on DIFFERENT branch:
 //   - Fetch link to any existing open PR.
-//   - No unstaged changes: checkout default branch, git pull, done. (Option in TUI to switch back with 'b')
-//   - Unstaged changes: git fetch && git rebase to default branch. (Option in TUI to commit/push PR with 'p')
+//   - No unstaged changes: checkout default branch, git pull, done. (StatusMsg: "Switched")
+//   - Unstaged changes: git fetch && git rebase to default branch. (StatusMsg: "Rebased")
 func SyncRepository(item *RepoItem) {
 	item.Status = StatusSyncing
 	item.Logs = append(item.Logs, fmt.Sprintf("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
@@ -390,15 +390,15 @@ func SyncRepository(item *RepoItem) {
 			if err := pullCmd.Run(); err == nil {
 				if strings.Contains(pullOut.String(), "Already up to date.") {
 					item.Status = StatusUpToDate
-					item.StatusMsg = fmt.Sprintf("󰄬 Up to date (%s)", defaultBranch)
+					item.StatusMsg = "OK"
 				} else {
 					item.Status = StatusUpdated
-					item.StatusMsg = fmt.Sprintf("󰄬 Updated (%s)", defaultBranch)
+					item.StatusMsg = "Updated"
 				}
 				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s'.", defaultBranch))
 			} else {
 				item.Status = StatusError
-				item.StatusMsg = "󰅙 Pull Failed"
+				item.StatusMsg = "Pull Error"
 				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
 			}
 			return
@@ -411,7 +411,7 @@ func SyncRepository(item *RepoItem) {
 			stashCmd := exec.Command("git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 			if err := stashCmd.Run(); err != nil {
 				item.Status = StatusError
-				item.StatusMsg = "󰅙 Stash Error"
+				item.StatusMsg = "Stash Err"
 				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to stash local changes: %v", err))
 				return
 			}
@@ -423,11 +423,11 @@ func SyncRepository(item *RepoItem) {
 			applyCmd := exec.Command("git", "-C", item.Path, "stash", "apply")
 			if err := applyCmd.Run(); err == nil {
 				item.Status = StatusStashedApplied
-				item.StatusMsg = fmt.Sprintf("󰏖 Stash Applied (%s)", defaultBranch)
+				item.StatusMsg = "Stashed"
 				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch))
 			} else {
 				item.Status = StatusError
-				item.StatusMsg = "󰅙 Stash Apply Conflict"
+				item.StatusMsg = "Conflict"
 				item.Logs = append(item.Logs, "󰅙 Conflict occurred while applying stash!")
 			}
 			return
@@ -439,13 +439,12 @@ func SyncRepository(item *RepoItem) {
 	// =========================================================================
 	if !hasUnstagedChanges {
 		// B1: No unstaged changes -> checkout default branch, git pull, done.
-		// (Option in TUI: Press 'b' to switch back to origBranch)
 		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull...", origBranch, defaultBranch))
 
 		coCmd := exec.Command("git", "-C", item.Path, "checkout", defaultBranch)
 		if err := coCmd.Run(); err != nil {
 			item.Status = StatusError
-			item.StatusMsg = fmt.Sprintf("󰅙 Checkout Failed (%s)", defaultBranch)
+			item.StatusMsg = "Checkout Err"
 			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to checkout '%s': %v", defaultBranch, err))
 			return
 		}
@@ -457,17 +456,16 @@ func SyncRepository(item *RepoItem) {
 		pullCmd.Stderr = &pullOut
 		if err := pullCmd.Run(); err == nil {
 			item.Status = StatusSwitchedDefault
-			item.StatusMsg = fmt.Sprintf("󰄬 Switched to %s & Pulled", defaultBranch)
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched from '%s' to '%s' and pulled. (Press 'b' to switch back to '%s')", origBranch, defaultBranch, origBranch))
+			item.StatusMsg = "Switched"
+			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched from '%s' to '%s' and pulled.", origBranch, defaultBranch))
 		} else {
 			item.Status = StatusError
-			item.StatusMsg = "󰅙 Pull Failed"
+			item.StatusMsg = "Pull Error"
 			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
 		}
 		return
 	} else {
 		// B2: Unstaged changes -> git fetch and rebase to default branch.
-		// (Option in TUI: Press 'p' to commit & push to raise new/existing PR and switch back to default)
 		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch))
 
 		_ = exec.Command("git", "-C", item.Path, "fetch", "origin").Run()
@@ -479,12 +477,12 @@ func SyncRepository(item *RepoItem) {
 
 		if err := rebaseCmd.Run(); err == nil {
 			item.Status = StatusRebased
-			item.StatusMsg = fmt.Sprintf("󰚰 Rebased (%s)", origBranch)
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Rebased '%s' onto '%s'. (Press 'p' to commit, push/PR & switch to %s)", origBranch, rebaseTarget, defaultBranch))
+			item.StatusMsg = "Rebased"
+			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Rebased '%s' onto '%s'.", origBranch, rebaseTarget))
 		} else {
 			_ = exec.Command("git", "-C", item.Path, "rebase", "--abort").Run()
 			item.Status = StatusRebaseConflict
-			item.StatusMsg = fmt.Sprintf("󰅙 Rebase Conflict (%s)", origBranch)
+			item.StatusMsg = "Conflict"
 			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Rebase conflict: %s", rebaseOut.String()))
 		}
 		return
@@ -499,7 +497,7 @@ func SwitchBranch(item *RepoItem, targetBranch string) error {
 		return err
 	}
 	item.CurrentBranch = targetBranch
-	item.StatusMsg = fmt.Sprintf("󰁨 Switched to %s", targetBranch)
+	item.StatusMsg = "Switched"
 	item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched branch to '%s'.", targetBranch))
 	return nil
 }
@@ -545,7 +543,7 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 	if err := coCmd.Run(); err == nil {
 		item.CurrentBranch = item.DefaultBranch
 		item.Status = StatusPRCreated
-		item.StatusMsg = fmt.Sprintf("󰏫 PR Raised & Switched to %s", item.DefaultBranch)
+		item.StatusMsg = "PR Raised"
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
 	}
 
