@@ -472,3 +472,61 @@ func TestFooterSeparationAndLineWidthBounds(t *testing.T) {
 		}
 	}
 }
+
+func TestPanelBoundaryCrossingToasts(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", CurrentBranch: "main", Status: git.StatusUpToDate},
+	}
+	m.Runners = []*jobs.RunnerItem{
+		{ID: "runner-1", Name: "carey-mac-alpha", Status: jobs.RunnerIdle},
+	}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "repo1 / test", Status: jobs.JobRunning, Repo: "repo1"},
+	}
+
+	// 1. Move down from Repos to Runners
+	m.ActiveFocus = FocusRepos
+	m.SelectedIndex = 0
+	msgDown := tea.KeyMsg{Type: tea.KeyDown}
+
+	m2, _ := m.Update(msgDown)
+	updated2 := m2.(Model)
+	if updated2.ActiveFocus != FocusRunners {
+		t.Errorf("expected ActiveFocus FocusRunners, got %v", updated2.ActiveFocus)
+	}
+	if !strings.Contains(updated2.ToastMsg, "Focused Runners Panel") {
+		t.Errorf("expected ToastMsg to contain Focused Runners Panel, got %q", updated2.ToastMsg)
+	}
+
+	// 2. Move down from Runners to Jobs
+	m3, _ := updated2.Update(msgDown)
+	updated3 := m3.(Model)
+	if updated3.ActiveFocus != FocusJobs {
+		t.Errorf("expected ActiveFocus FocusJobs, got %v", updated3.ActiveFocus)
+	}
+	if !strings.Contains(updated3.ToastMsg, "Focused Jobs Panel") {
+		t.Errorf("expected ToastMsg to contain Focused Jobs Panel, got %q", updated3.ToastMsg)
+	}
+
+	// 3. Move up from Jobs to Runners
+	msgUp := tea.KeyMsg{Type: tea.KeyUp}
+	m4, _ := updated3.Update(msgUp)
+	updated4 := m4.(Model)
+	if updated4.ActiveFocus != FocusRunners {
+		t.Errorf("expected ActiveFocus FocusRunners, got %v", updated4.ActiveFocus)
+	}
+	if !strings.Contains(updated4.ToastMsg, "Focused Runners Panel") {
+		t.Errorf("expected ToastMsg to contain Focused Runners Panel, got %q", updated4.ToastMsg)
+	}
+
+	// 4. Move up from Runners to Repos
+	m5, _ := updated4.Update(msgUp)
+	updated5 := m5.(Model)
+	if updated5.ActiveFocus != FocusRepos {
+		t.Errorf("expected ActiveFocus FocusRepos, got %v", updated5.ActiveFocus)
+	}
+	if !strings.Contains(updated5.ToastMsg, "Focused Repositories Panel") {
+		t.Errorf("expected ToastMsg to contain Focused Repositories Panel, got %q", updated5.ToastMsg)
+	}
+}
