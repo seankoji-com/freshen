@@ -1747,6 +1747,16 @@ func (m Model) View() string {
 		jobEndIdx = len(m.JobQueue)
 	}
 
+	// Detect grouped runs to add tree branch connectors for matrix jobs
+	runCounts := make(map[int64]int)
+	runIndices := make(map[int64][]int)
+	for idx, j := range m.JobQueue {
+		if j.RunID != 0 {
+			runCounts[j.RunID]++
+			runIndices[j.RunID] = append(runIndices[j.RunID], idx)
+		}
+	}
+
 	for i := jobStartIdx; i < jobEndIdx; i++ {
 		j := m.JobQueue[i]
 		stSymbol := "⏳"
@@ -1762,8 +1772,18 @@ func (m Model) View() string {
 			stColor = colorRed
 		}
 
-		// Keep job row within pane using dynamic column widths
 		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
+
+		// Tree branch connector if part of a multi-job workflow run
+		treePrefix := ""
+		if count := runCounts[j.RunID]; count > 1 {
+			indices := runIndices[j.RunID]
+			if indices[len(indices)-1] == i {
+				treePrefix = "└─ "
+			} else {
+				treePrefix = "├─ "
+			}
+		}
 
 		idW := len(j.ID)
 		if idW < 8 {
@@ -1782,19 +1802,24 @@ func (m Model) View() string {
 			idStrText = Hyperlink(idStrText, jobURL)
 		}
 
-		runnerW := len(j.RunnerName)
+		runnerStr := j.RunnerName
+		if runnerStr == "" {
+			runnerStr = "awaiting"
+		}
+		runnerW := len(runnerStr) + 2 // include "→ " prefix
 		if runnerW < 10 {
 			runnerW = 10
 		}
 		if runnerW > 16 {
 			runnerW = 16
 		}
-		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render(truncateString(j.RunnerName, runnerW))
+		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render("→ " + truncateString(runnerStr, runnerW-2))
 
 		// Give all remaining inner pane space to job name
-		nameW := paneInnerWidth - 2 - 9 - 1 - idW - 1 - runnerW - 1
-		if nameW < 15 {
-			nameW = 15
+		prefixLen := lipgloss.Width(treePrefix)
+		nameW := paneInnerWidth - 2 - prefixLen - 9 - 1 - idW - 1 - runnerW - 1
+		if nameW < 12 {
+			nameW = 12
 		}
 
 		// Smart display name: strip redundant repo prefix if job name starts with "repo / "
@@ -1806,7 +1831,7 @@ func (m Model) View() string {
 
 		nameStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(displayName, nameW))
 
-		line := fmt.Sprintf("%s %s %s %s", stBadge, idStrText, nameStr, runnerAssigned)
+		line := fmt.Sprintf("%s%s %s %s %s", treePrefix, stBadge, idStrText, nameStr, runnerAssigned)
 
 		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
 			jobsLines = append(jobsLines, clipLine(selectedRowStyle.Width(paneInnerWidth).Render("> "+line)))
