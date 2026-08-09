@@ -548,9 +548,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			case FocusRunners:
-				if len(m.Repos) > 0 {
+				if m.SelectedRunnerIndex > 0 {
+					m.SelectedRunnerIndex--
+					m.updateViewport()
+				} else if len(m.Repos) > 0 {
 					m.ActiveFocus = FocusRepos
 					m.SelectedIndex = len(m.Repos) - 1
+					m.setToast(" Focused Repositories Panel", 1)
 					m.updateViewport()
 				}
 			case FocusJobs:
@@ -565,6 +569,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					m.ActiveFocus = FocusRunners
+					matching := m.getMatchingRunners()
+					if len(matching) > 0 {
+						m.SelectedRunnerIndex = len(matching) - 1
+					} else {
+						m.SelectedRunnerIndex = 0
+					}
+					m.setToast(" Focused Runners Panel", 1)
 					m.updateViewport()
 				}
 			}
@@ -577,16 +588,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				} else {
 					m.ActiveFocus = FocusRunners
+					m.SelectedRunnerIndex = 0
+					m.setToast(" Focused Runners Panel", 1)
 					m.updateViewport()
 				}
 			case FocusRunners:
-				m.ActiveFocus = FocusJobs
-				m.SelectedJobIndex = 0
-				m.updateViewport()
-				if len(m.JobQueue) > 0 {
-					j := m.JobQueue[0]
-					if j.Status == jobs.JobRunning {
-						cmds = append(cmds, m.loadJobLogsCmd(j))
+				matching := m.getMatchingRunners()
+				if m.SelectedRunnerIndex < len(matching)-1 {
+					m.SelectedRunnerIndex++
+					m.updateViewport()
+				} else {
+					m.ActiveFocus = FocusJobs
+					m.SelectedJobIndex = 0
+					m.setToast(" Focused Jobs Panel", 1)
+					m.updateViewport()
+					if len(m.JobQueue) > 0 {
+						j := m.JobQueue[0]
+						if j.Status == jobs.JobRunning {
+							cmds = append(cmds, m.loadJobLogsCmd(j))
+						}
 					}
 				}
 			case FocusJobs:
@@ -1184,7 +1204,7 @@ func (m *Model) updateViewport() {
 			maxJobLen = 15
 		}
 
-		for _, r := range matchingRunners {
+		for idx, r := range matchingRunners {
 			var rColor lipgloss.Color
 			var rGlyph string
 			switch r.Status {
@@ -1197,7 +1217,6 @@ func (m *Model) updateViewport() {
 			default:
 				rColor, rGlyph = colorGreen, "●"
 			}
-			marker := "  "
 			glyphCell := lipgloss.NewStyle().Foreground(rColor).Width(2).Render(rGlyph)
 			var currentJobStr string
 			switch {
@@ -1220,12 +1239,18 @@ func (m *Model) updateViewport() {
 			default:
 				currentJobStr = lipgloss.NewStyle().Foreground(colorMuted).Render("idle")
 			}
-			sb.WriteString(fmt.Sprintf("%s%s %s  %s\n",
-				marker,
+
+			isSelected := m.ActiveFocus == FocusRunners && idx == m.SelectedRunnerIndex
+			rowContent := fmt.Sprintf("%s %s  %s",
 				glyphCell,
 				lipgloss.NewStyle().Foreground(colorSecondary).Width(20).Render(r.Name),
 				currentJobStr,
-			))
+			)
+			if isSelected {
+				sb.WriteString(selectedRowStyle.Render("> "+rowContent) + "\n")
+			} else {
+				sb.WriteString(normalRowStyle.Render("  "+rowContent) + "\n")
+			}
 		}
 
 		// --- QUEUED / RUNNING JOBS ON MATCHING RUNNERS ---
@@ -2393,4 +2418,28 @@ func (m Model) getAvailableTags() []string {
 	}
 	sort.Strings(keys)
 	return append(tags, keys...)
+}
+
+func (m Model) getMatchingRunners() []*jobs.RunnerItem {
+	tags := m.getAvailableTags()
+	tagIdx := m.SelectedTagIndex
+	if tagIdx >= len(tags) {
+		tagIdx = 0
+	}
+	activeTag := tags[tagIdx]
+
+	var matching []*jobs.RunnerItem
+	for _, r := range m.Runners {
+		if activeTag == "ALL" {
+			matching = append(matching, r)
+		} else {
+			for _, tag := range r.Tags {
+				if tag == activeTag {
+					matching = append(matching, r)
+					break
+				}
+			}
+		}
+	}
+	return matching
 }
