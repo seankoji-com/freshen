@@ -414,29 +414,30 @@ func MergeRunners(newRunners []*RunnerItem, existing []*RunnerItem, jobQueue []*
 	return newRunners
 }
 
-// FetchOrgJobQueue polls GitHub API for all in_progress and queued workflow runs and their individual jobs.
-// Returns collected errors from per-repo failures so callers can surface partial-data warnings.
+// FetchOrgJobQueue polls GitHub API for active workflow runs across the organization using org-level endpoints.
+// This executes 2 API calls total (in_progress + queued) rather than N calls per repository, minimizing rate limits.
 func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 	var allJobs []*JobItem
 	seenRunIDs := make(map[int64]bool)
 	seenJobIDs := make(map[int64]bool)
 	var fetchErrors []string
 
-	for _, repo := range repos {
+	statuses := []string{"in_progress", "queued"}
+	for _, status := range statuses {
 		out, err := runGHCommand(
 			"api",
-			fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=10", org, repo),
+			fmt.Sprintf("/orgs/%s/actions/runs?status=%s&per_page=50", org, status),
 		)
 		if err != nil {
-			slog.Error("gh api workflow runs failed", "org", org, "repo", repo, "error", err)
-			fetchErrors = append(fetchErrors, fmt.Sprintf("%s: %v", repo, err))
+			slog.Error("gh api org workflow runs failed", "org", org, "status", status, "error", err)
+			fetchErrors = append(fetchErrors, fmt.Sprintf("status=%s: %v", status, err))
 			continue
 		}
 
 		var resp GHWorkflowRunsResponse
 		if err := json.Unmarshal(out, &resp); err != nil {
-			slog.Error("failed to parse workflow runs JSON", "org", org, "repo", repo, "error", err)
-			fetchErrors = append(fetchErrors, fmt.Sprintf("%s: parse error", repo))
+			slog.Error("failed to parse org workflow runs JSON", "org", org, "status", status, "error", err)
+			fetchErrors = append(fetchErrors, fmt.Sprintf("status=%s parse error", status))
 			continue
 		}
 
@@ -444,15 +445,16 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			if seenRunIDs[run.ID] {
 				continue
 			}
-			// Only inspect active runs
-			if run.Status != "in_progress" && run.Status != "queued" && run.Status != "waiting" && run.Status != "requested" {
-				continue
-			}
 			seenRunIDs[run.ID] = true
+
+			repoName := run.Repository.Name
+			if repoName == "" {
+				repoName = "unknown"
+			}
 
 			jobsOut, err := runGHCommand(
 				"api",
-				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
+				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repoName, run.ID),
 			)
 
 			var parsedJobsFromRun int
@@ -470,8 +472,8 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 							continue
 						}
 
-						jobItem := buildJobItemFromJob(j, run, repo)
-						prNum, prTitle, prURL := extractPRInfo(run, org, repo)
+						jobItem := buildJobItemFromJob(j, run, repoName)
+						prNum, prTitle, prURL := extractPRInfo(run, org, repoName)
 						jobItem.PRNumber = prNum
 						jobItem.PRTitle = prTitle
 						jobItem.PRURL = prURL
@@ -481,13 +483,13 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 					}
 				}
 			} else {
-				slog.Debug("gh jobs endpoint failed for run, using fallback", "runID", run.ID, "repo", repo, "error", err)
+				slog.Debug("gh jobs endpoint failed for run, using fallback", "runID", run.ID, "repo", repoName, "error", err)
 			}
 
 			// Fallback if jobs endpoint returned no jobs
 			if parsedJobsFromRun == 0 {
-				jobItem := buildJobItemFromRun(run, repo)
-				prNum, prTitle, prURL := extractPRInfo(run, org, repo)
+				jobItem := buildJobItemFromRun(run, repoName)
+				prNum, prTitle, prURL := extractPRInfo(run, org, repoName)
 				jobItem.PRNumber = prNum
 				jobItem.PRTitle = prTitle
 				jobItem.PRURL = prURL
@@ -505,9 +507,9 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			}
 		}
 		if rateLimitCount > 0 {
-			return FilterAndSortJobQueue(allJobs), fmt.Errorf("rate limit exceeded across %d repo(s)", rateLimitCount)
+			return FilterAndSortJobQueue(allJobs), fmt.Errorf("GitHub API rate limit exceeded")
 		}
-		return FilterAndSortJobQueue(allJobs), fmt.Errorf("%d repo(s) had errors (%s)", len(fetchErrors), fetchErrors[0])
+		return FilterAndSortJobQueue(allJobs), fmt.Errorf("failed fetching org job queue (%s)", fetchErrors[0])
 	}
 	return FilterAndSortJobQueue(allJobs), nil
 }
