@@ -1222,6 +1222,12 @@ func (m *Model) updateViewport() {
 		}
 		jobIDLink := Hyperlink(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(job.ID), jobURL)
 
+		runToken, jobToken := parseJobHierarchy(job.Name, job.Repo)
+		runnerDisplay := job.RunnerName
+		if runnerDisplay == "" {
+			runnerDisplay = "Awaiting available runner node..."
+		}
+
 		sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  %s %s  |  Duration: %s\n\n",
 			iconQueue,
 			jobIDLink,
@@ -1233,11 +1239,18 @@ func (m *Model) updateViewport() {
 			job.Duration,
 		))
 
-		sb.WriteString(fmt.Sprintf(" %s %s  |  %s %s\n",
-			lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("JOB TITLE:"),
-			job.Name,
+		sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Run:"),
+			lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken),
+		))
+		sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Job:"),
+			lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(jobToken),
+		))
+		sb.WriteString(fmt.Sprintf(" %s  %s %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Runner:"),
 			iconRunner,
-			lipgloss.NewStyle().Foreground(colorSecondary).Render("Assigned to: "+job.RunnerName),
+			lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(runnerDisplay),
 		))
 
 		if job.Status == jobs.JobQueued {
@@ -1817,9 +1830,9 @@ func (m Model) View() string {
 
 		// Give all remaining inner pane space to job name
 		prefixLen := lipgloss.Width(treePrefix)
-		nameW := paneInnerWidth - 2 - prefixLen - 9 - 1 - idW - 1 - runnerW - 1
-		if nameW < 12 {
-			nameW = 12
+		nameW := paneInnerWidth - 4 - prefixLen - 9 - 1 - idW - 1 - runnerW - 1
+		if nameW < 10 {
+			nameW = 10
 		}
 
 		// Smart display name: strip redundant repo prefix if job name starts with "repo / "
@@ -1834,7 +1847,7 @@ func (m Model) View() string {
 		line := fmt.Sprintf("%s%s %s %s %s", treePrefix, stBadge, idStrText, nameStr, runnerAssigned)
 
 		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
-			jobsLines = append(jobsLines, clipLine(selectedRowStyle.Width(paneInnerWidth).Render("> "+line)))
+			jobsLines = append(jobsLines, clipLine(selectedRowStyle.MaxWidth(paneInnerWidth).Render("> "+line)))
 		} else {
 			jobsLines = append(jobsLines, clipLine(normalRowStyle.Render("  "+line)))
 		}
@@ -1914,4 +1927,22 @@ func truncateString(str string, maxLen int) string {
 		return str[:maxLen]
 	}
 	return str[:maxLen-3] + "..."
+}
+
+func parseJobHierarchy(fullName, repo string) (runName, jobName string) {
+	cleanName := fullName
+	repoPrefix := repo + " / "
+	if strings.HasPrefix(cleanName, repoPrefix) {
+		cleanName = strings.TrimPrefix(cleanName, repoPrefix)
+	}
+
+	parts := strings.Split(cleanName, " / ")
+	if len(parts) >= 2 {
+		runName = parts[0]
+		jobName = strings.Join(parts[1:], " / ")
+	} else {
+		runName = "-"
+		jobName = cleanName
+	}
+	return runName, jobName
 }
