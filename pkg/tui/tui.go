@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -218,7 +219,7 @@ func (m Model) startParallelSyncCmd(forceFullSync bool) tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				// Perform sync: auto-full sync for default branch repos, fetch & rebase for feature branch repos
+				// Branch-selective sync
 				git.SyncRepository(r, forceFullSync)
 			}(item)
 		}
@@ -252,7 +253,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
-			// Re-sync selected repo (auto branch behavior)
+			// Re-sync selected repo
 			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
@@ -328,20 +329,60 @@ func (m *Model) updateViewport() {
 	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("Repository:  %s\n", subtitleStyle.Render(item.Name)))
-	sb.WriteString(fmt.Sprintf("GitHub Name: %s\n", item.GHRepoName))
-	sb.WriteString(fmt.Sprintf("Local Path:  %s\n", item.Path))
-	sb.WriteString(fmt.Sprintf("Branch:      %s (Default: %s)\n", item.CurrentBranch, item.DefaultBranch))
-	sb.WriteString(fmt.Sprintf("Status:      %s\n", item.StatusMsg))
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REPOSITORY:"), subtitleStyle.Render(item.Name)))
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("GITHUB NAME:"), item.GHRepoName))
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Render("LOCAL PATH: "), item.Path))
+	sb.WriteString(fmt.Sprintf("%s %s (Default: %s)\n", lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render("BRANCH:     "), item.CurrentBranch, item.DefaultBranch))
+	sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("STATUS:     "), item.StatusMsg))
 	if item.DraftPRURL != "" {
-		sb.WriteString(fmt.Sprintf("Draft PR:    %s\n", badgeStashedPR.Render(item.DraftPRURL)))
+		sb.WriteString(fmt.Sprintf("%s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:   "), badgeStashedPR.Render(item.DraftPRURL)))
 	}
-	sb.WriteString("\n------------------ EXECUTION LOGS ------------------\n")
+	sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
+
 	for _, logLine := range item.Logs {
-		sb.WriteString(fmt.Sprintf("%s\n", logLine))
+		sb.WriteString(highlightLogLine(logLine) + "\n")
 	}
 
 	m.Viewport.SetContent(sb.String())
+}
+
+// highlightLogLine applies syntax highlighting to git commands, timestamps, URLs, and status markers.
+func highlightLogLine(line string) string {
+	if line == "" {
+		return line
+	}
+
+	// 1. Highlight timestamps [15:04:05]
+	line = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`).ReplaceAllStringFunc(line, func(m string) string {
+		return lipgloss.NewStyle().Foreground(colorMuted).Render(m)
+	})
+
+	// 2. Highlight Git / GH commands
+	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|gh pr create|gh repo list)\b`)
+	line = cmdRegex.ReplaceAllStringFunc(line, func(m string) string {
+		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
+	})
+
+	// 3. Highlight URLs (https://...)
+	urlRegex := regexp.MustCompile(`https?://[^\s]+`)
+	line = urlRegex.ReplaceAllStringFunc(line, func(m string) string {
+		return lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(m)
+	})
+
+	// 4. Highlight Quoted Strings / Branches ('main', 'master', etc.)
+	quoteRegex := regexp.MustCompile(`'[^']+'`)
+	line = quoteRegex.ReplaceAllStringFunc(line, func(m string) string {
+		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(m)
+	})
+
+	// 5. Highlight Success / Error prefix markers
+	if strings.HasPrefix(line, "✓") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
+		line = lipgloss.NewStyle().Foreground(colorGreen).Render(line)
+	} else if strings.HasPrefix(line, "✗") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
+		line = lipgloss.NewStyle().Foreground(colorRed).Render(line)
+	}
+
+	return line
 }
 
 func (m Model) View() string {
