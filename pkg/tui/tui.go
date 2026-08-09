@@ -1042,13 +1042,7 @@ func (m *Model) updateViewport() {
 
 		// --- CURRENT JOB ---
 		sb.WriteString("\n")
-		var activeJob *jobs.JobItem
-		for _, j := range m.JobQueue {
-			if j.Status == jobs.JobRunning && (j.RunnerName == runner.Name || j.RunnerID == runner.ID) {
-				activeJob = j
-				break
-			}
-		}
+		activeJob := findJobForRunner(runner, m.JobQueue)
 
 		curJobID := runner.CurrentJobID
 		curJobName := runner.CurrentJob
@@ -1086,7 +1080,7 @@ func (m *Model) updateViewport() {
 		} else if runner.Status == jobs.RunnerRunning {
 			sb.WriteString(fmt.Sprintf(" %s  %s\n",
 				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
-				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("⚡ Executing GitHub workflow job"),
+				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf("⚡ %s active workflow", m.TargetOrg)),
 			))
 		} else {
 			sb.WriteString(fmt.Sprintf(" %s  %s\n",
@@ -1128,22 +1122,22 @@ func (m *Model) updateViewport() {
 			glyphCell := lipgloss.NewStyle().Foreground(rColor).Width(2).Render(rGlyph)
 			var currentJobStr string
 			switch {
+			case r.Status == jobs.RunnerRunning:
+				matchedJ := findJobForRunner(r, m.JobQueue)
+				if matchedJ != nil {
+					dispName := matchedJ.Name
+					repoPrefix := matchedJ.Repo + " / "
+					if strings.HasPrefix(dispName, repoPrefix) {
+						dispName = strings.TrimPrefix(dispName, repoPrefix)
+					}
+					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(dispName, maxJobLen))
+				} else if r.CurrentJob != "-" && r.CurrentJob != "" {
+					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(r.CurrentJob, maxJobLen))
+				} else {
+					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString("active job in queue", maxJobLen))
+				}
 			case r.CurrentJob != "-" && r.CurrentJob != "":
 				currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(r.CurrentJob, maxJobLen))
-			case r.Status == jobs.RunnerRunning:
-				// Check if we can match active job name from queue
-				var matchedJ *jobs.JobItem
-				for _, j := range m.JobQueue {
-					if j.Status == jobs.JobRunning && (j.RunnerName == r.Name || j.RunnerID == r.ID) {
-						matchedJ = j
-						break
-					}
-				}
-				if matchedJ != nil {
-					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(matchedJ.Name, maxJobLen))
-				} else {
-					currentJobStr = lipgloss.NewStyle().Foreground(colorSecondary).Render("executing workflow job")
-				}
 			default:
 				currentJobStr = lipgloss.NewStyle().Foreground(colorMuted).Render("idle")
 			}
@@ -1945,4 +1939,35 @@ func parseJobHierarchy(fullName, repo string) (runName, jobName string) {
 		jobName = cleanName
 	}
 	return runName, jobName
+}
+
+func findJobForRunner(r *jobs.RunnerItem, queue []*jobs.JobItem) *jobs.JobItem {
+	if r == nil {
+		return nil
+	}
+	// 1. Try exact runner name match (running)
+	for _, j := range queue {
+		if j.Status == jobs.JobRunning && (j.RunnerName == r.Name || j.RunnerID == r.ID) {
+			return j
+		}
+	}
+	// 2. Try case-insensitive runner name match (running)
+	for _, j := range queue {
+		if j.Status == jobs.JobRunning && j.RunnerName != "" && strings.EqualFold(j.RunnerName, r.Name) {
+			return j
+		}
+	}
+	// 3. Try any queued/running job assigned to this runner
+	for _, j := range queue {
+		if (j.RunnerName == r.Name || j.RunnerID == r.ID) && j.Name != "" {
+			return j
+		}
+	}
+	// 4. Try any running job in queue
+	for _, j := range queue {
+		if j.Status == jobs.JobRunning {
+			return j
+		}
+	}
+	return nil
 }
