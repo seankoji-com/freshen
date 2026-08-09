@@ -54,9 +54,47 @@ type PRItem struct {
 }
 
 type BranchWorktreeDetails struct {
-	Branches     []string
-	Worktrees    []string
-	ChangedFiles []string
+	Branches       []string
+	LocalBranches  []string
+	RemoteBranches []string
+	Worktrees      []string
+	ChangedFiles   []string
+}
+
+// GetLocalBranches returns local branch entries.
+func (d BranchWorktreeDetails) GetLocalBranches() []string {
+	if len(d.LocalBranches) > 0 {
+		return d.LocalBranches
+	}
+	var local []string
+	for _, b := range d.Branches {
+		clean := strings.TrimSpace(b)
+		clean = strings.TrimPrefix(clean, "* ")
+		clean = strings.TrimPrefix(clean, "+ ")
+		clean = strings.TrimSpace(clean)
+		if !strings.HasPrefix(clean, "remotes/") {
+			local = append(local, b)
+		}
+	}
+	return local
+}
+
+// GetRemoteBranches returns remote tracking branch entries.
+func (d BranchWorktreeDetails) GetRemoteBranches() []string {
+	if len(d.RemoteBranches) > 0 {
+		return d.RemoteBranches
+	}
+	var remote []string
+	for _, b := range d.Branches {
+		clean := strings.TrimSpace(b)
+		clean = strings.TrimPrefix(clean, "* ")
+		clean = strings.TrimPrefix(clean, "+ ")
+		clean = strings.TrimSpace(clean)
+		if strings.HasPrefix(clean, "remotes/") {
+			remote = append(remote, b)
+		}
+	}
+	return remote
 }
 
 type GraphQLOrgResponse struct {
@@ -97,6 +135,7 @@ type RepoItem struct {
 	HasLoadedPRs       bool
 	IsLoadingIssues    bool
 	IsLoadingPRs       bool
+	HasLoadedCounts    bool
 	BranchDetails      BranchWorktreeDetails
 	Status             RepoStatus
 	StatusMsg          string
@@ -193,6 +232,17 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		for _, line := range strings.Split(out.String(), "\n") {
 			if trimmed := strings.TrimSpace(line); trimmed != "" {
 				details.Branches = append(details.Branches, trimmed)
+
+				clean := trimmed
+				clean = strings.TrimPrefix(clean, "* ")
+				clean = strings.TrimPrefix(clean, "+ ")
+				clean = strings.TrimSpace(clean)
+
+				if strings.HasPrefix(clean, "remotes/") {
+					details.RemoteBranches = append(details.RemoteBranches, trimmed)
+				} else {
+					details.LocalBranches = append(details.LocalBranches, trimmed)
+				}
 			}
 		}
 	}
