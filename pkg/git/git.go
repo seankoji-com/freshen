@@ -34,6 +34,29 @@ type GHRepoInfo struct {
 	SSHURL     string `json:"sshUrl"`
 }
 
+type RepoCounts struct {
+	Issues int
+	PRs    int
+}
+
+type GraphQLOrgResponse struct {
+	Data struct {
+		Organization struct {
+			Repositories struct {
+				Nodes []struct {
+					Name   string `json:"name"`
+					Issues struct {
+						TotalCount int `json:"totalCount"`
+					} `json:"issues"`
+					PullRequests struct {
+						TotalCount int `json:"totalCount"`
+					} `json:"pullRequests"`
+				} `json:"nodes"`
+			} `json:"repositories"`
+		} `json:"organization"`
+	} `json:"data"`
+}
+
 type RepoItem struct {
 	Name               string
 	GHRepoName         string
@@ -45,6 +68,8 @@ type RepoItem struct {
 	DefaultBranch      string
 	HasUnstagedChanges bool
 	ExistingPRURL      string
+	OpenIssuesCount    int
+	OpenPRsCount       int
 	Status             RepoStatus
 	StatusMsg          string
 	Stashed            bool
@@ -92,6 +117,31 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 	}
 
 	return repos, nil
+}
+
+// FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
+func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
+	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
+	cmd := exec.Command("gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	var resp GraphQLOrgResponse
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]RepoCounts)
+	for _, node := range resp.Data.Organization.Repositories.Nodes {
+		result[node.Name] = RepoCounts{
+			Issues: node.Issues.TotalCount,
+			PRs:    node.PullRequests.TotalCount,
+		}
+	}
+	return result, nil
 }
 
 // FetchExistingPRURL checks if an open PR exists on GitHub for the given branch.
