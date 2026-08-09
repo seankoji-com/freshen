@@ -335,3 +335,30 @@ func TestHyperlinksInView(t *testing.T) {
 		t.Errorf("expected FocusJobs header to contain valid OSC 8 hyperlink for Job ID")
 	}
 }
+
+func TestIssue37Fixes(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 120
+	m.Height = 40
+	m.Repos = []*git.RepoItem{
+		{Name: "myrepo", CurrentBranch: "feat/long-branch-name-feature-x", Status: git.StatusUpToDate},
+	}
+
+	// 1. Verify tab bar active styling
+	m.ActiveTab = TabLogs
+	tabBar := m.renderTabBar()
+	if !strings.Contains(tabBar, "[1 Logs]") || !strings.Contains(tabBar, "[2 Branches & Worktrees]") {
+		t.Errorf("renderTabBar missing expected tab headers, got: %q", tabBar)
+	}
+
+	// 2. Verify cellBranchStyle width is at least 20
+	if cellBranchStyle.GetWidth() < 20 {
+		t.Errorf("expected cellBranchStyle width to be at least 20, got %d", cellBranchStyle.GetWidth())
+	}
+
+	// 3. Verify View includes extended branch name beyond 16 chars
+	view := m.View()
+	if !strings.Contains(view, "feat/long-branch-name") {
+		t.Errorf("expected View to contain extended branch name, got:\n%s", view)
+	}
+}
