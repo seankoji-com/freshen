@@ -1015,15 +1015,19 @@ func (m *Model) updateViewport() {
 			loadPct = (busyCount * 100) / len(matchingRunners)
 		}
 
-		// --- HEADER ---
-		sb.WriteString(fmt.Sprintf(" %s %s   %s\n",
-			iconRunner,
-			lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("FLEET TAG BROWSER"),
-			lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("Tag: [%s]", activeTag)),
-		))
+		// --- TAG TABS BAR (Right Column Header) ---
+		var tagPills []string
+		for i, tag := range tags {
+			if i == m.SelectedTagIndex {
+				tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("["+tag+"]"))
+			} else {
+				tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorMuted).Render(tag))
+			}
+		}
+		sb.WriteString(" " + iconRunner + "  TAGS:  " + strings.Join(tagPills, "  ") + "\n")
 		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
-		) + "\n")
+		) + "\n\n")
 
 		// --- DETAILS TABLE ---
 		label := func(k, v string, vc lipgloss.Color) string {
@@ -1666,23 +1670,12 @@ func (m Model) View() string {
 
 	tagTitle := "REGISTERED RUNNERS"
 	if activeTag != "ALL" {
-		tagTitle = fmt.Sprintf("REGISTERED RUNNERS (Tag: %s)", activeTag)
+		tagTitle = fmt.Sprintf("REGISTERED RUNNERS (%s)", activeTag)
 	}
 
 	runnerHeader := fmt.Sprintf(" %s %s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(tagTitle))
 	runnerLines = append(runnerLines, clipLine(runnerHeader))
 	runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
-
-	// Tag Pills Bar
-	var tagPills []string
-	for i, tag := range tags {
-		if i == m.SelectedTagIndex {
-			tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("["+tag+"]"))
-		} else {
-			tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorMuted).Render(tag))
-		}
-	}
-	runnerLines = append(runnerLines, clipLine(" TAGS:  "+strings.Join(tagPills, "  ")))
 
 	var runningNames, idleNames, offlineNames []string
 	for _, r := range m.Runners {
@@ -1813,6 +1806,9 @@ func (m Model) View() string {
 			triggerBadge := ""
 			if j.PRNumber != 0 {
 				prLabel := fmt.Sprintf("PR #%d", j.PRNumber)
+				if j.PRTitle != "" {
+					prLabel = fmt.Sprintf("PR #%d: %s", j.PRNumber, j.PRTitle)
+				}
 				prURL := j.PRURL
 				if prURL == "" {
 					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, j.Repo, j.PRNumber)
