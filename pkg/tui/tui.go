@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -15,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/seankoji-com/freshen/pkg/git"
+	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 // --- Active Right-Pane Detail View Tab ---
@@ -25,6 +27,15 @@ const (
 	TabBranches
 	TabIssues
 	TabPRs
+)
+
+// --- Left-Pane Focus Panel ---
+type FocusType int
+
+const (
+	FocusRepos FocusType = iota
+	FocusRunners
+	FocusJobs
 )
 
 // --- NerdFont Glyphs & Color Palette ---
@@ -44,6 +55,9 @@ var (
 	iconPending  = "•"
 	iconCopy     = "󰅍"
 	iconWorktree = "󰉓"
+	iconRunner   = "🏃"
+	iconQueue    = "📋"
+	iconCpu      = "⚡"
 
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
@@ -119,17 +133,23 @@ var (
 			BorderForeground(colorPrimary).
 			Padding(0, 1)
 
+	borderFocusedStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colorSecondary).
+				Padding(0, 1)
+
 	logBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorSecondary).
 			Padding(0, 1)
 
 	// Explicit Column Width Styles for Table Alignment
+	// Total: 2 + 20 + 16 + 4 + 6 + spaces = ~51 chars, fits in a ~55 char inner pane
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
-	cellNameStyle       = lipgloss.NewStyle().Width(24)
-	cellBranchStyle     = lipgloss.NewStyle().Width(22)
-	cellPRsStyle        = lipgloss.NewStyle().Width(5).Align(lipgloss.Right)
-	cellIssuesStyle     = lipgloss.NewStyle().Width(7).Align(lipgloss.Right)
+	cellNameStyle       = lipgloss.NewStyle().Width(20)
+	cellBranchStyle     = lipgloss.NewStyle().Width(16)
+	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
+	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
 )
 
 // Hyperlink formats text as an OSC 8 terminal hyperlink.
@@ -143,6 +163,27 @@ func Hyperlink(text, url string) string {
 // --- Messages for Bubble Tea Update Loop ---
 
 type syncFinishedMsg struct{}
+
+type repoTickMsg time.Time
+
+type runnerJobTickMsg time.Time
+
+func repoTickCmd() tea.Cmd {
+	return tea.Every(5*time.Minute, func(t time.Time) tea.Msg {
+		return repoTickMsg(t)
+	})
+}
+
+func runnerJobTickCmd() tea.Cmd {
+	return tea.Every(10*time.Second, func(t time.Time) tea.Msg {
+		return runnerJobTickMsg(t)
+	})
+}
+
+type loadedRunnersMsg struct {
+	runners []*jobs.RunnerItem
+	err     error
+}
 
 type orgSyncedMsg struct {
 	repos []*git.RepoItem
@@ -164,15 +205,20 @@ type loadedPRsMsg struct {
 // --- Bubble Tea Model ---
 
 type Model struct {
-	TargetDir     string
-	TargetOrg     string
-	Repos         []*git.RepoItem
-	SelectedIndex int
-	ActiveTab     TabType
-	IsSyncing     bool
-	IsOrgSyncing  bool
-	TotalCount    int
-	ToastMsg      string
+	TargetDir           string
+	TargetOrg           string
+	Repos               []*git.RepoItem
+	Runners             []*jobs.RunnerItem
+	JobQueue            []*jobs.JobItem
+	SelectedIndex       int
+	SelectedRunnerIndex int
+	SelectedJobIndex    int
+	ActiveFocus         FocusType
+	ActiveTab           TabType
+	IsSyncing           bool
+	IsOrgSyncing        bool
+	TotalCount          int
+	ToastMsg            string
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -196,15 +242,20 @@ func NewModel(targetDir, targetOrg string) Model {
 	vp := viewport.New(60, 15)
 
 	return Model{
-		TargetDir:     targetDir,
-		TargetOrg:     targetOrg,
-		Repos:         make([]*git.RepoItem, 0),
-		SelectedIndex: 0,
-		ActiveTab:     TabLogs,
-		IsOrgSyncing:  true,
-		Spinner:       s,
-		ProgressBar:   p,
-		Viewport:      vp,
+		TargetDir:           targetDir,
+		TargetOrg:           targetOrg,
+		Repos:               make([]*git.RepoItem, 0),
+		Runners:             make([]*jobs.RunnerItem, 0),
+		JobQueue:            make([]*jobs.JobItem, 0),
+		SelectedIndex:       0,
+		SelectedRunnerIndex: 0,
+		SelectedJobIndex:    0,
+		ActiveFocus:         FocusRepos,
+		ActiveTab:           TabLogs,
+		IsOrgSyncing:        true,
+		Spinner:             s,
+		ProgressBar:         p,
+		Viewport:            vp,
 	}
 }
 
@@ -212,7 +263,74 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.Spinner.Tick,
 		m.loadOrgReposCmd(),
+		m.loadRunnersCmd(),
+		m.loadJobQueueCmd(),
+		repoTickCmd(),
+		runnerJobTickCmd(),
 	)
+}
+
+func (m Model) loadRunnersCmd() tea.Cmd {
+	return func() tea.Msg {
+		runners, err := jobs.FetchOrgRunners(m.TargetOrg, m.Runners, m.JobQueue)
+		return loadedRunnersMsg{runners: runners, err: err}
+	}
+}
+
+type loadedJobQueueMsg struct {
+	queue []*jobs.JobItem
+	err   error
+}
+
+func (m Model) loadJobQueueCmd() tea.Cmd {
+	// Collect repo names from loaded repos
+	repos := make([]string, 0, len(m.Repos))
+	for _, r := range m.Repos {
+		repoName := r.GHRepoName
+		if repoName == "" {
+			repoName = r.Name
+		}
+		if !r.IsArchived && repoName != "" {
+			repos = append(repos, repoName)
+		}
+	}
+	// If repos not loaded yet, try fetching from org API
+	if len(repos) == 0 {
+		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+		if err == nil {
+			for _, r := range orgRepos {
+				if !r.IsArchived {
+					repos = append(repos, r.Name)
+				}
+			}
+		}
+	}
+	return func() tea.Msg {
+		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repos)
+		return loadedJobQueueMsg{queue: queue, err: err}
+	}
+}
+
+type loadedJobLogsMsg struct {
+	jobID   string // JobItem.ID to match
+	ghJobID int64
+	logs    []string
+	err     error
+}
+
+// loadJobLogsCmd fetches real log lines for the given running job.
+func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
+	if job == nil || job.RunID == 0 {
+		return nil
+	}
+	org := m.TargetOrg
+	repo := job.Repo
+	runID := job.RunID
+	jobID := job.ID
+	return func() tea.Msg {
+		lines, ghJobID, err := jobs.FetchJobLogs(org, repo, runID, 200)
+		return loadedJobLogsMsg{jobID: jobID, ghJobID: ghJobID, logs: lines, err: err}
+	}
 }
 
 func (m Model) loadOrgReposCmd() tea.Cmd {
@@ -236,7 +354,6 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 				localExists = true
 			}
 
-			// Filter out archived repos if they are NOT cloned locally
 			if ghRepo.IsArchived && !localExists {
 				continue
 			}
@@ -299,7 +416,6 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			result = append(result, item)
 		}
 
-		// Sort repositories alphabetically by Name
 		sort.Slice(result, func(i, j int) bool {
 			return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
 		})
@@ -367,16 +483,83 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return m, tea.Quit
 
+		case "w", "W":
+			// Cycle active panel focus: Repos -> Runners -> Jobs
+			m.ActiveFocus = (m.ActiveFocus + 1) % 3
+			m.updateViewport()
+
 		case "up":
-			if m.SelectedIndex > 0 {
-				m.SelectedIndex--
-				m.updateViewport()
+			switch m.ActiveFocus {
+			case FocusRepos:
+				if m.SelectedIndex > 0 {
+					m.SelectedIndex--
+					m.updateViewport()
+				}
+			case FocusRunners:
+				if m.SelectedRunnerIndex > 0 {
+					m.SelectedRunnerIndex--
+					m.updateViewport()
+				} else if len(m.Repos) > 0 {
+					m.ActiveFocus = FocusRepos
+					m.SelectedIndex = len(m.Repos) - 1
+					m.updateViewport()
+				}
+			case FocusJobs:
+				if m.SelectedJobIndex > 0 {
+					m.SelectedJobIndex--
+					m.updateViewport()
+					if m.SelectedJobIndex < len(m.JobQueue) {
+						j := m.JobQueue[m.SelectedJobIndex]
+						if j.Status == jobs.JobRunning {
+							cmds = append(cmds, m.loadJobLogsCmd(j))
+						}
+					}
+				} else if len(m.Runners) > 0 {
+					m.ActiveFocus = FocusRunners
+					m.SelectedRunnerIndex = len(m.Runners) - 1
+					m.updateViewport()
+				}
 			}
 
 		case "down":
-			if m.SelectedIndex < len(m.Repos)-1 {
-				m.SelectedIndex++
-				m.updateViewport()
+			switch m.ActiveFocus {
+			case FocusRepos:
+				if m.SelectedIndex < len(m.Repos)-1 {
+					m.SelectedIndex++
+					m.updateViewport()
+				} else if len(m.Runners) > 0 {
+					m.ActiveFocus = FocusRunners
+					m.SelectedRunnerIndex = 0
+					m.updateViewport()
+				}
+			case FocusRunners:
+				if m.SelectedRunnerIndex < len(m.Runners)-1 {
+					m.SelectedRunnerIndex++
+					m.updateViewport()
+				} else {
+					// Always fall through to jobs panel from last runner
+					m.ActiveFocus = FocusJobs
+					m.SelectedJobIndex = 0
+					m.updateViewport()
+					// Immediately kick off log fetch for the newly focused job
+					if len(m.JobQueue) > 0 {
+						j := m.JobQueue[0]
+						if j.Status == jobs.JobRunning {
+							cmds = append(cmds, m.loadJobLogsCmd(j))
+						}
+					}
+				}
+			case FocusJobs:
+				if m.SelectedJobIndex < len(m.JobQueue)-1 {
+					m.SelectedJobIndex++
+					m.updateViewport()
+					if m.SelectedJobIndex < len(m.JobQueue) {
+						j := m.JobQueue[m.SelectedJobIndex]
+						if j.Status == jobs.JobRunning {
+							cmds = append(cmds, m.loadJobLogsCmd(j))
+						}
+					}
+				}
 			}
 
 		case "j", "ctrl+d", "pgdown":
@@ -386,35 +569,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Viewport.LineUp(3)
 
 		case "right", "l", "tab":
-			m.ActiveTab = (m.ActiveTab + 1) % 4
-			m.updateViewport()
-			return m, m.triggerTabFetch()
+			if m.ActiveFocus == FocusRepos {
+				m.ActiveTab = (m.ActiveTab + 1) % 4
+				m.updateViewport()
+				return m, m.triggerTabFetch()
+			} else {
+				m.ActiveFocus = (m.ActiveFocus + 1) % 3
+				m.updateViewport()
+			}
 
 		case "left", "h", "shift+tab":
-			m.ActiveTab = (m.ActiveTab + 3) % 4
-			m.updateViewport()
-			return m, m.triggerTabFetch()
+			if m.ActiveFocus == FocusRepos {
+				m.ActiveTab = (m.ActiveTab + 3) % 4
+				m.updateViewport()
+				return m, m.triggerTabFetch()
+			} else {
+				m.ActiveFocus = (m.ActiveFocus + 2) % 3
+				m.updateViewport()
+			}
 
 		case "1":
+			m.ActiveFocus = FocusRepos
 			m.ActiveTab = TabLogs
 			m.updateViewport()
 
 		case "2":
-			m.ActiveTab = TabBranches
+			m.ActiveFocus = FocusRunners
 			m.updateViewport()
 
 		case "3":
-			m.ActiveTab = TabIssues
+			m.ActiveFocus = FocusJobs
 			m.updateViewport()
-			return m, m.triggerTabFetch()
 
 		case "4":
-			m.ActiveTab = TabPRs
-			m.updateViewport()
-			return m, m.triggerTabFetch()
+			if m.ActiveFocus == FocusRepos {
+				m.ActiveTab = TabPRs
+				m.updateViewport()
+				return m, m.triggerTabFetch()
+			}
 
 		case "X":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
 				if err == nil {
@@ -427,7 +622,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "r":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
 					go git.SyncRepository(item)
@@ -436,7 +631,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "c", "y":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				targetCopy := item.DraftPRURL
 				if targetCopy == "" {
@@ -449,10 +644,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := copyToClipboard(targetCopy); err == nil {
 					m.ToastMsg = fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy)
 				}
+			} else if m.ActiveFocus == FocusRunners && len(m.Runners) > 0 && m.SelectedRunnerIndex < len(m.Runners) {
+				r := m.Runners[m.SelectedRunnerIndex]
+				if err := copyToClipboard(r.ID); err == nil {
+					m.ToastMsg = fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID)
+				}
+			} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+				j := m.JobQueue[m.SelectedJobIndex]
+				if err := copyToClipboard(j.ID); err == nil {
+					m.ToastMsg = fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID)
+				}
 			}
 
 		case "b":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				target := item.OriginalBranch
 				if item.CurrentBranch == item.OriginalBranch {
@@ -466,7 +671,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "p":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
 					go func(r *git.RepoItem) {
@@ -480,7 +685,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "d":
-			if len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
 					_ = git.DeleteLocalRepo(item.Path)
@@ -497,26 +702,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			}
-
-		case "D":
-			deletedTotal := 0
-			var activeRepos []*git.RepoItem
-			for _, item := range m.Repos {
-				if item.IsArchived {
-					if err := git.DeleteLocalRepo(item.Path); err == nil {
-						deletedTotal++
-					}
-				} else {
-					activeRepos = append(activeRepos, item)
-				}
-			}
-			m.Repos = activeRepos
-			m.TotalCount = len(m.Repos)
-			if m.SelectedIndex >= len(m.Repos) && len(m.Repos) > 0 {
-				m.SelectedIndex = len(m.Repos) - 1
-			}
-			m.ToastMsg = fmt.Sprintf(" 🗑️ Deleted all %d archived repositories from disk!", deletedTotal)
-			m.updateViewport()
 		}
 
 	case loadedIssuesMsg:
@@ -547,16 +732,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Click in Left Repo Table Pane (Row 0 starts at Y = 4)
-			if msg.X < m.Width/2 && msg.Y >= 4 {
-				clickedIdx := msg.Y - 4
-				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
-					m.SelectedIndex = clickedIdx
+			// Click in Left Column Panes
+			if msg.X < m.Width/2 {
+				repoPaneEnd := 4 + len(m.Repos) + 2
+				runnersPaneEnd := repoPaneEnd + 3 + len(m.Runners)
+
+				if msg.Y >= 2 && msg.Y <= repoPaneEnd {
+					m.ActiveFocus = FocusRepos
+					clickedIdx := msg.Y - 4
+					if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
+						m.SelectedIndex = clickedIdx
+					}
+					m.updateViewport()
+				} else if msg.Y > repoPaneEnd && msg.Y <= runnersPaneEnd {
+					m.ActiveFocus = FocusRunners
+					clickedIdx := msg.Y - repoPaneEnd - 2
+					if clickedIdx >= 0 && clickedIdx < len(m.Runners) {
+						m.SelectedRunnerIndex = clickedIdx
+					}
+					m.updateViewport()
+				} else if msg.Y > runnersPaneEnd {
+					m.ActiveFocus = FocusJobs
+					clickedIdx := msg.Y - runnersPaneEnd - 2
+					if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
+						m.SelectedJobIndex = clickedIdx
+					}
 					m.updateViewport()
 				}
 			}
-			// Click in Right Detail View Pane (Tab Bar at Y = 4 or Y = 5)
-			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
+			// Click in Right Detail View Pane
+			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) && m.ActiveFocus == FocusRepos {
 				relX := msg.X - (m.Width / 2)
 				if relX >= 0 && relX < 10 {
 					m.ActiveTab = TabLogs
@@ -576,8 +781,137 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case repoTickMsg:
+		return m, tea.Batch(
+			m.loadOrgReposCmd(),
+			repoTickCmd(),
+		)
+
+	case runnerJobTickMsg:
+		jobs.PollStep(m.Runners, m.JobQueue)
+		m.updateViewport()
+		var cmdsToAdd []tea.Cmd
+		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd(), m.loadJobQueueCmd(), runnerJobTickCmd())
+		// Refresh logs for selected running job
+		if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+			selJob := m.JobQueue[m.SelectedJobIndex]
+			if selJob.Status == jobs.JobRunning {
+				cmdsToAdd = append(cmdsToAdd, m.loadJobLogsCmd(selJob))
+			}
+		}
+		return m, tea.Batch(cmdsToAdd...)
+
+	case loadedRunnersMsg:
+		if msg.err == nil && len(msg.runners) > 0 {
+			m.Runners = msg.runners
+			m.updateViewport()
+		}
+
+	case loadedJobQueueMsg:
+		if msg.err == nil {
+			// Compare with previous queue to trigger toast notifications
+			if len(m.JobQueue) > 0 {
+				oldJobs := make(map[string]*jobs.JobItem)
+				for _, j := range m.JobQueue {
+					oldJobs[j.ID] = j
+				}
+
+				newJobsMap := make(map[string]*jobs.JobItem)
+				for _, j := range msg.queue {
+					newJobsMap[j.ID] = j
+				}
+
+				// Check for status changes or new jobs
+				for _, newJ := range msg.queue {
+					if oldJ, ok := oldJobs[newJ.ID]; ok {
+						if oldJ.Status != newJ.Status {
+							if newJ.Status == jobs.JobRunning {
+								runnerStr := newJ.RunnerName
+								if runnerStr == "" {
+									runnerStr = "worker"
+								}
+								m.ToastMsg = fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr)
+							} else if newJ.Status == jobs.JobPassed {
+								m.ToastMsg = fmt.Sprintf(" 󰄬 Job %s passed (%s)", newJ.ID, newJ.Name)
+							} else if newJ.Status == jobs.JobFailed {
+								m.ToastMsg = fmt.Sprintf(" 󰅙 Job %s failed (%s)", newJ.ID, newJ.Name)
+							}
+						}
+					} else {
+						// Brand new job detected during polling
+						if newJ.Status == jobs.JobRunning {
+							runnerStr := newJ.RunnerName
+							if runnerStr == "" {
+								runnerStr = "worker"
+							}
+							m.ToastMsg = fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr)
+						} else if newJ.Status == jobs.JobQueued {
+							m.ToastMsg = fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name)
+						}
+					}
+				}
+
+				// Check for jobs that finished and left the queue
+				for _, oldJ := range m.JobQueue {
+					if _, stillThere := newJobsMap[oldJ.ID]; !stillThere {
+						if oldJ.Status == jobs.JobRunning {
+							m.ToastMsg = fmt.Sprintf(" 󰄬 Job %s completed (%s)", oldJ.ID, oldJ.Name)
+						}
+					}
+				}
+			}
+
+			// Preserve existing logs on jobs we already have
+			existingLogs := make(map[string][]string)
+			existingGHJobID := make(map[string]int64)
+			for _, j := range m.JobQueue {
+				if len(j.Logs) > 0 {
+					existingLogs[j.ID] = j.Logs
+					existingGHJobID[j.ID] = j.GHJobID
+				}
+			}
+			for _, j := range msg.queue {
+				if logs, ok := existingLogs[j.ID]; ok {
+					j.Logs = logs
+					j.GHJobID = existingGHJobID[j.ID]
+				}
+			}
+			m.JobQueue = msg.queue
+			// Kick off log fetch for selected running job
+			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+				selJob := m.JobQueue[m.SelectedJobIndex]
+				if selJob.Status == jobs.JobRunning {
+					cmds = append(cmds, m.loadJobLogsCmd(selJob))
+				}
+			}
+			m.updateViewport()
+		}
+
+	case loadedJobLogsMsg:
+		if msg.err == nil && len(msg.logs) > 0 {
+			for _, j := range m.JobQueue {
+				if j.ID == msg.jobID {
+					j.Logs = msg.logs
+					j.GHJobID = msg.ghJobID
+					break
+				}
+			}
+			m.updateViewport()
+		}
+
 	case orgSyncedMsg:
 		m.IsOrgSyncing = false
+		if len(m.Repos) > 0 && len(msg.repos) > 0 {
+			oldRepoBranches := make(map[string]string)
+			for _, r := range m.Repos {
+				oldRepoBranches[r.Name] = r.CurrentBranch
+			}
+			for _, newR := range msg.repos {
+				if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
+					m.ToastMsg = fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch)
+				}
+			}
+		}
 		m.Repos = msg.repos
 		sort.Slice(m.Repos, func(i, j int) bool {
 			return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
@@ -598,9 +932,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Height = msg.Height
 		m.ProgressBar.Width = msg.Width - 20
 
+		// Mirror the same height budget as View()
+		rightBoxH := msg.Height - 3
+		if rightBoxH < 13 {
+			rightBoxH = 13
+		}
 		halfWidth := msg.Width / 2
-		m.Viewport.Width = halfWidth - 6
-		m.Viewport.Height = msg.Height - 10
+		leftWidth := halfWidth - 1
+		rightWidth := msg.Width - leftWidth - 2
+		m.Viewport.Width = rightWidth - 4
+		m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
 	}
 
 	var spinnerCmd tea.Cmd
@@ -631,151 +972,443 @@ func (m *Model) triggerTabFetch() tea.Cmd {
 }
 
 func (m *Model) updateViewport() {
-	if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
-		return
-	}
-
-	item := m.Repos[m.SelectedIndex]
 	var sb strings.Builder
 
-	// Build Clickable Hyperlinks for Right Pane Top Metadata Line
-	repoURL := item.URL
-	if repoURL == "" {
-		repoURL = fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, item.GHRepoName)
-	}
-	repoLink := Hyperlink(fmt.Sprintf("%s %s", iconGithub, subtitleStyle.Render(item.GHRepoName)), repoURL)
+	switch m.ActiveFocus {
 
-	branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
-	if item.CurrentBranch != item.DefaultBranch {
-		branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
-	}
-	branchURL := fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch)
-	branchLink := Hyperlink(fmt.Sprintf("%s %s", iconBranch, branchDetail), branchURL)
-
-	prCountStr := "0 open"
-	if item.OpenPRsCount > 0 {
-		prCountStr = fmt.Sprintf("%d open", item.OpenPRsCount)
-	}
-	prURL := fmt.Sprintf("%s/pulls", repoURL)
-	prLink := Hyperlink(fmt.Sprintf("%s %s", iconPR, prCountStr), prURL)
-
-	issueCountStr := "0 open"
-	if item.OpenIssuesCount > 0 {
-		issueCountStr = fmt.Sprintf("%d open", item.OpenIssuesCount)
-	}
-	issueURL := fmt.Sprintf("%s/issues", repoURL)
-	issueLink := Hyperlink(fmt.Sprintf("%s %s", iconIssue, issueCountStr), issueURL)
-
-	// Sleek 1-Line Clickable Metadata Header:
-	//  carey-finance  |   master (default)  |  OK  |  󰏫 0 open  |  ⊙ 125 open
-	sb.WriteString(fmt.Sprintf(" %s  |  %s  |  %s  |  %s  |  %s\n\n",
-		repoLink, branchLink, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(item.StatusMsg), prLink, issueLink,
-	))
-
-	// Tab Bar Header
-	sb.WriteString(m.renderTabBar() + "\n\n")
-
-	// Render Content Based on Selected Tab
-	switch m.ActiveTab {
-
-	case TabLogs:
-		if item.ExistingPRURL != "" {
-			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL)))
+	case FocusRunners:
+		if len(m.Runners) == 0 {
+			m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org."))
+			return
 		}
-		if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
-			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
+		if m.SelectedRunnerIndex >= len(m.Runners) {
+			m.SelectedRunnerIndex = 0
+		}
+		runner := m.Runners[m.SelectedRunnerIndex]
+
+		// --- STATUS BADGE ---
+		var statusColor lipgloss.Color
+		var statusGlyph string
+		switch runner.Status {
+		case jobs.RunnerRunning:
+			statusColor, statusGlyph = colorSecondary, "⚡"
+		case jobs.RunnerOffline:
+			statusColor, statusGlyph = colorRed, "✖"
+		case jobs.RunnerMaintenance:
+			statusColor, statusGlyph = colorYellow, "⚠"
+		default:
+			statusColor, statusGlyph = colorGreen, "●"
+		}
+		statusBadge := lipgloss.NewStyle().Foreground(statusColor).Bold(true).
+			Render(fmt.Sprintf("%s %s", statusGlyph, runner.Status))
+
+		// --- HEADER ---
+		sb.WriteString(fmt.Sprintf(" %s %s   %s\n",
+			iconRunner,
+			lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(runner.Name),
+			statusBadge,
+		))
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
+		) + "\n")
+
+		// --- DETAILS TABLE ---
+		label := func(k, v string, vc lipgloss.Color) string {
+			return fmt.Sprintf(" %s  %s\n",
+				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(k),
+				lipgloss.NewStyle().Foreground(vc).Render(v),
+			)
 		}
 
-		dashCount := (m.Viewport.Width - 18) / 2
-		if dashCount < 2 {
-			dashCount = 2
+		sb.WriteString(label("ID", runner.ID, colorPrimary))
+		sb.WriteString(label("Platform", runner.Platform, colorSecondary))
+
+		tagsStr := strings.Join(runner.Tags, "  ")
+		if tagsStr == "" {
+			tagsStr = "—"
 		}
-		divider := strings.Repeat("─", dashCount) + " EXECUTION LOGS " + strings.Repeat("─", dashCount)
-		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(divider) + "\n")
+		sb.WriteString(label("Labels", tagsStr, colorYellow))
 
-		wrapWidth := m.Viewport.Width - 2
-		if wrapWidth < 20 {
-			wrapWidth = 40
+		heartbeat := "—"
+		if !runner.LastHeartbeat.IsZero() {
+			ago := int(time.Since(runner.LastHeartbeat).Seconds())
+			if ago < 60 {
+				heartbeat = fmt.Sprintf("%ds ago", ago)
+			} else {
+				heartbeat = fmt.Sprintf("%dm ago", ago/60)
+			}
 		}
-		logWrapper := lipgloss.NewStyle().Width(wrapWidth)
+		sb.WriteString(label("Last Seen", heartbeat, colorMuted))
 
-		for _, logLine := range item.Logs {
-			styled := highlightLogLine(logLine)
-			sb.WriteString(logWrapper.Render(styled) + "\n")
-		}
-
-	case TabBranches:
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
-
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
-		if len(item.BranchDetails.Branches) == 0 {
-			sb.WriteString("  (None found)\n")
-		} else {
-			for _, b := range item.BranchDetails.Branches {
-				sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+		// --- CURRENT JOB ---
+		sb.WriteString("\n")
+		var activeJob *jobs.JobItem
+		for _, j := range m.JobQueue {
+			if j.Status == jobs.JobRunning && (j.RunnerName == runner.Name || j.RunnerID == runner.ID) {
+				activeJob = j
+				break
 			}
 		}
 
-		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰉓 Git Worktrees:") + "\n")
-		if len(item.BranchDetails.Worktrees) == 0 {
-			sb.WriteString("  (No worktrees found)\n")
+		curJobID := runner.CurrentJobID
+		curJobName := runner.CurrentJob
+		if activeJob != nil {
+			curJobID = activeJob.ID
+			curJobName = activeJob.Name
+		}
+
+		if activeJob != nil || (curJobName != "-" && curJobName != "") {
+			jobText := curJobName
+			if curJobID != "-" && curJobID != "" && curJobID != activeJob.Name {
+				jobText = fmt.Sprintf("%s  %s", curJobID, curJobName)
+			}
+
+			var jobLink string
+			if activeJob != nil && activeJob.RunID != 0 {
+				jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID)
+				if activeJob.GHJobID != 0 {
+					jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID, activeJob.GHJobID)
+				}
+				jobLink = Hyperlink(lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobText), jobURL)
+			} else {
+				jobLink = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobText)
+			}
+			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
+				jobLink,
+			))
+		} else if runner.Status == jobs.RunnerRunning {
+			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
+				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("⚡ Executing GitHub workflow job"),
+			))
 		} else {
-			for _, w := range item.BranchDetails.Worktrees {
-				sb.WriteString(fmt.Sprintf("  %s %s\n", iconWorktree, w))
+			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
+				lipgloss.NewStyle().Foreground(colorMuted).Render("Idle — no active job"),
+			))
+		}
+
+		// --- ALL RUNNERS OVERVIEW TABLE ---
+		sb.WriteString("\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" ALL RUNNERS") + "\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
+		) + "\n")
+
+		maxJobLen := m.Viewport.Width - 28
+		if maxJobLen < 28 {
+			maxJobLen = 28
+		}
+
+		for i, r := range m.Runners {
+			var rColor lipgloss.Color
+			var rGlyph string
+			switch r.Status {
+			case jobs.RunnerRunning:
+				rColor, rGlyph = colorSecondary, "⚡"
+			case jobs.RunnerOffline:
+				rColor, rGlyph = colorRed, "✖"
+			case jobs.RunnerMaintenance:
+				rColor, rGlyph = colorYellow, "⚠"
+			default:
+				rColor, rGlyph = colorGreen, "●"
+			}
+			marker := "  "
+			if i == m.SelectedRunnerIndex {
+				marker = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("> ")
+			}
+			// Fixed-width glyph column (⚡ is 2 cells wide, others are 1 — pad to equalise)
+			glyphCell := lipgloss.NewStyle().Foreground(rColor).Width(2).Render(rGlyph)
+			var currentJobStr string
+			switch {
+			case r.CurrentJob != "-" && r.CurrentJob != "":
+				currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(r.CurrentJob, maxJobLen))
+			case r.Status == jobs.RunnerRunning:
+				// Check if we can match active job name from queue
+				var matchedJ *jobs.JobItem
+				for _, j := range m.JobQueue {
+					if j.Status == jobs.JobRunning && (j.RunnerName == r.Name || j.RunnerID == r.ID) {
+						matchedJ = j
+						break
+					}
+				}
+				if matchedJ != nil {
+					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(matchedJ.Name, maxJobLen))
+				} else {
+					currentJobStr = lipgloss.NewStyle().Foreground(colorSecondary).Render("executing workflow job")
+				}
+			default:
+				currentJobStr = lipgloss.NewStyle().Foreground(colorMuted).Render("idle")
+			}
+			sb.WriteString(fmt.Sprintf("%s%s %s  %s\n",
+				marker,
+				glyphCell,
+				lipgloss.NewStyle().Foreground(colorSecondary).Width(20).Render(r.Name),
+				currentJobStr,
+			))
+		}
+
+		// --- QUEUED / RUNNING JOBS ON THIS RUNNER ---
+		var assignedJobs []*jobs.JobItem
+		for _, j := range m.JobQueue {
+			if j.RunnerName == runner.Name || j.RunnerID == runner.ID {
+				assignedJobs = append(assignedJobs, j)
 			}
 		}
-
-		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
-		if len(item.BranchDetails.ChangedFiles) == 0 {
-			sb.WriteString("  󰄬 Working tree is clean.\n")
-		} else {
-			for _, f := range item.BranchDetails.ChangedFiles {
-				sb.WriteString(fmt.Sprintf("  %s\n", f))
-			}
-		}
-
-	case TabIssues:
-		spinnerStr := ""
-		if item.IsLoadingIssues {
-			spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
-		}
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
-
-		if len(item.IssuesList) == 0 && item.IsLoadingIssues {
-			sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", m.Spinner.View()))
-		} else if len(item.IssuesList) == 0 {
-			sb.WriteString("  󰄬 No open issues found for this repository.\n")
-		} else {
-			titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
-			for _, issue := range item.IssuesList {
-				header := fmt.Sprintf("#%-4d %s", issue.Number, issue.Title)
-				sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
-					badgeIssue.Render("⊙"), titleWrapper.Render(header),
-					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
+		if len(assignedJobs) > 0 {
+			sb.WriteString("\n")
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" QUEUED / RUNNING JOBS ON THIS RUNNER") + "\n")
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+				fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
+			) + "\n")
+			for _, j := range assignedJobs {
+				var jColor lipgloss.Color
+				var jGlyph string
+				if j.Status == jobs.JobRunning {
+					jColor, jGlyph = colorSecondary, "⚡"
+				} else {
+					jColor, jGlyph = colorYellow, "⏳"
+				}
+				jLink := lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(j.ID)
+				if j.RunID != 0 {
+					jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+					if j.GHJobID != 0 {
+						jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, j.Repo, j.RunID, j.GHJobID)
+					}
+					jLink = Hyperlink(jLink, jobURL)
+				}
+				sb.WriteString(fmt.Sprintf(" %s  %s  %s  %s\n",
+					lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
+					jLink,
+					lipgloss.NewStyle().Foreground(colorSecondary).Render(j.Name),
+					lipgloss.NewStyle().Foreground(colorMuted).Render(j.Duration),
 				))
 			}
 		}
 
-	case TabPRs:
-		spinnerStr := ""
-		if item.IsLoadingPRs {
-			spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+	case FocusJobs:
+		if len(m.JobQueue) == 0 || m.SelectedJobIndex >= len(m.JobQueue) {
+			m.Viewport.SetContent("No jobs in queue.")
+			return
 		}
-		sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
+		job := m.JobQueue[m.SelectedJobIndex]
 
-		if len(item.PRsList) == 0 && item.IsLoadingPRs {
-			sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", m.Spinner.View()))
-		} else if len(item.PRsList) == 0 {
-			sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
+		statusBadge := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ " + string(job.Status))
+		if job.Status == jobs.JobRunning {
+			statusBadge = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("⚡ " + string(job.Status))
+		} else if job.Status == jobs.JobPassed {
+			statusBadge = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("󰄬 " + string(job.Status))
+		} else if job.Status == jobs.JobFailed {
+			statusBadge = lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("󰅙 " + string(job.Status))
+		}
+
+		jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, job.Repo, job.RunID)
+		if job.GHJobID != 0 {
+			jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, job.Repo, job.RunID, job.GHJobID)
+		}
+		jobIDLink := Hyperlink(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(job.ID), jobURL)
+
+		sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  %s %s  |  Duration: %s\n\n",
+			iconQueue,
+			jobIDLink,
+			statusBadge,
+			iconFolder,
+			lipgloss.NewStyle().Foreground(colorPrimary).Render(job.Repo),
+			iconBranch,
+			lipgloss.NewStyle().Foreground(colorMuted).Render(job.Branch),
+			job.Duration,
+		))
+
+		sb.WriteString(fmt.Sprintf(" %s %s  |  %s %s\n",
+			lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("JOB TITLE:"),
+			job.Name,
+			iconRunner,
+			lipgloss.NewStyle().Foreground(colorSecondary).Render("Assigned to: "+job.RunnerName),
+		))
+
+		if job.Status == jobs.JobQueued {
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ Job is currently queued. Awaiting available runner worker node...") + "\n")
 		} else {
-			titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
-			for _, pr := range item.PRsList {
-				header := fmt.Sprintf("#%-4d %s (%s %s)", pr.Number, pr.Title, iconBranch, pr.HeadRefName)
-				sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
-					badgePR.Render("󰏫"), titleWrapper.Render(header),
-					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
-				))
+			dashCount := (m.Viewport.Width - 26) / 2
+			if dashCount < 2 {
+				dashCount = 2
+			}
+			divider := strings.Repeat("─", dashCount) + " ACTIVE RUNNER LOGS " + strings.Repeat("─", dashCount)
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorSecondary).Render(divider) + "\n\n")
+
+			wrapWidth := m.Viewport.Width - 2
+			if wrapWidth < 20 {
+				wrapWidth = 40
+			}
+			logWrapper := lipgloss.NewStyle().Width(wrapWidth)
+
+			if len(job.Logs) > 0 {
+				for _, logLine := range job.Logs {
+					styled := highlightLogLine(logLine)
+					sb.WriteString(logWrapper.Render(styled) + "\n")
+				}
+			} else {
+				var assignedRunner *jobs.RunnerItem
+				for _, r := range m.Runners {
+					if r.ID == job.RunnerID || r.Name == job.RunnerName {
+						assignedRunner = r
+						break
+					}
+				}
+
+				if assignedRunner != nil && len(assignedRunner.OutputLogs) > 0 {
+					for _, logLine := range assignedRunner.OutputLogs {
+						styled := highlightLogLine(logLine)
+						sb.WriteString(logWrapper.Render(styled) + "\n")
+					}
+				} else {
+					sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Fetching workflow execution logs...\n"))
+				}
+			}
+		}
+
+	case FocusRepos:
+		if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+			return
+		}
+
+		item := m.Repos[m.SelectedIndex]
+
+		repoURL := item.URL
+		if repoURL == "" {
+			repoURL = fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, item.GHRepoName)
+		}
+		repoLink := Hyperlink(fmt.Sprintf("%s %s", iconGithub, subtitleStyle.Render(item.GHRepoName)), repoURL)
+
+		branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
+		if item.CurrentBranch != item.DefaultBranch {
+			branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+		}
+		branchURL := fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch)
+		branchLink := Hyperlink(fmt.Sprintf("%s %s", iconBranch, branchDetail), branchURL)
+
+		prCountStr := "0 open"
+		if item.OpenPRsCount > 0 {
+			prCountStr = fmt.Sprintf("%d open", item.OpenPRsCount)
+		}
+		prURL := fmt.Sprintf("%s/pulls", repoURL)
+		prLink := Hyperlink(fmt.Sprintf("%s %s", iconPR, prCountStr), prURL)
+
+		issueCountStr := "0 open"
+		if item.OpenIssuesCount > 0 {
+			issueCountStr = fmt.Sprintf("%d open", item.OpenIssuesCount)
+		}
+		issueURL := fmt.Sprintf("%s/issues", repoURL)
+		issueLink := Hyperlink(fmt.Sprintf("%s %s", iconIssue, issueCountStr), issueURL)
+
+		sb.WriteString(fmt.Sprintf(" %s  |  %s  |  %s  |  %s  |  %s\n\n",
+			repoLink, branchLink, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(item.StatusMsg), prLink, issueLink,
+		))
+
+		sb.WriteString(m.renderTabBar() + "\n\n")
+
+		switch m.ActiveTab {
+
+		case TabLogs:
+			if item.ExistingPRURL != "" {
+				sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL)))
+			}
+			if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
+				sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
+			}
+
+			dashCount := (m.Viewport.Width - 18) / 2
+			if dashCount < 2 {
+				dashCount = 2
+			}
+			divider := strings.Repeat("─", dashCount) + " EXECUTION LOGS " + strings.Repeat("─", dashCount)
+			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(divider) + "\n")
+
+			wrapWidth := m.Viewport.Width - 2
+			if wrapWidth < 20 {
+				wrapWidth = 40
+			}
+			logWrapper := lipgloss.NewStyle().Width(wrapWidth)
+
+			for _, logLine := range item.Logs {
+				styled := highlightLogLine(logLine)
+				sb.WriteString(logWrapper.Render(styled) + "\n")
+			}
+
+		case TabBranches:
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
+
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local & Remote Branches:") + "\n")
+			if len(item.BranchDetails.Branches) == 0 {
+				sb.WriteString("  (None found)\n")
+			} else {
+				for _, b := range item.BranchDetails.Branches {
+					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+				}
+			}
+
+			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰉓 Git Worktrees:") + "\n")
+			if len(item.BranchDetails.Worktrees) == 0 {
+				sb.WriteString("  (No worktrees found)\n")
+			} else {
+				for _, w := range item.BranchDetails.Worktrees {
+					sb.WriteString(fmt.Sprintf("  %s %s\n", iconWorktree, w))
+				}
+			}
+
+			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
+			if len(item.BranchDetails.ChangedFiles) == 0 {
+				sb.WriteString("  󰄬 Working tree is clean.\n")
+			} else {
+				for _, f := range item.BranchDetails.ChangedFiles {
+					sb.WriteString(fmt.Sprintf("  %s\n", f))
+				}
+			}
+
+		case TabIssues:
+			spinnerStr := ""
+			if item.IsLoadingIssues {
+				spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+			}
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
+
+			if len(item.IssuesList) == 0 && item.IsLoadingIssues {
+				sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", m.Spinner.View()))
+			} else if len(item.IssuesList) == 0 {
+				sb.WriteString("  󰄬 No open issues found for this repository.\n")
+			} else {
+				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
+				for _, issue := range item.IssuesList {
+					header := fmt.Sprintf("#%-4d %s", issue.Number, issue.Title)
+					sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+						badgeIssue.Render("⊙"), titleWrapper.Render(header),
+						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
+					))
+				}
+			}
+
+		case TabPRs:
+			spinnerStr := ""
+			if item.IsLoadingPRs {
+				spinnerStr = fmt.Sprintf("  %s %s", m.Spinner.View(), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+			}
+			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
+
+			if len(item.PRsList) == 0 && item.IsLoadingPRs {
+				sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", m.Spinner.View()))
+			} else if len(item.PRsList) == 0 {
+				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
+			} else {
+				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
+				for _, pr := range item.PRsList {
+					header := fmt.Sprintf("#%-4d %s (%s %s)", pr.Number, pr.Title, iconBranch, pr.HeadRefName)
+					sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+						badgePR.Render("󰏫"), titleWrapper.Render(header),
+						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
+					))
+				}
 			}
 		}
 	}
@@ -802,7 +1435,6 @@ func (m Model) renderTabBar() string {
 	return ""
 }
 
-// highlightLogLine applies NerdFont styling & syntax highlighting to log text.
 func highlightLogLine(line string) string {
 	if line == "" {
 		return line
@@ -812,7 +1444,7 @@ func highlightLogLine(line string) string {
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(m)
 	})
 
-	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list)\b`)
+	cmdRegex := regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
 	line = cmdRegex.ReplaceAllStringFunc(line, func(m string) string {
 		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
 	})
@@ -827,7 +1459,7 @@ func highlightLogLine(line string) string {
 		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(m)
 	})
 
-	if strings.Contains(line, "󰄬") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
+	if strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
 		line = lipgloss.NewStyle().Foreground(colorGreen).Render(line)
 	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
 		line = lipgloss.NewStyle().Foreground(colorRed).Render(line)
@@ -841,10 +1473,10 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Single Compact Line Header Banner with Far-Right Anchored Clickable Target Org Link
+	// 1. Header Banner
 	shortTargetDir := git.ShortenHomePath(m.TargetDir)
 	leftTitle := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
-		subtitleStyle.Render("GitHub Repository Workflow & Sync Manager")
+		subtitleStyle.Render("GitHub Repository & CI Runner Workflow Manager")
 
 	orgURL := fmt.Sprintf("https://github.com/%s", m.TargetOrg)
 	clickableOrg := Hyperlink(fmt.Sprintf("%s %s", iconGithub, m.TargetOrg), orgURL)
@@ -860,55 +1492,131 @@ func (m Model) View() string {
 
 	header := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle + "\n"
 
-	// 2. Strict 50% / 50% Fixed Width Split Layout
+	// 2. Split Layout Dimensions
+	//
+	// Lipgloss .Height(N) sets the INNER content area. The outer rendered block is N+2 lines
+	// (top border + N content lines + bottom border).
+	//
+	// Left column: 3 boxes stacked, each rendered as (innerHeight + 2) lines.
+	//   Total rendered left = (repoH + 2) + (runnersH + 2) + (jobsH + 2)
+	//                       = totalInner + 6
+	//
+	// Right pane: 1 box, rendered as (rightBoxHeight + 2) lines.
+	//
+	// JoinHorizontal height = max(left, right).
+	// We size rightBoxHeight so right = left: rightBoxHeight + 2 = totalInner + 6
+	//   => rightBoxHeight = totalInner + 4
+	//
+	// Total output lines = 1 (header\n) + mainView lines = 1 + (rightBoxHeight + 2)
+	// We need: 1 + rightBoxHeight + 2 = m.Height
+	//   => rightBoxHeight = m.Height - 3
+	//   => totalInner = rightBoxHeight - 4 = m.Height - 7
+	//
 	halfWidth := m.Width / 2
 	leftWidth := halfWidth - 1
-	rightWidth := m.Width - leftWidth - 1
+	rightWidth := m.Width - leftWidth - 2
 
+	// Inner content width: border (1) + padding (1) on each side = 4 chars overhead
 	paneInnerWidth := leftWidth - 4
 	if paneInnerWidth < 30 {
 		paneInnerWidth = 30
 	}
 
-	// Render Repo Grid Table (Left)
-	var leftSb strings.Builder
+	rightBoxHeight := m.Height - 3
+	if rightBoxHeight < 13 {
+		rightBoxHeight = 13
+	}
 
-	// Pixel-Perfect Column Header Layout
-	headerLine := fmt.Sprintf("%s%s %s %s %s",
+	// totalInner is the sum of content heights for the 3 left boxes
+	totalInner := rightBoxHeight - 4
+	if totalInner < 9 {
+		totalInner = 9
+	}
+
+	// runnersBoxHeight=4 means inner content=4 lines, outer rendered=6 (top+4+bottom)
+	runnersBoxHeight := 4 // inner content lines (renders as 6 outer lines)
+	repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
+	if repoBoxHeight < 4 {
+		repoBoxHeight = 4
+	}
+
+	jobsBoxHeight := totalInner - repoBoxHeight - runnersBoxHeight
+	if jobsBoxHeight < 3 {
+		jobsBoxHeight = 3
+	}
+
+	// clipLine clips a rendered line to the inner pane width, preventing terminal wrapping
+	clipLine := func(line string) string {
+		return lipgloss.NewStyle().MaxWidth(paneInnerWidth).Render(line)
+	}
+	// sliceLines clips a slice to at most n lines (prevents .Height(N) from overflowing)
+	sliceLines := func(lines []string, n int) []string {
+		if len(lines) > n {
+			return lines[:n]
+		}
+		return lines
+	}
+
+	// ------------------ PANEL 1: REPOSITORIES ------------------
+	var repoLines []string
+	availRepoW := paneInnerWidth - 18
+	if availRepoW < 24 {
+		availRepoW = 24
+	}
+	repoNameW := (availRepoW * 55) / 100
+	if repoNameW < 18 {
+		repoNameW = 18
+	}
+	branchW := availRepoW - repoNameW
+	if branchW < 12 {
+		branchW = 12
+	}
+
+	dynCellNameStyle := lipgloss.NewStyle().Width(repoNameW)
+	dynCellBranchStyle := lipgloss.NewStyle().Width(branchW)
+
+	repoHeader := fmt.Sprintf("%s%s %s %s %s",
 		cellStatusIconStyle.Render(""),
-		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
-		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
+		dynCellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
+		dynCellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
-	leftSb.WriteString(headerLine + "\n")
-
-	// Dynamic Unicode ─ Horizontal Rule matching exact inner pane width
-	dividerLine := strings.Repeat("─", paneInnerWidth)
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(dividerLine) + "\n")
+	repoLines = append(repoLines, clipLine(repoHeader))
+	repoLines = append(repoLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
 	if m.IsOrgSyncing {
-		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
+		repoLines = append(repoLines, clipLine(m.Spinner.View()+" Fetching GitHub repositories..."))
 	} else if len(m.Repos) == 0 {
-		leftSb.WriteString("No repositories found in target directory.\n")
+		repoLines = append(repoLines, clipLine("No repositories found in target directory."))
 	} else {
-		for i, item := range m.Repos {
+		maxRepoRows := repoBoxHeight - 4
+		if maxRepoRows < 1 {
+			maxRepoRows = 1
+		}
+
+		startIdx := 0
+		if m.SelectedIndex >= maxRepoRows {
+			startIdx = m.SelectedIndex - maxRepoRows + 1
+		}
+		endIdx := startIdx + maxRepoRows
+		if endIdx > len(m.Repos) {
+			endIdx = len(m.Repos)
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			item := m.Repos[i]
 			statusIconStr := cellStatusIconStyle.Render(m.renderStatusBadge(item))
+			nameCell := dynCellNameStyle.Render(truncateString(item.Name, repoNameW-1))
 
-			// 1. Name Cell
-			nameCell := cellNameStyle.Render(truncateString(item.Name, 24))
-
-			// 2. Branch Text Cell with Color Coding
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
-			branchStr = truncateString(branchStr, 20)
+			branchStr = truncateString(branchStr, branchW-1)
 			displayText := fmt.Sprintf(" %s", branchStr)
 
 			var branchStyle lipgloss.Style
-
-			// Feature branch rule: A branch is default ONLY if branchStr == "main" or "master"
 			isDefaultBranch := branchStr == "main" || branchStr == "master"
 
 			if item.IsArchived {
@@ -917,71 +1625,214 @@ func (m Model) View() string {
 			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
 				branchStyle = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
 			} else if item.HasUnstagedChanges {
-				// Dirty branch (both default and feature) -> Yellow text
 				branchStyle = lipgloss.NewStyle().Foreground(colorYellow).Bold(true)
 			} else if isDefaultBranch || branchStr == "-" {
-				// Clean default branch (main/master) -> Greyed out text
 				branchStyle = lipgloss.NewStyle().Foreground(colorMuted)
 			} else {
-				// Clean feature branch (scaffold/initial, etc.) -> Green text
 				branchStyle = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 			}
 
-			branchCell := cellBranchStyle.Render(branchStyle.Render(displayText))
+			branchCell := dynCellBranchStyle.Render(branchStyle.Render(displayText))
 
-			// 3. PRs Count Cell
-			prsStyle := cellPRsStyle
 			var prsCell string
 			if item.OpenPRsCount > 0 {
-				prsCell = prsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
+				prsCell = cellPRsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
 			} else {
-				prsCell = prsStyle.Foreground(colorMuted).Render("-")
+				prsCell = cellPRsStyle.Foreground(colorMuted).Render("-")
 			}
 
-			// 4. Issues Count Cell
-			issuesStyle := cellIssuesStyle
 			var issuesCell string
 			if item.OpenIssuesCount > 0 {
-				issuesCell = issuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
+				issuesCell = cellIssuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
 			} else {
-				issuesCell = issuesStyle.Foreground(colorMuted).Render("-")
+				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("-")
 			}
 
-			// Combine cells into a pixel-aligned table line
-			line := fmt.Sprintf("%s%s %s %s %s",
-				statusIconStr, nameCell, branchCell, prsCell, issuesCell,
-			)
+			line := fmt.Sprintf("%s%s %s %s %s", statusIconStr, nameCell, branchCell, prsCell, issuesCell)
 
-			if i == m.SelectedIndex {
-				leftSb.WriteString(selectedRowStyle.Width(leftWidth - 4).Render("> "+line) + "\n")
+			if m.ActiveFocus == FocusRepos && i == m.SelectedIndex {
+				repoLines = append(repoLines, clipLine(selectedRowStyle.Width(paneInnerWidth).Render("> "+line)))
 			} else {
-				leftSb.WriteString(normalRowStyle.Render("  "+line) + "\n")
+				repoLines = append(repoLines, clipLine(normalRowStyle.Render("  "+line)))
 			}
 		}
 	}
 
-	leftPane := borderBoxStyle.
+	repoStyle := borderBoxStyle
+	if m.ActiveFocus == FocusRepos {
+		repoStyle = borderFocusedStyle
+	}
+	repoPane := repoStyle.
 		Width(leftWidth).
-		Height(m.Height - 6).
-		Render(leftSb.String())
+		Height(repoBoxHeight).
+		Render(strings.Join(sliceLines(repoLines, repoBoxHeight), "\n"))
+
+	// ------------------ PANEL 2: REGISTERED RUNNERS (ULTRA-COMPACT GROUPED) ------------------
+	var runnerLines []string
+	runnerHeader := fmt.Sprintf(" %s %s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REGISTERED RUNNERS"))
+	runnerLines = append(runnerLines, clipLine(runnerHeader))
+	runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
+
+	var runningNames, idleNames, offlineNames []string
+	for _, r := range m.Runners {
+		switch r.Status {
+		case jobs.RunnerRunning:
+			runningNames = append(runningNames, r.Name)
+		case jobs.RunnerOffline:
+			offlineNames = append(offlineNames, r.Name)
+		default:
+			idleNames = append(idleNames, r.Name)
+		}
+	}
+
+	if len(runningNames) > 0 {
+		glyph := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Width(2).Render("⚡")
+		label := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf(" RUNNING (%d): ", len(runningNames)))
+		names := lipgloss.NewStyle().Foreground(colorGreen).Render(strings.Join(runningNames, ", "))
+		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
+	}
+	if len(idleNames) > 0 {
+		glyph := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Width(2).Render("●")
+		label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(fmt.Sprintf(" IDLE (%d): ", len(idleNames)))
+		names := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Join(idleNames, ", "))
+		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
+	}
+	if len(offlineNames) > 0 {
+		glyph := lipgloss.NewStyle().Foreground(colorRed).Bold(true).Width(2).Render("✖")
+		label := lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render(fmt.Sprintf(" OFFLINE (%d): ", len(offlineNames)))
+		names := lipgloss.NewStyle().Foreground(colorRed).Render(strings.Join(offlineNames, ", "))
+		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
+	}
+
+	runnerStyle := borderBoxStyle
+	if m.ActiveFocus == FocusRunners {
+		runnerStyle = borderFocusedStyle
+	}
+	runnersPane := runnerStyle.
+		Width(leftWidth).
+		Height(runnersBoxHeight).
+		Render(strings.Join(sliceLines(runnerLines, runnersBoxHeight), "\n"))
+
+	// ------------------ PANEL 3: OVERALL JOB QUEUE ------------------
+	var jobsLines []string
+	jobHeader := fmt.Sprintf(" %s %s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"))
+	jobsLines = append(jobsLines, jobHeader)
+	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
+
+	// maxJobRows: inner content area of jobs box minus header and divider lines
+	maxJobRows := jobsBoxHeight - 2
+	if maxJobRows < 1 {
+		maxJobRows = 1
+	}
+	jobStartIdx := 0
+	if m.SelectedJobIndex >= maxJobRows {
+		jobStartIdx = m.SelectedJobIndex - maxJobRows + 1
+	}
+	jobEndIdx := jobStartIdx + maxJobRows
+	if jobEndIdx > len(m.JobQueue) {
+		jobEndIdx = len(m.JobQueue)
+	}
+
+	for i := jobStartIdx; i < jobEndIdx; i++ {
+		j := m.JobQueue[i]
+		stSymbol := "⏳"
+		stColor := colorYellow
+		if j.Status == jobs.JobRunning {
+			stSymbol = "⚡"
+			stColor = colorSecondary
+		} else if j.Status == jobs.JobPassed {
+			stSymbol = "󰄬"
+			stColor = colorGreen
+		} else if j.Status == jobs.JobFailed {
+			stSymbol = "󰅙"
+			stColor = colorRed
+		}
+
+		// Keep job row within pane using dynamic column widths
+		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
+
+		availW := paneInnerWidth - 4
+		idW := len(j.ID)
+		if idW < 8 {
+			idW = 8
+		}
+		if idW > 14 {
+			idW = 14
+		}
+
+		idStrText := lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Width(idW).Render(truncateString(j.ID, idW))
+		if j.RunID != 0 {
+			jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+			if j.GHJobID != 0 {
+				jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, j.Repo, j.RunID, j.GHJobID)
+			}
+			idStrText = Hyperlink(idStrText, jobURL)
+		}
+
+		runnerW := len(j.RunnerName)
+		if runnerW < 12 {
+			runnerW = 12
+		}
+		if runnerW > 18 {
+			runnerW = 18
+		}
+		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render(truncateString(j.RunnerName, runnerW))
+
+		// Give all remaining inner pane space to job name
+		nameW := availW - 10 - idW - runnerW - 3
+		if nameW < 15 {
+			nameW = 15
+		}
+		nameStr := lipgloss.NewStyle().Width(nameW).Render(truncateString(j.Name, nameW))
+
+		line := fmt.Sprintf("%s %s %s %s", stBadge, idStrText, nameStr, runnerAssigned)
+
+		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
+			jobsLines = append(jobsLines, clipLine(selectedRowStyle.Width(paneInnerWidth).Render("> "+line)))
+		} else {
+			jobsLines = append(jobsLines, clipLine(normalRowStyle.Render("  "+line)))
+		}
+	}
+
+	jobsStyle := borderBoxStyle
+	if m.ActiveFocus == FocusJobs {
+		jobsStyle = borderFocusedStyle
+	}
+	jobsPane := jobsStyle.
+		Width(leftWidth).
+		Height(jobsBoxHeight).
+		Render(strings.Join(sliceLines(jobsLines, jobsBoxHeight), "\n"))
+
+	leftColumn := lipgloss.JoinVertical(lipgloss.Left, repoPane, runnersPane, jobsPane)
 
 	// Render Details Viewport (Right)
+	// logBoxStyle has Border (1+1) + Padding (1+1) = 4 chars horizontal overhead.
+	// Passing rightWidth - 4 makes the outer rendered width equal to rightWidth.
+	rightInnerWidth := rightWidth - 4
+	if rightInnerWidth < 20 {
+		rightInnerWidth = 20
+	}
+
 	rightPane := logBoxStyle.
-		Width(rightWidth).
-		Height(m.Height - 6).
+		Width(rightInnerWidth).
+		Height(rightBoxHeight).
 		Render(m.Viewport.View())
 
-	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, " ", rightPane)
+	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
-	// 3. Footer Keybindings Help
-	footerText := "[↑/↓] Move Repo  |  [j/k] Scroll Pane  |  [←/→/h/l] Switch Tab  |  [b] Toggle Branch  |  [d/D] Delete Archived  |  [q] Quit"
+	// 3. Footer Keybindings Help (on its own line below mainView)
+	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [j/k] Scroll  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.ToastMsg)
 	}
 
-	footer := lipgloss.NewStyle().Foreground(colorMuted).Render(footerText)
+	footer := lipgloss.NewStyle().Foreground(colorMuted).MaxWidth(m.Width).Render(footerText)
 
-	return header + "\n" + mainView + "\n" + footer
+	// header has trailing \n (1 newline)
+	// mainView has (availableHeight-1) internal newlines = availableHeight lines
+	// footer is concatenated to last line of mainView (no extra newline)
+	// strings.Split gives: availableHeight+1 lines total = m.Height ✓
+	return header + mainView + footer
 }
 
 func (m Model) renderStatusBadge(item *git.RepoItem) string {
