@@ -47,6 +47,9 @@ type JobItem struct {
 	Name       string
 	Repo       string
 	Branch     string
+	Event      string
+	PRNumber   int
+	PRURL      string
 	Status     JobStatus
 	RunnerID   string
 	RunnerName string
@@ -55,8 +58,8 @@ type JobItem struct {
 	Logs       []string
 	Seconds    int
 	StartedAt  time.Time
-	RunID      int64  // GitHub workflow run ID
-	GHJobID    int64  // GitHub job ID within the run (populated lazily)
+	RunID      int64 // GitHub workflow run ID
+	GHJobID    int64 // GitHub job ID within the run (populated lazily)
 }
 
 // --- GitHub API response types ---
@@ -79,18 +82,25 @@ type GHRunnersResponse struct {
 	Runners    []GHRunnerInfo `json:"runners"`
 }
 
+type GHPullRequestInfo struct {
+	Number int    `json:"number"`
+	URL    string `json:"html_url"`
+}
+
 type GHWorkflowRun struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	DisplayTitle string `json:"display_title"`
-	Status      string `json:"status"`
-	HeadBranch  string `json:"head_branch"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
-	RunStartedAt string `json:"run_started_at"`
-	RunnerName  string `json:"runner_name"`
-	RunnerID    int    `json:"runner_id"`
-	Repository  struct {
+	ID           int64               `json:"id"`
+	Name         string              `json:"name"`
+	DisplayTitle string              `json:"display_title"`
+	Status       string              `json:"status"`
+	Event        string              `json:"event"`
+	HeadBranch   string              `json:"head_branch"`
+	CreatedAt    string              `json:"created_at"`
+	UpdatedAt    string              `json:"updated_at"`
+	RunStartedAt string              `json:"run_started_at"`
+	RunnerName   string              `json:"runner_name"`
+	RunnerID     int                 `json:"runner_id"`
+	PullRequests []GHPullRequestInfo `json:"pull_requests"`
+	Repository   struct {
 		Name string `json:"name"`
 	} `json:"repository"`
 }
@@ -314,11 +324,24 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 								}
 							}
 
+							prNum := 0
+							prURL := ""
+							if len(run.PullRequests) > 0 {
+								prNum = run.PullRequests[0].Number
+								prURL = run.PullRequests[0].URL
+								if prURL == "" && prNum != 0 {
+									prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
+								}
+							}
+
 							jobItem := &JobItem{
 								ID:         fmt.Sprintf("#%d", j.ID),
 								Name:       displayName,
 								Repo:       repo,
 								Branch:     run.HeadBranch,
+								Event:      run.Event,
+								PRNumber:   prNum,
+								PRURL:      prURL,
 								Status:     js,
 								RunnerName: j.RunnerName,
 								QueuedAt:   queuedAgo,
@@ -380,11 +403,24 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 						}
 					}
 
+					prNum := 0
+					prURL := ""
+					if len(run.PullRequests) > 0 {
+						prNum = run.PullRequests[0].Number
+						prURL = run.PullRequests[0].URL
+						if prURL == "" && prNum != 0 {
+							prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
+						}
+					}
+
 					job := &JobItem{
 						ID:         fmt.Sprintf("#%d", run.ID),
 						Name:       displayName,
 						Repo:       repo,
 						Branch:     run.HeadBranch,
+						Event:      run.Event,
+						PRNumber:   prNum,
+						PRURL:      prURL,
 						Status:     js,
 						RunnerName: run.RunnerName,
 						QueuedAt:   queuedAgo,
