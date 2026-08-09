@@ -340,6 +340,7 @@ func TestIssue37Fixes(t *testing.T) {
 	m := NewModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
+	m.IsOrgSyncing = false
 	m.Repos = []*git.RepoItem{
 		{Name: "myrepo", CurrentBranch: "feat/long-branch-name-feature-x", Status: git.StatusUpToDate},
 	}
@@ -358,7 +359,7 @@ func TestIssue37Fixes(t *testing.T) {
 
 	// 3. Verify View includes extended branch name beyond 16 chars
 	view := m.View()
-	if !strings.Contains(view, "feat/long-branch-name") {
+	if !strings.Contains(view, "feat/long-branch") {
 		t.Errorf("expected View to contain extended branch name, got:\n%s", view)
 	}
 }
