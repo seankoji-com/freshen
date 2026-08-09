@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -528,5 +529,20 @@ func TestPanelBoundaryCrossingToasts(t *testing.T) {
 	}
 	if !strings.Contains(updated5.ToastMsg, "Focused Repositories Panel") {
 		t.Errorf("expected ToastMsg to contain Focused Repositories Panel, got %q", updated5.ToastMsg)
+	}
+}
+
+func TestTruncateStringMultiByteUTF8(t *testing.T) {
+	// Toast containing multi-byte arrow glyphs and emoji
+	multibyteStr := " ⚠ Job queue may be incomplete: 18 repo(s) had errors: ⚡ carey-mac-alpha ↓ Runners"
+	truncated := truncateString(multibyteStr, 30)
+
+	if !utf8.ValidString(truncated) {
+		t.Errorf("truncateString produced invalid UTF-8 string: %q", truncated)
+	}
+
+	runes := []rune(truncated)
+	if len(runes) > 30 {
+		t.Errorf("expected rune count <= 30, got %d for %q", len(runes), truncated)
 	}
 }
