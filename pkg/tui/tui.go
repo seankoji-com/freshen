@@ -597,7 +597,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Width = msg.Width
 		m.Height = msg.Height
 		m.ProgressBar.Width = msg.Width - 20
-		m.Viewport.Width = (msg.Width / 2) - 4
+
+		halfWidth := msg.Width / 2
+		m.Viewport.Width = halfWidth - 6
 		m.Viewport.Height = msg.Height - 10
 	}
 
@@ -683,7 +685,13 @@ func (m *Model) updateViewport() {
 		if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
 			sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
 		}
-		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("------------------ EXECUTION LOGS ------------------") + "\n")
+
+		dashCount := (m.Viewport.Width - 18) / 2
+		if dashCount < 2 {
+			dashCount = 2
+		}
+		divider := strings.Repeat("─", dashCount) + " EXECUTION LOGS " + strings.Repeat("─", dashCount)
+		sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(divider) + "\n")
 
 		wrapWidth := m.Viewport.Width - 2
 		if wrapWidth < 20 {
@@ -739,9 +747,11 @@ func (m *Model) updateViewport() {
 		} else if len(item.IssuesList) == 0 {
 			sb.WriteString("  󰄬 No open issues found for this repository.\n")
 		} else {
+			titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
 			for _, issue := range item.IssuesList {
-				sb.WriteString(fmt.Sprintf("  %s #%-4d %s\n     %s\n\n",
-					badgeIssue.Render("⊙"), issue.Number, issue.Title,
+				header := fmt.Sprintf("#%-4d %s", issue.Number, issue.Title)
+				sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+					badgeIssue.Render("⊙"), titleWrapper.Render(header),
 					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
 				))
 			}
@@ -759,9 +769,11 @@ func (m *Model) updateViewport() {
 		} else if len(item.PRsList) == 0 {
 			sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
 		} else {
+			titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
 			for _, pr := range item.PRsList {
-				sb.WriteString(fmt.Sprintf("  %s #%-4d %s (%s %s)\n     %s\n\n",
-					badgePR.Render("󰏫"), pr.Number, pr.Title, iconBranch, pr.HeadRefName,
+				header := fmt.Sprintf("#%-4d %s (%s %s)", pr.Number, pr.Title, iconBranch, pr.HeadRefName)
+				sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+					badgePR.Render("󰏫"), titleWrapper.Render(header),
 					lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
 				))
 			}
@@ -848,24 +860,32 @@ func (m Model) View() string {
 
 	header := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle + "\n"
 
-	// 2. Main Content Split View
-	leftWidth := (m.Width / 2) - 2
-	rightWidth := (m.Width / 2) - 2
+	// 2. Strict 50% / 50% Fixed Width Split Layout
+	halfWidth := m.Width / 2
+	leftWidth := halfWidth - 1
+	rightWidth := m.Width - leftWidth - 1
+
+	paneInnerWidth := leftWidth - 4
+	if paneInnerWidth < 30 {
+		paneInnerWidth = 30
+	}
 
 	// Render Repo Grid Table (Left)
 	var leftSb strings.Builder
 
-	// Pixel-Perfect Column Header Layout (Header Prefix = "    " [4 spaces] matching data row prefix)
-	headerPrefix := "    "
+	// Pixel-Perfect Column Header Layout
 	headerLine := fmt.Sprintf("%s%s %s %s %s",
-		headerPrefix,
+		cellStatusIconStyle.Render(""),
 		cellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
 		cellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
 		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
 	leftSb.WriteString(headerLine + "\n")
-	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("    --------------------------------------------------------------------------------") + "\n")
+
+	// Dynamic Unicode ─ Horizontal Rule matching exact inner pane width
+	dividerLine := strings.Repeat("─", paneInnerWidth)
+	leftSb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(dividerLine) + "\n")
 
 	if m.IsOrgSyncing {
 		leftSb.WriteString(m.Spinner.View() + " Fetching GitHub organization repositories...\n")
