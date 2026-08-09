@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
@@ -441,5 +442,33 @@ func TestTabBranchesGroupedRendering(t *testing.T) {
 	}
 	if !strings.Contains(viewContent, "Remote Branches:") {
 		t.Errorf("expected Viewport to contain 'Remote Branches:' header, got:\n%s", viewContent)
+	}
+}
+
+func TestFooterSeparationAndLineWidthBounds(t *testing.T) {
+	m := NewModel("/tmp/test", "test-org")
+	m.Width = 160
+	m.Height = 40
+	m.IsOrgSyncing = false
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", CurrentBranch: "main", Status: git.StatusUpToDate},
+	}
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	if len(lines) != m.Height {
+		t.Errorf("expected View() total line count to equal m.Height (%d), got %d lines", m.Height, len(lines))
+	}
+
+	lastLine := lines[len(lines)-1]
+	if !strings.Contains(lastLine, "Focus") || !strings.Contains(lastLine, "Quit") {
+		t.Errorf("expected last line of View() to be footer keybindings help, got: %q", lastLine)
+	}
+
+	for i, line := range lines {
+		if lipgloss.Width(line) > m.Width {
+			t.Errorf("line %d width (%d) exceeds m.Width (%d): %q", i, lipgloss.Width(line), m.Width, line)
+		}
 	}
 }
