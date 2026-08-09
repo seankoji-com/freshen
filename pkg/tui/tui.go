@@ -213,6 +213,7 @@ type Model struct {
 	SelectedIndex       int
 	SelectedRunnerIndex int
 	SelectedJobIndex    int
+	SelectedTagIndex    int
 	ActiveFocus         FocusType
 	ActiveTab           TabType
 	IsSyncing           bool
@@ -500,10 +501,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.updateViewport()
 				}
 			case FocusRunners:
-				if m.SelectedRunnerIndex > 0 {
-					m.SelectedRunnerIndex--
-					m.updateViewport()
-				} else if len(m.Repos) > 0 {
+				if len(m.Repos) > 0 {
 					m.ActiveFocus = FocusRepos
 					m.SelectedIndex = len(m.Repos) - 1
 					m.updateViewport()
@@ -518,9 +516,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							cmds = append(cmds, m.loadJobLogsCmd(j))
 						}
 					}
-				} else if len(m.Runners) > 0 {
+				} else {
 					m.ActiveFocus = FocusRunners
-					m.SelectedRunnerIndex = len(m.Runners) - 1
 					m.updateViewport()
 				}
 			}
@@ -531,26 +528,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.SelectedIndex < len(m.Repos)-1 {
 					m.SelectedIndex++
 					m.updateViewport()
-				} else if len(m.Runners) > 0 {
+				} else {
 					m.ActiveFocus = FocusRunners
-					m.SelectedRunnerIndex = 0
 					m.updateViewport()
 				}
 			case FocusRunners:
-				if m.SelectedRunnerIndex < len(m.Runners)-1 {
-					m.SelectedRunnerIndex++
-					m.updateViewport()
-				} else {
-					// Always fall through to jobs panel from last runner
-					m.ActiveFocus = FocusJobs
-					m.SelectedJobIndex = 0
-					m.updateViewport()
-					// Immediately kick off log fetch for the newly focused job
-					if len(m.JobQueue) > 0 {
-						j := m.JobQueue[0]
-						if j.Status == jobs.JobRunning {
-							cmds = append(cmds, m.loadJobLogsCmd(j))
-						}
+				m.ActiveFocus = FocusJobs
+				m.SelectedJobIndex = 0
+				m.updateViewport()
+				if len(m.JobQueue) > 0 {
+					j := m.JobQueue[0]
+					if j.Status == jobs.JobRunning {
+						cmds = append(cmds, m.loadJobLogsCmd(j))
 					}
 				}
 			case FocusJobs:
@@ -566,14 +555,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "j", "ctrl+d", "pgdown":
-			m.Viewport.LineDown(3)
-
-		case "k", "ctrl+u", "pgup":
-			m.Viewport.LineUp(3)
-
 		case "right", "l", "tab":
-			if m.ActiveFocus == FocusRepos {
+			if m.ActiveFocus == FocusRunners {
+				tags := m.getAvailableTags()
+				if len(tags) > 0 {
+					m.SelectedTagIndex = (m.SelectedTagIndex + 1) % len(tags)
+					m.updateViewport()
+				}
+			} else if m.ActiveFocus == FocusRepos {
 				m.ActiveTab = (m.ActiveTab + 1) % 4
 				m.updateViewport()
 				return m, m.triggerTabFetch()
@@ -583,7 +572,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "left", "h", "shift+tab":
-			if m.ActiveFocus == FocusRepos {
+			if m.ActiveFocus == FocusRunners {
+				tags := m.getAvailableTags()
+				if len(tags) > 0 {
+					m.SelectedTagIndex = (m.SelectedTagIndex - 1 + len(tags)) % len(tags)
+					m.updateViewport()
+				}
+			} else if m.ActiveFocus == FocusRepos {
 				m.ActiveTab = (m.ActiveTab + 3) % 4
 				m.updateViewport()
 				return m, m.triggerTabFetch()
@@ -987,32 +982,44 @@ func (m *Model) updateViewport() {
 			m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org."))
 			return
 		}
-		if m.SelectedRunnerIndex >= len(m.Runners) {
-			m.SelectedRunnerIndex = 0
-		}
-		runner := m.Runners[m.SelectedRunnerIndex]
 
-		// --- STATUS BADGE ---
-		var statusColor lipgloss.Color
-		var statusGlyph string
-		switch runner.Status {
-		case jobs.RunnerRunning:
-			statusColor, statusGlyph = colorSecondary, "⚡"
-		case jobs.RunnerOffline:
-			statusColor, statusGlyph = colorRed, "✖"
-		case jobs.RunnerMaintenance:
-			statusColor, statusGlyph = colorYellow, "⚠"
-		default:
-			statusColor, statusGlyph = colorGreen, "●"
+		tags := m.getAvailableTags()
+		if m.SelectedTagIndex >= len(tags) {
+			m.SelectedTagIndex = 0
 		}
-		statusBadge := lipgloss.NewStyle().Foreground(statusColor).Bold(true).
-			Render(fmt.Sprintf("%s %s", statusGlyph, runner.Status))
+		activeTag := tags[m.SelectedTagIndex]
+
+		// Filter runners by activeTag
+		var matchingRunners []*jobs.RunnerItem
+		for _, r := range m.Runners {
+			if activeTag == "ALL" {
+				matchingRunners = append(matchingRunners, r)
+			} else {
+				for _, tag := range r.Tags {
+					if tag == activeTag {
+						matchingRunners = append(matchingRunners, r)
+						break
+					}
+				}
+			}
+		}
+
+		busyCount := 0
+		for _, r := range matchingRunners {
+			if r.Status == jobs.RunnerRunning {
+				busyCount++
+			}
+		}
+		loadPct := 0
+		if len(matchingRunners) > 0 {
+			loadPct = (busyCount * 100) / len(matchingRunners)
+		}
 
 		// --- HEADER ---
 		sb.WriteString(fmt.Sprintf(" %s %s   %s\n",
 			iconRunner,
-			lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(runner.Name),
-			statusBadge,
+			lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("FLEET TAG BROWSER"),
+			lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("Tag: [%s]", activeTag)),
 		))
 		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
@@ -1026,78 +1033,14 @@ func (m *Model) updateViewport() {
 			)
 		}
 
-		sb.WriteString(label("ID", runner.ID, colorPrimary))
-		sb.WriteString(label("Platform", runner.Platform, colorSecondary))
+		sb.WriteString(label("Active Tag", activeTag, colorSecondary))
+		sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
+		sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
+		sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
 
-		tagsStr := strings.Join(runner.Tags, "  ")
-		if tagsStr == "" {
-			tagsStr = "—"
-		}
-		sb.WriteString(label("Labels", tagsStr, colorYellow))
-
-		heartbeat := "—"
-		if !runner.LastHeartbeat.IsZero() {
-			ago := int(time.Since(runner.LastHeartbeat).Seconds())
-			if ago < 60 {
-				heartbeat = fmt.Sprintf("%ds ago", ago)
-			} else {
-				heartbeat = fmt.Sprintf("%dm ago", ago/60)
-			}
-		}
-		sb.WriteString(label("Last Seen", heartbeat, colorMuted))
-
-		// --- CURRENT JOB ---
+		// --- MATCHING RUNNERS TABLE ---
 		sb.WriteString("\n")
-		activeJob := findJobForRunner(runner, m.JobQueue)
-
-		curJobID := runner.CurrentJobID
-		curJobName := runner.CurrentJob
-		if activeJob != nil {
-			curJobID = activeJob.ID
-			curJobName = activeJob.Name
-		}
-
-		if activeJob != nil || (curJobName != "-" && curJobName != "") {
-			jobText := curJobName
-			if curJobID != "-" && curJobID != "" && curJobID != activeJob.Name {
-				jobText = fmt.Sprintf("%s  %s", curJobID, curJobName)
-			}
-
-			maxCurJobLen := m.Viewport.Width - 17
-			if maxCurJobLen < 15 {
-				maxCurJobLen = 15
-			}
-			jobTextTrunc := truncateString(jobText, maxCurJobLen)
-
-			var jobLink string
-			if activeJob != nil && activeJob.RunID != 0 {
-				jobURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID)
-				if activeJob.GHJobID != 0 {
-					jobURL = fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d/job/%d", m.TargetOrg, activeJob.Repo, activeJob.RunID, activeJob.GHJobID)
-				}
-				jobLink = Hyperlink(lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobTextTrunc), jobURL)
-			} else {
-				jobLink = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobTextTrunc)
-			}
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
-				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
-				jobLink,
-			))
-		} else if runner.Status == jobs.RunnerRunning {
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
-				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
-				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf("⚡ %s active workflow", m.TargetOrg)),
-			))
-		} else {
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
-				lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Current Job"),
-				lipgloss.NewStyle().Foreground(colorMuted).Render("Idle — no active job"),
-			))
-		}
-
-		// --- ALL RUNNERS OVERVIEW TABLE ---
-		sb.WriteString("\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" ALL RUNNERS") + "\n")
+		sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(fmt.Sprintf(" RUNNERS MATCHING [%s]", activeTag)) + "\n")
 		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 			fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
 		) + "\n")
@@ -1107,7 +1050,7 @@ func (m *Model) updateViewport() {
 			maxJobLen = 15
 		}
 
-		for i, r := range m.Runners {
+		for _, r := range matchingRunners {
 			var rColor lipgloss.Color
 			var rGlyph string
 			switch r.Status {
@@ -1121,10 +1064,6 @@ func (m *Model) updateViewport() {
 				rColor, rGlyph = colorGreen, "●"
 			}
 			marker := "  "
-			if i == m.SelectedRunnerIndex {
-				marker = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("> ")
-			}
-			// Fixed-width glyph column (⚡ is 2 cells wide, others are 1 — pad to equalise)
 			glyphCell := lipgloss.NewStyle().Foreground(rColor).Width(2).Render(rGlyph)
 			var currentJobStr string
 			switch {
@@ -1155,16 +1094,21 @@ func (m *Model) updateViewport() {
 			))
 		}
 
-		// --- QUEUED / RUNNING JOBS ON THIS RUNNER ---
+		// --- QUEUED / RUNNING JOBS ON MATCHING RUNNERS ---
 		var assignedJobs []*jobs.JobItem
+		matchingNames := make(map[string]bool)
+		for _, r := range matchingRunners {
+			matchingNames[r.Name] = true
+			matchingNames[r.ID] = true
+		}
 		for _, j := range m.JobQueue {
-			if j.RunnerName == runner.Name || j.RunnerID == runner.ID {
+			if matchingNames[j.RunnerName] || matchingNames[j.RunnerID] {
 				assignedJobs = append(assignedJobs, j)
 			}
 		}
 		if len(assignedJobs) > 0 {
 			sb.WriteString("\n")
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" QUEUED / RUNNING JOBS ON THIS RUNNER") + "\n")
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(fmt.Sprintf(" QUEUED / RUNNING JOBS ON [%s] RUNNERS", activeTag)) + "\n")
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 				fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
 			) + "\n")
@@ -1712,14 +1656,51 @@ func (m Model) View() string {
 		Height(repoBoxHeight).
 		Render(strings.Join(sliceLines(repoLines, repoBoxHeight), "\n"))
 
-	// ------------------ PANEL 2: REGISTERED RUNNERS (ULTRA-COMPACT GROUPED) ------------------
+	// ------------------ PANEL 2: REGISTERED RUNNERS (TAG BROWSER) ------------------
 	var runnerLines []string
-	runnerHeader := fmt.Sprintf(" %s %s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("REGISTERED RUNNERS"))
+	tags := m.getAvailableTags()
+	if m.SelectedTagIndex >= len(tags) {
+		m.SelectedTagIndex = 0
+	}
+	activeTag := tags[m.SelectedTagIndex]
+
+	tagTitle := "REGISTERED RUNNERS"
+	if activeTag != "ALL" {
+		tagTitle = fmt.Sprintf("REGISTERED RUNNERS (Tag: %s)", activeTag)
+	}
+
+	runnerHeader := fmt.Sprintf(" %s %s", iconRunner, lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(tagTitle))
 	runnerLines = append(runnerLines, clipLine(runnerHeader))
 	runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
+	// Tag Pills Bar
+	var tagPills []string
+	for i, tag := range tags {
+		if i == m.SelectedTagIndex {
+			tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("["+tag+"]"))
+		} else {
+			tagPills = append(tagPills, lipgloss.NewStyle().Foreground(colorMuted).Render(tag))
+		}
+	}
+	runnerLines = append(runnerLines, clipLine(" TAGS:  "+strings.Join(tagPills, "  ")))
+
 	var runningNames, idleNames, offlineNames []string
 	for _, r := range m.Runners {
+		match := false
+		if activeTag == "ALL" {
+			match = true
+		} else {
+			for _, tag := range r.Tags {
+				if tag == activeTag {
+					match = true
+					break
+				}
+			}
+		}
+		if !match {
+			continue
+		}
+
 		switch r.Status {
 		case jobs.RunnerRunning:
 			runningNames = append(runningNames, r.Name)
@@ -2101,4 +2082,22 @@ func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targ
 		}
 	}
 	return result
+}
+
+func (m Model) getAvailableTags() []string {
+	tagsSet := make(map[string]bool)
+	for _, r := range m.Runners {
+		for _, tag := range r.Tags {
+			if tag != "" {
+				tagsSet[tag] = true
+			}
+		}
+	}
+	tags := []string{"ALL"}
+	var keys []string
+	for k := range tagsSet {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return append(tags, keys...)
 }
