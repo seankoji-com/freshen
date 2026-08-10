@@ -1187,9 +1187,7 @@ func (m *Model) updateViewport() {
 		sb.WriteString(label("Runner Count", fmt.Sprintf("%d matching runners", len(matchingRunners)), colorPrimary))
 		sb.WriteString(label("Cluster Load", fmt.Sprintf("%d%% load (%d busy / %d total)", loadPct, busyCount, len(matchingRunners)), colorYellow))
 		if len(tags) > 1 {
-			if len(tags) > 1 {
-				sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
-			}
+			sb.WriteString(label("Tag Navigation", "[← / →] or [h / l] to cycle through fleet tags", colorMuted))
 		}
 
 		// --- MATCHING RUNNERS TABLE ---
@@ -1563,6 +1561,11 @@ func (m *Model) updateViewport() {
 
 	case FocusRepos:
 		if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+			if m.IsOrgSyncing {
+				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching GitHub repositories...", m.Spinner.View()))
+			} else {
+				m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No repositories found. Select a repo from the left pane."))
+			}
 			return
 		}
 
@@ -1994,6 +1997,10 @@ func (m Model) View() string {
 	runnerLines = append(runnerLines, clipLine(runnerHeader))
 	runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
+	if m.IsRunnersLoading && len(m.Runners) == 0 {
+		runnerLines = append(runnerLines, clipLine(fmt.Sprintf(" %s Fetching registered runners...", cellStatusIconStyle.Render(m.Spinner.View()))))
+	}
+
 	var runningNames, idleNames, offlineNames []string
 	for _, r := range m.Runners {
 		match := false
@@ -2040,6 +2047,10 @@ func (m Model) View() string {
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
 	}
 
+	if !m.IsRunnersLoading && len(runningNames) == 0 && len(idleNames) == 0 && len(offlineNames) == 0 {
+		runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org.")))
+	}
+
 	runnerStyle := borderBoxStyle
 	if m.ActiveFocus == FocusRunners {
 		runnerStyle = borderFocusedStyle
@@ -2064,12 +2075,16 @@ func (m Model) View() string {
 	if runningCount > 0 || queuedCount > 0 {
 		countsStr = fmt.Sprintf(" (%d running, %d queued)", runningCount, queuedCount)
 	}
-	jobHeader := fmt.Sprintf(" %s %s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
+	jobHeaderSpinner := ""
+	if m.IsJobQueueLoading || m.IsOrgSyncing {
+		jobHeaderSpinner = " " + m.Spinner.View()
+	}
+	jobHeader := fmt.Sprintf(" %s %s%s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), jobHeaderSpinner, lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
 	jobsLines = append(jobsLines, jobHeader)
 	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
 
 	if len(m.JobQueue) == 0 {
-		if m.IsJobQueueLoading {
+		if m.IsJobQueueLoading || m.IsOrgSyncing {
 			jobsLines = append(jobsLines, clipLine(fmt.Sprintf(" %s Fetching active workflow jobs...", cellStatusIconStyle.Render(m.Spinner.View()))))
 		} else {
 			jobsLines = append(jobsLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No queued or running workflow jobs.")))
