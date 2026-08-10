@@ -323,26 +323,4 @@ else
   fi
 fi
 
-# ---- Post/update summary as issue comment ----
-echo "Handling summary issue comment..."
-
-# Check for existing summary comment with this persona's marker
-EXISTING_SUMMARY_ID=$(gh api "repos/${OWNER_REPO}/issues/${PR_NUMBER}/comments" \
-  --paginate 2>/dev/null |
-  jq --arg marker "$SUMMARY_MARKER" '[.[] | select(.body | contains($marker))] | last | .id // empty' \
-    2>/dev/null || echo "")
-
-if [ -n "$EXISTING_SUMMARY_ID" ]; then
-  echo "Updating existing summary comment $EXISTING_SUMMARY_ID"
-  gh api "repos/${OWNER_REPO}/issues/comments/${EXISTING_SUMMARY_ID}" \
-    -X PATCH \
-    -f body="$SUMMARY_BODY" \
-    >/dev/null 2>&1 || echo "::warning::Failed to update summary comment"
-else
-  echo "Posting new summary comment"
-  jq -n --arg body "$SUMMARY_BODY" '{body: $body}' |
-    gh api "repos/${OWNER_REPO}/issues/${PR_NUMBER}/comments" --input - \
-      >/dev/null 2>&1 || echo "::warning::Failed to post summary comment"
-fi
-
 echo "Persona ${PERSONA_ID} review complete ($INLINE_COUNT inline, $NO_LINE_COUNT summary-only, $SKIPPED deduped)"
