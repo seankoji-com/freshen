@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 
@@ -12,8 +14,16 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// newTestModel builds a Model with a no-op context/cancel/WaitGroup for tests
+// that don't exercise shutdown behavior directly.
+func newTestModel(targetDir, targetOrg string) Model {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	return NewModel(targetDir, targetOrg, ctx, cancel, &wg)
+}
+
 func TestFocusedRunViewportRendering(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
@@ -64,7 +74,7 @@ func TestFocusedRunViewportRendering(t *testing.T) {
 }
 
 func TestEnterUnfocusesWhenFocusedRunMatches(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.ActiveFocus = FocusJobs
 	m.SelectedJobIndex = 0
 	m.FocusedRunID = 100
@@ -82,7 +92,7 @@ func TestEnterUnfocusesWhenFocusedRunMatches(t *testing.T) {
 }
 
 func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.ActiveFocus = FocusJobs
 	m.SelectedJobIndex = 0
 	m.FocusedRunID = 0
@@ -100,7 +110,7 @@ func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
 }
 
 func TestEscUnfocusesRun(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.ActiveFocus = FocusJobs
 	m.FocusedRunID = 100
 	m.JobQueue = []*jobs.JobItem{
@@ -117,7 +127,7 @@ func TestEscUnfocusesRun(t *testing.T) {
 }
 
 func TestViewLineCountNeverExceedsTerminalHeight(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.Repos = []*git.RepoItem{
@@ -143,7 +153,7 @@ func TestViewLineCountNeverExceedsTerminalHeight(t *testing.T) {
 }
 
 func TestHeaderBannerAndColumnHeadersSticky(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.Repos = []*git.RepoItem{
@@ -162,7 +172,7 @@ func TestHeaderBannerAndColumnHeadersSticky(t *testing.T) {
 }
 
 func TestRightPaneHeaderInViewInitially(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.Repos = []*git.RepoItem{
@@ -176,7 +186,7 @@ func TestRightPaneHeaderInViewInitially(t *testing.T) {
 }
 
 func TestLoadJobQueueCmdRepoNameFallback(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	// Simulate local disk repos where GHRepoName is not yet populated from GitHub org sync
 	m.Repos = []*git.RepoItem{
 		{Name: ".dotfiles", GHRepoName: "", IsArchived: false},
@@ -191,7 +201,7 @@ func TestLoadJobQueueCmdRepoNameFallback(t *testing.T) {
 }
 
 func TestRunnerView_NoWordBusy_HyperlinkJobTitle(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusRunners
@@ -233,7 +243,7 @@ func TestRunnerView_NoWordBusy_HyperlinkJobTitle(t *testing.T) {
 }
 
 func TestTableOrderInFocusRunners(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusRunners
@@ -269,7 +279,7 @@ func TestTableOrderInFocusRunners(t *testing.T) {
 }
 
 func TestPollingToastNotifications(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 
@@ -311,7 +321,7 @@ func TestPollingToastNotifications(t *testing.T) {
 }
 
 func TestHyperlinksInView(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
@@ -339,7 +349,7 @@ func TestHyperlinksInView(t *testing.T) {
 }
 
 func TestIssue37Fixes(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.IsOrgSyncing = false
@@ -367,7 +377,7 @@ func TestIssue37Fixes(t *testing.T) {
 }
 
 func TestRepoTableCountsDifferentiation(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.IsOrgSyncing = false
@@ -410,7 +420,7 @@ func TestRepoTableCountsDifferentiation(t *testing.T) {
 }
 
 func TestTabBranchesGroupedRendering(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 120
 	m.Height = 40
 	m.IsOrgSyncing = false
@@ -448,7 +458,7 @@ func TestTabBranchesGroupedRendering(t *testing.T) {
 }
 
 func TestFooterSeparationAndLineWidthBounds(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Width = 160
 	m.Height = 40
 	m.IsOrgSyncing = false
@@ -476,7 +486,7 @@ func TestFooterSeparationAndLineWidthBounds(t *testing.T) {
 }
 
 func TestPanelBoundaryCrossingToasts(t *testing.T) {
-	m := NewModel("/tmp/test", "test-org")
+	m := newTestModel("/tmp/test", "test-org")
 	m.Repos = []*git.RepoItem{
 		{Name: "repo1", CurrentBranch: "main", Status: git.StatusUpToDate},
 	}

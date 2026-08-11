@@ -1,15 +1,24 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/tui"
 )
+
+// shutdownWait is how long main() waits for in-flight background git
+// operations to stop after the TUI exits, before returning anyway.
+const shutdownWait = 5 * time.Second
 
 const Version = "1.0.0"
 
@@ -48,25 +57,60 @@ func main() {
 		targetDir = absDir
 	}
 
+	// ctx is cancelled on Ctrl+C/SIGTERM/terminal-close (SIGHUP), and again
+	// explicitly on quit — it aborts any in-flight git operations so nothing
+	// (like the auto-stash sync) keeps running after freshen exits.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
 	if nonInteractiveFlag {
-		runNonInteractive(targetDir, orgFlag)
+		runNonInteractive(ctx, targetDir, orgFlag)
 		return
 	}
 
 	// Launch TUI Application
+	var bgWG sync.WaitGroup
 	p := tea.NewProgram(
-		tui.NewModel(targetDir, orgFlag),
+		tui.NewModel(targetDir, orgFlag, ctx, stop, &bgWG),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
 
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running freshen TUI: %v\n", err)
+	// If the process receives a signal instead of a keypress, stop the TUI too.
+	go func() {
+		<-ctx.Done()
+		p.Quit()
+	}()
+
+	_, runErr := p.Run()
+	stop() // cancel any in-flight sync regardless of how we got here
+
+	waitForBackgroundWork(&bgWG)
+
+	if runErr != nil {
+		fmt.Printf("Error running freshen TUI: %v\n", runErr)
 		os.Exit(1)
 	}
 }
 
-func runNonInteractive(targetDir, targetOrg string) {
+// waitForBackgroundWork blocks until all tracked background git operations
+// finish, or shutdownWait elapses — guaranteeing the process actually exits
+// instead of leaving orphaned git/gh subprocesses behind.
+func waitForBackgroundWork(wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownWait):
+		fmt.Println("Warning: background sync did not stop in time; exiting anyway.")
+	}
+}
+
+func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("                   FRESHEN REPOSITORY WORKFLOW                        \n")
 	fmt.Printf("======================================================================\n")
@@ -113,7 +157,7 @@ func runNonInteractive(targetDir, targetOrg string) {
 			Logs:       make([]string, 0),
 		}
 
-		git.SyncRepository(item)
+		git.SyncRepository(ctx, item)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)
