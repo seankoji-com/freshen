@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -195,6 +196,10 @@ type loadedRunnersMsg struct {
 type orgSyncedMsg struct {
 	repos []*git.RepoItem
 	err   error
+	// autoSync is true only for the initial load; periodic refreshes only
+	// update displayed repo metadata and must not trigger a full
+	// stash/pull/apply sync of every dirty repo.
+	autoSync bool
 }
 
 type loadedIssuesMsg struct {
@@ -242,9 +247,20 @@ type Model struct {
 	Height      int
 
 	mu sync.Mutex
+
+	// ctx is cancelled on quit (via key or OS signal) to abort in-flight git
+	// operations instead of letting them keep running after the UI exits.
+	// bgWG tracks those operations so the caller can wait for them to
+	// actually stop before the process exits.
+	ctx    context.Context
+	cancel context.CancelFunc
+	bgWG   *sync.WaitGroup
 }
 
-func NewModel(targetDir, targetOrg string) Model {
+// NewModel constructs the TUI model. ctx should be cancelled by the caller
+// (e.g. on quit or an OS signal) to abort in-flight background git
+// operations; bgWG tracks those operations for a bounded shutdown wait.
+func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(colorSecondary)
@@ -273,13 +289,16 @@ func NewModel(targetDir, targetOrg string) Model {
 		Spinner:             s,
 		ProgressBar:         p,
 		Viewport:            vp,
+		ctx:                 ctx,
+		cancel:              cancel,
+		bgWG:                bgWG,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.Spinner.Tick,
-		m.loadOrgReposCmd(),
+		m.loadOrgReposCmd(true),
 		m.loadRunnersCmd(),
 		m.loadJobQueueCmd(),
 		repoTickCmd(),
@@ -354,14 +373,14 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 	}
 }
 
-func (m Model) loadOrgReposCmd() tea.Cmd {
+func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 	return func() tea.Msg {
 		orgRepos, _ := git.FetchOrgRepos(m.TargetOrg)
 		orgCounts, _ := git.FetchOrgRepoCounts(m.TargetOrg)
 
 		entries, err := git.ScanLocalDirectory(m.TargetDir)
 		if err != nil {
-			return orgSyncedMsg{repos: nil, err: err}
+			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
 		}
 
 		repoMap := make(map[string]*git.RepoItem)
@@ -443,7 +462,7 @@ func (m Model) loadOrgReposCmd() tea.Cmd {
 			return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
 		})
 
-		return orgSyncedMsg{repos: result, err: nil}
+		return orgSyncedMsg{repos: result, err: nil, autoSync: autoSync}
 	}
 }
 
@@ -462,7 +481,14 @@ func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
 }
 
 func (m Model) startParallelSyncCmd() tea.Cmd {
+	if m.bgWG != nil {
+		m.bgWG.Add(1)
+	}
 	return func() tea.Msg {
+		if m.bgWG != nil {
+			defer m.bgWG.Done()
+		}
+
 		var wg sync.WaitGroup
 		concurrency := 4
 		sem := make(chan struct{}, concurrency)
@@ -470,6 +496,9 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 		for _, item := range m.Repos {
 			if item.IsArchived {
 				continue
+			}
+			if m.ctx.Err() != nil {
+				break
 			}
 
 			wg.Add(1)
@@ -479,7 +508,7 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				git.SyncRepository(r)
+				git.SyncRepository(m.ctx, r)
 			}(item)
 		}
 
@@ -514,6 +543,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 
 		case "q", "ctrl+c":
+			if m.cancel != nil {
+				m.cancel()
+			}
 			return m, tea.Quit
 
 		case "enter":
@@ -691,7 +723,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					go git.SyncRepository(item)
+					if m.bgWG != nil {
+						m.bgWG.Add(1)
+					}
+					go func(r *git.RepoItem) {
+						if m.bgWG != nil {
+							defer m.bgWG.Done()
+						}
+						git.SyncRepository(m.ctx, r)
+					}(item)
 					m.updateViewport()
 				}
 			}
@@ -869,7 +909,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case repoTickMsg:
 		return m, tea.Batch(
-			m.loadOrgReposCmd(),
+			m.loadOrgReposCmd(false),
 			repoTickCmd(),
 		)
 
@@ -970,7 +1010,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
 		})
 		m.TotalCount = len(m.Repos)
-		if len(m.Repos) > 0 {
+		if msg.autoSync && len(m.Repos) > 0 {
 			m.IsSyncing = true
 			m.updateViewport()
 			cmds = append(cmds, m.startParallelSyncCmd())
