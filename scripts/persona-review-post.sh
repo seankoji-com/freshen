@@ -195,9 +195,14 @@ echo "Validating comment positions against PR diff hunks..."
 
 HUNKS_FILE="${RUNNER_TEMP:-/tmp}/pr-${PR_NUMBER}-hunks.json"
 trap "rm -f ${HUNKS_FILE}" EXIT
-if ! gh api "repos/${OWNER_REPO}/pulls/${PR_NUMBER}/files" --paginate --slurp \
-  --jq '[.[][] | {filename, patch: (.patch // "")}]' \
-  >"$HUNKS_FILE" 2>/dev/null; then
+# NOTE: `--slurp` and `--jq` are mutually exclusive in `gh api` — combining
+# them makes gh exit 1 on every run, so this fetch used to ALWAYS fail, the
+# fallback wrote "[]", and every comment was demoted to the summary (never
+# inline). The correct form is per-page `--jq` producing an NDJSON stream,
+# slurped into an array by a separate jq. `set -o pipefail` (set above)
+# preserves the fail-to-`[]` fallback when gh itself fails.
+if ! gh api "repos/${OWNER_REPO}/pulls/${PR_NUMBER}/files" --paginate \
+  --jq '.[] | {filename, patch: (.patch // "")}' 2>/dev/null | jq -s '.' >"$HUNKS_FILE"; then
   echo "[]" >"$HUNKS_FILE"
   echo "::warning::Failed to fetch PR diff hunks from API — all inline comments may be demoted to summary"
 fi
