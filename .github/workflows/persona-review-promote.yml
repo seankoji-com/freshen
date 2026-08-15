@@ -14,28 +14,42 @@
 # review's `comments` array, so findings land on their diff lines. If GitHub
 # rejects an anchor (422 — line not in diff), the review retries body-only
 # with the findings folded back into the body.
+#
+# Escaped markers: the routine sometimes posts markers HTML-escaped
+# (`&lt;!-- persona-summary:… --&gt;`), which silently skipped the job and left
+# the comment attributed to the human account. The guard accepts either form
+# and the parse step normalizes both back to `<!--`/`-->` before anything else
+# reads the body. `edited` is a trigger too, so touching a comment that was
+# left behind by a failed promote retries it — a comment that promoted
+# successfully no longer exists to be edited.
 name: Persona review promote
 
 on:
   issue_comment:
-    types: [created]
+    types: [created, edited]
 
 jobs:
   promote:
     if: >-
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '<!-- persona-summary:') &&
+      (contains(github.event.comment.body, '<!-- persona-summary:') ||
+       contains(github.event.comment.body, '&lt;!-- persona-summary:')) &&
       contains(fromJSON('["OWNER","MEMBER"]'), github.event.comment.author_association)
     runs-on: [self-hosted, Linux]
     permissions:
       issues: write
     steps:
+      # Unescape only the marker delimiters, not every &lt; in the prose — a
+      # persona quoting HTML in its review keeps that text intact. The
+      # normalized body goes to a file so the later steps parse and re-post
+      # exactly what this step validated.
       - name: Parse persona and verdict
         id: parse
         env:
           BODY: ${{ github.event.comment.body }}
         run: |
-          id=$(printf '%s' "$BODY" | sed -n 's/.*<!-- persona-summary:\([a-z0-9-]*\) -->.*/\1/p' | head -1)
+          printf '%s' "$BODY" | sed -e 's/&lt;!--/<!--/g' -e 's/--&gt;/-->/g' > "$RUNNER_TEMP/persona-body.md"
+          id=$(sed -n 's/.*<!-- persona-summary:\([a-z0-9-]*\) -->.*/\1/p' "$RUNNER_TEMP/persona-body.md" | head -1)
           echo "id=$id" >> "$GITHUB_OUTPUT"
           verdict=COMMENT
           case "$BODY" in
@@ -91,15 +105,14 @@ jobs:
         if: steps.creds.outputs.skip != 'true'
         env:
           APP_TOKEN: ${{ steps.token.outputs.token }}
-          BODY: ${{ github.event.comment.body }}
           VERDICT: ${{ steps.parse.outputs.verdict }}
           PR: ${{ github.event.issue.number }}
         run: |
-          inline=$(printf '%s' "$BODY" | sed -n 's/.*<!-- persona-inline:\(.*\)-->.*/\1/p' | head -1)
+          inline=$(sed -n 's/.*<!-- persona-inline:\(.*\)-->.*/\1/p' "$RUNNER_TEMP/persona-body.md" | head -1)
           if [ -z "$inline" ] || ! printf '%s' "$inline" | jq -e 'type == "array"' >/dev/null 2>&1; then
             inline='[]'
           fi
-          clean_body=$(printf '%s' "$BODY" | sed 's/<!-- persona-inline:.*-->//')
+          clean_body=$(sed 's/<!-- persona-inline:.*-->//' "$RUNNER_TEMP/persona-body.md")
           payload=$(jq -n --arg body "$clean_body" --arg event "$VERDICT" --argjson comments "$inline" \
             '{body: $body, event: $event} + (if ($comments | length) > 0 then {comments: $comments} else {} end)')
           post() {
