@@ -5,7 +5,7 @@
 - **Go 1.26+** (module: `github.com/seankoji-com/freshen`)
 - Build: `go build -o freshen main.go`
 - Run tests: `go test ./...`
-- No build system beyond Go's native toolchain (no Makefile, no CI config in this repo)
+- No Makefile. CI/CD via GitHub Actions in .github/workflows/.
 
 ## Project organization
 
