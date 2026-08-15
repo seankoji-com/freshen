@@ -1,0 +1,29 @@
+# Persona review ping — fires the org-wide "Persona review panel" Claude Code
+# routine (https://claude.ai/code/routines/trig_01WczQbfsKih679HbRHN58BV) on PR
+# events. The routine sweeps idempotently (markers + head-SHA dedup), so extra
+# or overlapping fires are harmless; the routine's hourly cron remains the
+# catch-up safety net. Replaces the retired code-review-matrix.yml OpenCode
+# reviewer.
+name: Persona review ping
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  ping:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Fire persona review routine
+        env:
+          FIRE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_FIRE_TOKEN }}
+        run: |
+          curl -sS --fail-with-body -X POST \
+            "https://api.anthropic.com/v1/claude_code/routines/trig_01WczQbfsKih679HbRHN58BV/fire" \
+            -H "Authorization: Bearer ${FIRE_TOKEN}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: experimental-cc-routine-2026-04-01" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"Fired by pull_request ${{ github.event.action }} on ${{ github.repository }} PR #${{ github.event.pull_request.number }} (head ${{ github.event.pull_request.head.sha }}). Prioritize reviewing this PR; sweep others as normal.\"}"
