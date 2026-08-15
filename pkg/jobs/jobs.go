@@ -475,7 +475,10 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			var parsedJobsFromRun int
 			if err == nil {
 				var jobsResp GHJobsResponse
-				if err := json.Unmarshal(jobsOut, &jobsResp); err == nil && len(jobsResp.Jobs) > 0 {
+				if err := json.Unmarshal(jobsOut, &jobsResp); err != nil {
+					slog.Error("failed to parse jobs JSON", "runID", run.ID, "repo", repoName, "error", err)
+					fetchErrors = append(fetchErrors, fmt.Sprintf("jobs parse error for run %d", run.ID))
+				} else if len(jobsResp.Jobs) > 0 {
 					for _, j := range jobsResp.Jobs {
 						if seenJobIDs[j.ID] {
 							continue
