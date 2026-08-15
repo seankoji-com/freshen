@@ -43,4 +43,8 @@ go build -o freshen main.go    # produces a single binary
 go test ./...                  # runs all tests
 ```
 
-No Docker image, no CI/CD config in this repository.
+No Docker image. CI/CD via GitHub Actions in .github/workflows/.
+
+## Go version requirement
+
+Go 1.26+ (go.mod: 1.26.5).
