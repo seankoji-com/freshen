@@ -375,8 +375,15 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 
 func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 	return func() tea.Msg {
-		orgRepos, _ := git.FetchOrgRepos(m.TargetOrg)
-		orgCounts, _ := git.FetchOrgRepoCounts(m.TargetOrg)
+		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+		if err != nil {
+			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
+		}
+
+		orgCounts, countsErr := git.FetchOrgRepoCounts(m.TargetOrg)
+		if countsErr != nil {
+			slog.Debug("org repo counts fetch failed", "org", m.TargetOrg, "error", countsErr)
+		}
 
 		entries, err := git.ScanLocalDirectory(m.TargetDir)
 		if err != nil {
@@ -994,6 +1001,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case orgSyncedMsg:
 		m.IsOrgSyncing = false
+		if msg.err != nil {
+			slog.Error("org repos fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+			m.updateViewport()
+			return m, tea.Batch(cmds...)
+		}
 		if len(m.Repos) > 0 && len(msg.repos) > 0 {
 			oldRepoBranches := make(map[string]string)
 			for _, r := range m.Repos {
