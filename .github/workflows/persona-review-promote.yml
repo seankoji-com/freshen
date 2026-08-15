@@ -1,0 +1,109 @@
+# Persona review promote — turns the review routine's persona comments into
+# real PR reviews under each persona's own GitHub App identity (mm-*[bot]).
+#
+# The org-wide persona review routine (Claude Code cloud) cannot mint App
+# tokens from inside its sandbox, so it posts one marker-tagged issue comment
+# per persona. This workflow fires on each such comment, re-posts the body as
+# a PR review with the parsed verdict ("— ❌ REQUEST_CHANGES" → REQUEST_CHANGES,
+# "— ✅ APPROVE" → APPROVE, else COMMENT) under the persona's App, and deletes
+# the original comment. Reviews keep the same marker lines, so the routine's
+# dedup still sees them.
+name: Persona review promote
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  promote:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '<!-- persona-summary:') &&
+      contains(fromJSON('["OWNER","MEMBER"]'), github.event.comment.author_association)
+    runs-on: [self-hosted, Linux]
+    permissions:
+      issues: write
+    steps:
+      - name: Parse persona and verdict
+        id: parse
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          id=$(printf '%s' "$BODY" | sed -n 's/.*<!-- persona-summary:\([a-z0-9-]*\) -->.*/\1/p' | head -1)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          verdict=COMMENT
+          case "$BODY" in
+            *"❌ REQUEST_CHANGES"*) verdict=REQUEST_CHANGES ;;
+            *"✅ APPROVE"*) verdict=APPROVE ;;
+          esac
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+      # GitHub App private keys are multi-line PEMs — use the heredoc output
+      # form so the full key survives (a plain `echo key=value` breaks).
+      - name: Resolve persona App credentials
+        id: creds
+        env:
+          MM_SOLUTION_ARCHITECT_APP_ID: ${{ secrets.MM_SOLUTION_ARCHITECT_APP_ID }}
+          MM_SOLUTION_ARCHITECT_PRIVATE_KEY: ${{ secrets.MM_SOLUTION_ARCHITECT_PRIVATE_KEY }}
+          MM_GRUMPY_ENGINEER_APP_ID: ${{ secrets.MM_GRUMPY_ENGINEER_APP_ID }}
+          MM_GRUMPY_ENGINEER_PRIVATE_KEY: ${{ secrets.MM_GRUMPY_ENGINEER_PRIVATE_KEY }}
+          MM_SRE_APP_ID: ${{ secrets.MM_SRE_APP_ID }}
+          MM_SRE_PRIVATE_KEY: ${{ secrets.MM_SRE_PRIVATE_KEY }}
+          MM_UX_DESIGNER_APP_ID: ${{ secrets.MM_UX_DESIGNER_APP_ID }}
+          MM_UX_DESIGNER_PRIVATE_KEY: ${{ secrets.MM_UX_DESIGNER_PRIVATE_KEY }}
+          MM_BUSINESS_ANALYST_APP_ID: ${{ secrets.MM_BUSINESS_ANALYST_APP_ID }}
+          MM_BUSINESS_ANALYST_PRIVATE_KEY: ${{ secrets.MM_BUSINESS_ANALYST_PRIVATE_KEY }}
+        run: |
+          case "${{ steps.parse.outputs.id }}" in
+            solution-architect) app_id="$MM_SOLUTION_ARCHITECT_APP_ID" key="$MM_SOLUTION_ARCHITECT_PRIVATE_KEY" ;;
+            grumpy-engineer)    app_id="$MM_GRUMPY_ENGINEER_APP_ID"    key="$MM_GRUMPY_ENGINEER_PRIVATE_KEY" ;;
+            sre)                app_id="$MM_SRE_APP_ID"                key="$MM_SRE_PRIVATE_KEY" ;;
+            ux-designer)        app_id="$MM_UX_DESIGNER_APP_ID"        key="$MM_UX_DESIGNER_PRIVATE_KEY" ;;
+            business-analyst)   app_id="$MM_BUSINESS_ANALYST_APP_ID"   key="$MM_BUSINESS_ANALYST_PRIVATE_KEY" ;;
+            *)
+              echo "::notice::No App mapped for persona id '${{ steps.parse.outputs.id }}' — leaving comment as-is."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+          echo "app_id=$app_id" >> "$GITHUB_OUTPUT"
+          echo "private_key<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$key" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Mint persona App token
+        if: steps.creds.outputs.skip != 'true'
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ steps.creds.outputs.app_id }}
+          private-key: ${{ steps.creds.outputs.private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Post review as persona
+        if: steps.creds.outputs.skip != 'true'
+        env:
+          APP_TOKEN: ${{ steps.token.outputs.token }}
+          BODY: ${{ github.event.comment.body }}
+          VERDICT: ${{ steps.parse.outputs.verdict }}
+          PR: ${{ github.event.issue.number }}
+        run: |
+          jq -n --arg body "$BODY" --arg event "$VERDICT" '{body: $body, event: $event}' \
+            | curl -sS --fail-with-body -X POST \
+                -H "Authorization: Bearer ${APP_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/reviews" -d @-
+
+      # The workflow GITHUB_TOKEN cannot delete a user-authored comment
+      # ("Resource not accessible by integration"); the persona App's
+      # issues:write installation token can.
+      - name: Delete original comment
+        if: steps.creds.outputs.skip != 'true'
+        env:
+          APP_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          curl -sS --fail-with-body -X DELETE \
+            -H "Authorization: Bearer ${APP_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}"
