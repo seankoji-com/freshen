@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sync"
@@ -21,6 +22,31 @@ import (
 const shutdownWait = 5 * time.Second
 
 const Version = "1.0.0"
+
+// validatePrerequisites checks that freshen has access to required tools.
+// It exits with status 1 and writes to stderr if any critical prerequisite is missing.
+// The gh auth check is skipped if versionFlag is true (version printing needs nothing).
+func validatePrerequisites(versionFlag bool) {
+	// Check for git on PATH
+	_, err := exec.LookPath("git")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "freshen requires git on PATH.")
+		os.Exit(1)
+	}
+
+	// Skip gh check if printing version (it needs nothing)
+	if versionFlag {
+		return
+	}
+
+	// Check for authenticated GitHub CLI
+	cmd := exec.Command("gh", "auth", "status")
+	err = cmd.Run()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "freshen requires an authenticated GitHub CLI. Run: gh auth login.")
+		os.Exit(1)
+	}
+}
 
 func main() {
 	var (
@@ -41,6 +67,8 @@ func main() {
 	flag.BoolVar(&versionFlag, "v", false, "Show freshen version (shorthand)")
 
 	flag.Parse()
+
+	validatePrerequisites(versionFlag)
 
 	if versionFlag {
 		fmt.Printf("freshen v%s\n", Version)
