@@ -8,6 +8,12 @@
 # "— ✅ APPROVE" → APPROVE, else COMMENT) under the persona's App, and deletes
 # the original comment. Reviews keep the same marker lines, so the routine's
 # dedup still sees them.
+#
+# Inline anchors: a single-line block `<!-- persona-inline:[{"path":...,
+# "line":...,"side":"RIGHT","body":...}] -->` in the comment becomes the
+# review's `comments` array, so findings land on their diff lines. If GitHub
+# rejects an anchor (422 — line not in diff), the review retries body-only
+# with the findings folded back into the body.
 name: Persona review promote
 
 on:
@@ -89,11 +95,34 @@ jobs:
           VERDICT: ${{ steps.parse.outputs.verdict }}
           PR: ${{ github.event.issue.number }}
         run: |
-          jq -n --arg body "$BODY" --arg event "$VERDICT" '{body: $body, event: $event}' \
-            | curl -sS --fail-with-body -X POST \
-                -H "Authorization: Bearer ${APP_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/reviews" -d @-
+          inline=$(printf '%s' "$BODY" | sed -n 's/.*<!-- persona-inline:\(.*\)-->.*/\1/p' | head -1)
+          if [ -z "$inline" ] || ! printf '%s' "$inline" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            inline='[]'
+          fi
+          clean_body=$(printf '%s' "$BODY" | sed 's/<!-- persona-inline:.*-->//')
+          payload=$(jq -n --arg body "$clean_body" --arg event "$VERDICT" --argjson comments "$inline" \
+            '{body: $body, event: $event} + (if ($comments | length) > 0 then {comments: $comments} else {} end)')
+          post() {
+            curl -sS -w '\n%{http_code}' -X POST \
+              -H "Authorization: Bearer ${APP_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/reviews" -d "$1"
+          }
+          resp=$(post "$payload"); code=$(tail -1 <<<"$resp")
+          if [ "$code" != "200" ] && [ "$inline" != "[]" ]; then
+            msg=$(sed '$d' <<<"$resp" | jq -r '.message? // empty' 2>/dev/null)
+            echo "::warning::inline anchors rejected (HTTP $code $msg); retrying body-only."
+            fallback_body=$(jq -nr --arg body "$clean_body" --argjson c "$inline" \
+              '$body + "\n\n" + ([$c[] | "- `\(.path):\(.line)` — \(.body)"] | join("\n"))')
+            payload=$(jq -n --arg body "$fallback_body" --arg event "$VERDICT" '{body: $body, event: $event}')
+            resp=$(post "$payload"); code=$(tail -1 <<<"$resp")
+          fi
+          if [ "$code" != "200" ]; then
+            echo "review post failed: HTTP $code"
+            sed '$d' <<<"$resp" | head -5
+            exit 1
+          fi
+          sed '$d' <<<"$resp" | jq '{id, state, user: .user.login}'
 
       # The workflow GITHUB_TOKEN cannot delete a user-authored comment
       # ("Resource not accessible by integration"); the persona App's
