@@ -90,6 +90,16 @@ Launch the TUI interface:
 ./freshen -v
 ```
 
+### Logs
+
+In TUI mode nothing is printed to the terminal — stray writes corrupt the alternate screen — so diagnostics go to a file under the user cache dir: `~/Library/Caches/freshen/freshen.log` on macOS, `~/.cache/freshen/freshen.log` on Linux. Set `FRESHEN_LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`.
+
+```bash
+tail -f ~/Library/Caches/freshen/freshen.log
+```
+
+Batch mode (`-y`) leaves logging on stderr.
+
 ---
 
 ## 🛠️ Built With

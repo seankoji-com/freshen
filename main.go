@@ -4,10 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -97,6 +100,11 @@ func main() {
 	}
 
 	// Launch TUI Application
+	logFile := configureTUILogging()
+	if logFile != nil {
+		defer logFile.Close()
+	}
+
 	var bgWG sync.WaitGroup
 	p := tea.NewProgram(
 		tui.NewModel(targetDir, orgFlag, ctx, stop, &bgWG),
@@ -119,6 +127,44 @@ func main() {
 		fmt.Printf("Error running freshen TUI: %v\n", runErr)
 		os.Exit(1)
 	}
+}
+
+// logPath returns the file the TUI writes its slog output to.
+func logPath() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		dir = os.TempDir()
+	}
+	return filepath.Join(dir, "freshen", "freshen.log")
+}
+
+// configureTUILogging redirects slog away from stderr for the interactive run.
+//
+// The TUI owns the terminal's alternate screen. Anything else written to
+// stdout/stderr while it is running paints over the frame and desynchronises
+// Bubble Tea's line-diffing renderer, which then repaints rows in the wrong
+// place — the duplicated repo rows and stacked panel headers. Logs go to a file
+// instead; set FRESHEN_LOG_LEVEL (debug|info|warn|error) to change verbosity.
+//
+// Returns the open log file so the caller can close it, or nil when logging
+// was discarded.
+func configureTUILogging() *os.File {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(strings.ToLower(os.Getenv("FRESHEN_LOG_LEVEL")))); err != nil {
+		level = slog.LevelInfo
+	}
+
+	path := logPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
+			return f
+		}
+	}
+
+	// No writable log file — discard rather than corrupt the display.
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return nil
 }
 
 // waitForBackgroundWork blocks until all tracked background git operations
@@ -185,7 +231,7 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
 			Logs:       make([]string, 0),
 		}
 
-		git.SyncRepository(ctx, item)
+		git.SyncRepository(ctx, item, nil)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)

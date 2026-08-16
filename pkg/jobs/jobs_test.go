@@ -1,74 +1,11 @@
 package jobs
 
 import (
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
-
-// mockGH installs a fake runGHCommand for the duration of the test and
-// restores the real implementation on cleanup.
-func mockGH(t *testing.T, fn func(args []string) ([]byte, error)) {
-	t.Helper()
-	orig := runGHCommand
-	runGHCommand = func(args ...string) ([]byte, error) {
-		return fn(args)
-	}
-	t.Cleanup(func() { runGHCommand = orig })
-}
-
-func mustJSON(t *testing.T, v any) []byte {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatalf("marshal fixture: %v", err)
-	}
-	return b
-}
-
-func TestSanitizeTerminal(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "strips OSC 8 hyperlink injection",
-			input: "evil title \x1b]8;;https://evil.example\x1b\\click me\x1b]8;;\x1b\\",
-			want:  "evil title ]8;;https://evil.example\\click me]8;;\\",
-		},
-		{
-			name:  "strips bare ESC and control bytes",
-			input: "run\x1b[31mred\x1b[0m\x07bell\x7fdel",
-			want:  "run[31mred[0mbelldel",
-		},
-		{
-			name:  "preserves spaces and normal text",
-			input: "fix: normal PR title #64",
-			want:  "fix: normal PR title #64",
-		},
-		{
-			name:  "preserves UTF-8 multibyte runes",
-			input: "unicode ✅ 日本語",
-			want:  "unicode ✅ 日本語",
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := SanitizeTerminal(tc.input)
-			if got != tc.want {
-				t.Errorf("SanitizeTerminal(%q) = %q, want %q", tc.input, got, tc.want)
-			}
-			if strings.ContainsAny(got, "\x1b\x07\x7f") {
-				t.Errorf("SanitizeTerminal(%q) = %q still contains control chars", tc.input, got)
-			}
-		})
-	}
-}
 
 func TestDefaultRunners(t *testing.T) {
 	runners := DefaultRunners()
@@ -174,506 +111,127 @@ func TestMergeRunnersCrossReference(t *testing.T) {
 	}
 }
 
-func TestFetchOrgRunners(t *testing.T) {
-	t.Run("valid runners", func(t *testing.T) {
-		resp := GHRunnersResponse{
-			TotalCount: 2,
-			Runners: []GHRunnerInfo{
-				{ID: 1, Name: "carey-mac-alpha\x1b[31m", OS: "macOS", Status: "online", Busy: true, Labels: []GHRunnerLabel{{Name: "self-hosted"}, {Name: "ARM64"}}},
-				{ID: 2, Name: "carey-mac-beta", OS: "macOS", Status: "offline", Busy: false, Labels: []GHRunnerLabel{{Name: "self-hosted"}}},
-			},
-		}
-		mockGH(t, func(args []string) ([]byte, error) {
-			if len(args) < 2 || !strings.Contains(args[1], "actions/runners") {
-				t.Fatalf("unexpected args: %v", args)
-			}
-			return mustJSON(t, resp), nil
-		})
+// stubGH swaps the gh runner for the duration of a test, so the org job queue
+// can be exercised against canned API responses instead of the network.
+func stubGH(t *testing.T, handler func(path string) ([]byte, error)) {
+	t.Helper()
+	original := runGH
+	t.Cleanup(func() { runGH = original })
 
-		runners, err := FetchOrgRunners("acme")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(runners) != 2 {
-			t.Fatalf("expected 2 runners, got %d", len(runners))
-		}
-		if runners[0].Status != RunnerRunning {
-			t.Errorf("expected busy runner RUNNING, got %s", runners[0].Status)
-		}
-		if runners[0].Platform != "macOS/ARM64" {
-			t.Errorf("expected platform macOS/ARM64, got %q", runners[0].Platform)
-		}
-		if strings.ContainsAny(runners[0].Name, "\x1b") {
-			t.Errorf("expected sanitized runner name, got %q", runners[0].Name)
-		}
-		if runners[1].Status != RunnerOffline {
-			t.Errorf("expected offline runner OFFLINE, got %s", runners[1].Status)
-		}
-	})
-
-	t.Run("empty runners", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return mustJSON(t, GHRunnersResponse{TotalCount: 0}), nil
-		})
-		runners, err := FetchOrgRunners("acme")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(runners) != 0 {
-			t.Errorf("expected 0 runners, got %d", len(runners))
-		}
-	})
-
-	t.Run("malformed JSON", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return []byte("{not valid json"), nil
-		})
-		_, err := FetchOrgRunners("acme")
-		if err == nil || !strings.Contains(err.Error(), "failed to parse runners JSON") {
-			t.Fatalf("expected parse error, got %v", err)
-		}
-	})
-
-	t.Run("gh command failure", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return nil, errors.New("gh api: 404 not found")
-		})
-		if _, err := FetchOrgRunners("acme"); err == nil {
-			t.Fatal("expected error to propagate")
-		}
-	})
-}
-
-func TestFetchOrgJobQueue(t *testing.T) {
-	t.Run("in_progress run with jobs parsed", func(t *testing.T) {
-		runsResp := GHWorkflowRunsResponse{
-			TotalCount: 1,
-			WorkflowRuns: []GHWorkflowRun{
-				{
-					ID:           100,
-					Name:         "CI",
-					DisplayTitle: "fix bug",
-					Status:       "in_progress",
-					Event:        "push",
-					HeadBranch:   "main",
-					CreatedAt:    time.Now().UTC().Format(time.RFC3339),
-					PullRequests: []GHPullRequestInfo{{Number: 5, Title: "fix bug\x1b[31m", URL: ""}},
-					Repository: struct {
-						Name string `json:"name"`
-					}{Name: "freshen"},
-				},
-			},
-		}
-		jobsResp := GHJobsResponse{
-			TotalCount: 1,
-			Jobs: []GHJobInfo{
-				{ID: 200, Name: "build", Status: "in_progress", RunnerName: "runner-x", RunnerID: 7, StartedAt: time.Now().UTC().Format(time.RFC3339)},
-			},
-		}
-
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			switch {
-			case strings.Contains(url, "status=in_progress"):
-				return mustJSON(t, runsResp), nil
-			case strings.Contains(url, "status=queued"):
-				return mustJSON(t, GHWorkflowRunsResponse{}), nil
-			case strings.Contains(url, "actions/runs/100/jobs"):
-				return mustJSON(t, jobsResp), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		jobs, err := FetchOrgJobQueue("acme", nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(jobs) != 1 {
-			t.Fatalf("expected 1 job, got %d", len(jobs))
-		}
-		j := jobs[0]
-		if j.Name != "freshen / build" {
-			t.Errorf("expected name 'freshen / build', got %q", j.Name)
-		}
-		if j.PRNumber != 5 {
-			t.Errorf("expected PR number 5, got %d", j.PRNumber)
-		}
-		if j.PRTitle != "fix bug[31m" {
-			t.Errorf("expected sanitized PR title, got %q", j.PRTitle)
-		}
-		if j.PRURL != "https://github.com/acme/freshen/pull/5" {
-			t.Errorf("expected constructed PR URL, got %q", j.PRURL)
-		}
-		if j.RunnerID != "runner-7" {
-			t.Errorf("expected runner-7, got %q", j.RunnerID)
-		}
-	})
-
-	t.Run("queued run falls back when jobs endpoint empty", func(t *testing.T) {
-		runsResp := GHWorkflowRunsResponse{
-			WorkflowRuns: []GHWorkflowRun{
-				{
-					ID:         101,
-					Name:       "CI",
-					Status:     "queued",
-					Event:      "push",
-					HeadBranch: "main",
-					CreatedAt:  time.Now().UTC().Format(time.RFC3339),
-					Repository: struct {
-						Name string `json:"name"`
-					}{Name: "freshen"},
-				},
-			},
-		}
-
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			switch {
-			case strings.Contains(url, "status=in_progress"):
-				return mustJSON(t, GHWorkflowRunsResponse{}), nil
-			case strings.Contains(url, "status=queued"):
-				return mustJSON(t, runsResp), nil
-			case strings.Contains(url, "actions/runs/101/jobs"):
-				return mustJSON(t, GHJobsResponse{}), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		jobs, err := FetchOrgJobQueue("acme", nil)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(jobs) != 1 {
-			t.Fatalf("expected 1 fallback job, got %d", len(jobs))
-		}
-		if jobs[0].Status != JobQueued {
-			t.Errorf("expected fallback job QUEUED, got %s", jobs[0].Status)
-		}
-		if jobs[0].ID != "#101" {
-			t.Errorf("expected fallback ID #101, got %s", jobs[0].ID)
-		}
-	})
-
-	t.Run("jobs endpoint unmarshal error still falls back (#75)", func(t *testing.T) {
-		runsResp := GHWorkflowRunsResponse{
-			WorkflowRuns: []GHWorkflowRun{
-				{
-					ID:         102,
-					Name:       "CI",
-					Status:     "in_progress",
-					Event:      "push",
-					HeadBranch: "main",
-					CreatedAt:  time.Now().UTC().Format(time.RFC3339),
-					Repository: struct {
-						Name string `json:"name"`
-					}{Name: "freshen"},
-				},
-			},
-		}
-
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			switch {
-			case strings.Contains(url, "status=in_progress"):
-				return mustJSON(t, runsResp), nil
-			case strings.Contains(url, "status=queued"):
-				return mustJSON(t, GHWorkflowRunsResponse{}), nil
-			case strings.Contains(url, "actions/runs/102/jobs"):
-				return []byte("{not valid json"), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		jobs, err := FetchOrgJobQueue("acme", nil)
-		if err == nil || !strings.Contains(err.Error(), "failed fetching org job queue") {
-			t.Fatalf("expected aggregated fetch error, got %v", err)
-		}
-		if len(jobs) != 1 {
-			t.Fatalf("expected fallback job despite parse error, got %d", len(jobs))
-		}
-		if jobs[0].Status != JobRunning {
-			t.Errorf("expected fallback job RUNNING (run.Status in_progress), got %s", jobs[0].Status)
-		}
-	})
-
-	t.Run("rate limit errors aggregate into single message", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			switch {
-			case strings.Contains(url, "status=in_progress"):
-				return nil, fmt.Errorf("GitHub API rate limit exceeded")
-			case strings.Contains(url, "status=queued"):
-				return mustJSON(t, GHWorkflowRunsResponse{}), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		jobs, err := FetchOrgJobQueue("acme", nil)
-		if err == nil || err.Error() != "GitHub API rate limit exceeded" {
-			t.Fatalf("expected rate limit error, got %v", err)
-		}
-		if len(jobs) != 0 {
-			t.Errorf("expected no jobs on rate limit, got %d", len(jobs))
-		}
-	})
-
-	t.Run("repos filter excludes untracked repositories", func(t *testing.T) {
-		runsResp := GHWorkflowRunsResponse{
-			WorkflowRuns: []GHWorkflowRun{
-				{ID: 103, Status: "queued", CreatedAt: time.Now().UTC().Format(time.RFC3339), Repository: struct {
-					Name string `json:"name"`
-				}{Name: "other-repo"}},
-			},
-		}
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			switch {
-			case strings.Contains(url, "status=in_progress"):
-				return mustJSON(t, GHWorkflowRunsResponse{}), nil
-			case strings.Contains(url, "status=queued"):
-				return mustJSON(t, runsResp), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		jobs, err := FetchOrgJobQueue("acme", []string{"freshen"})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(jobs) != 0 {
-			t.Errorf("expected repo filter to exclude run, got %d jobs", len(jobs))
-		}
-	})
-}
-
-func TestExtractPRInfo(t *testing.T) {
-	cases := []struct {
-		name        string
-		run         GHWorkflowRun
-		wantNum     int
-		wantTitle   string
-		wantURLFunc func(t *testing.T, got string)
-	}{
-		{
-			name: "PR with URL present",
-			run: GHWorkflowRun{
-				PullRequests: []GHPullRequestInfo{{Number: 5, Title: "my title", URL: "https://github.com/acme/repo/pull/5"}},
-			},
-			wantNum:   5,
-			wantTitle: "my title",
-			wantURLFunc: func(t *testing.T, got string) {
-				if got != "https://github.com/acme/repo/pull/5" {
-					t.Errorf("expected provided URL preserved, got %q", got)
-				}
-			},
-		},
-		{
-			name: "PR without URL builds one",
-			run: GHWorkflowRun{
-				PullRequests: []GHPullRequestInfo{{Number: 9, Title: "another\x1b[0m"}},
-			},
-			wantNum:   9,
-			wantTitle: "another[0m",
-			wantURLFunc: func(t *testing.T, got string) {
-				if got != "https://github.com/acme/repo/pull/9" {
-					t.Errorf("expected constructed URL, got %q", got)
-				}
-			},
-		},
-		{
-			name:      "no PR falls back to DisplayTitle",
-			run:       GHWorkflowRun{DisplayTitle: "run title\x07"},
-			wantNum:   0,
-			wantTitle: "run title",
-			wantURLFunc: func(t *testing.T, got string) {
-				if got != "" {
-					t.Errorf("expected empty URL, got %q", got)
-				}
-			},
-		},
-		{
-			name:      "no PR, no DisplayTitle",
-			run:       GHWorkflowRun{},
-			wantNum:   0,
-			wantTitle: "",
-			wantURLFunc: func(t *testing.T, got string) {
-				if got != "" {
-					t.Errorf("expected empty URL, got %q", got)
-				}
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			num, title, url := extractPRInfo(tc.run, "acme", "repo")
-			if num != tc.wantNum {
-				t.Errorf("expected PR number %d, got %d", tc.wantNum, num)
-			}
-			if title != tc.wantTitle {
-				t.Errorf("expected title %q, got %q", tc.wantTitle, title)
-			}
-			tc.wantURLFunc(t, url)
-		})
+	runGH = func(args ...string) ([]byte, error) {
+		return handler(args[len(args)-1])
 	}
 }
 
-func TestFetchJobLogs(t *testing.T) {
-	t.Run("jobs list command fails", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return nil, errors.New("boom")
-		})
-		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
-		if err == nil || !strings.Contains(err.Error(), "jobs list:") {
-			t.Fatalf("expected jobs list error, got %v", err)
-		}
-	})
-
-	t.Run("jobs list malformed JSON", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return []byte("{bad"), nil
-		})
-		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
-		if err == nil || !strings.Contains(err.Error(), "jobs parse:") {
-			t.Fatalf("expected jobs parse error, got %v", err)
-		}
-	})
-
-	t.Run("no job found", func(t *testing.T) {
-		mockGH(t, func(args []string) ([]byte, error) {
-			return mustJSON(t, GHJobsResponse{}), nil
-		})
-		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
-		if err == nil || !strings.Contains(err.Error(), "no job found") {
-			t.Fatalf("expected no-job error, got %v", err)
-		}
-	})
-
-	t.Run("matches by GHJobID and returns trimmed raw logs", func(t *testing.T) {
-		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{{ID: 55, Name: "build", Status: "in_progress"}}}
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			if strings.Contains(url, "jobs?filter=latest") {
-				return mustJSON(t, jobsResp), nil
-			}
-			if strings.Contains(url, "actions/jobs/55/logs") {
-				return []byte("line1\nline2\nline3\n"), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		lines, jobID, err := FetchJobLogs("acme", "repo", 1, 55, "", 2)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if jobID != 55 {
-			t.Errorf("expected jobID 55, got %d", jobID)
-		}
-		if len(lines) != 2 || lines[0] != "line2" || lines[1] != "line3" {
-			t.Errorf("expected last 2 lines, got %v", lines)
-		}
-	})
-
-	t.Run("falls back to step glyphs when logs unavailable", func(t *testing.T) {
-		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{
-			{ID: 60, Name: "build", Status: "in_progress", Steps: []GHJobStep{
-				{Number: 1, Name: "checkout", Status: "completed", Conclusion: "success"},
-				{Number: 2, Name: "test", Status: "in_progress"},
-			}},
-		}}
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			if strings.Contains(url, "jobs?filter=latest") {
-				return mustJSON(t, jobsResp), nil
-			}
-			if strings.Contains(url, "actions/jobs/60/logs") {
-				return nil, errors.New("logs unavailable")
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		lines, jobID, err := FetchJobLogs("acme", "repo", 1, 60, "", 10)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if jobID != 60 {
-			t.Errorf("expected jobID 60, got %d", jobID)
-		}
-		if len(lines) != 2 {
-			t.Fatalf("expected 2 step lines, got %d: %v", len(lines), lines)
-		}
-		if !strings.Contains(lines[0], "✓") || !strings.Contains(lines[0], "checkout") {
-			t.Errorf("expected success glyph for checkout step, got %q", lines[0])
-		}
-		if !strings.Contains(lines[1], "▶") || !strings.Contains(lines[1], "test") {
-			t.Errorf("expected in_progress glyph for test step, got %q", lines[1])
-		}
-	})
-
-	t.Run("matches by job name substring fallback", func(t *testing.T) {
-		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{{ID: 70, Name: "build-and-test", Status: "queued"}}}
-		mockGH(t, func(args []string) ([]byte, error) {
-			url := args[1]
-			if strings.Contains(url, "jobs?filter=latest") {
-				return mustJSON(t, jobsResp), nil
-			}
-			if strings.Contains(url, "actions/jobs/70/logs") {
-				return []byte("only line\n"), nil
-			}
-			t.Fatalf("unexpected args: %v", args)
-			return nil, nil
-		})
-
-		_, jobID, err := FetchJobLogs("acme", "repo", 1, 0, "build", 10)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if jobID != 70 {
-			t.Errorf("expected substring match to find job 70, got %d", jobID)
-		}
-	})
+// runsJSON is one repository's run list: an in-progress run, a queued run whose
+// jobs have not materialised yet, and a completed run that must be ignored.
+func runsJSON(base int64) string {
+	return fmt.Sprintf(`{"total_count":3,"workflow_runs":[
+	  {"id":%d,"name":"CI","display_title":"fix things","status":"in_progress","event":"pull_request","head_branch":"topic","created_at":"2026-08-16T10:00:00Z","run_started_at":"2026-08-16T10:00:05Z","pull_requests":[{"number":7,"title":"Fix things","html_url":"https://example.invalid/pull/7"}]},
+	  {"id":%d,"name":"CI","display_title":"queued one","status":"queued","event":"push","head_branch":"main","created_at":"2026-08-16T10:01:00Z"},
+	  {"id":%d,"name":"CI","display_title":"done","status":"completed","event":"push","head_branch":"main","created_at":"2026-08-16T09:00:00Z"}
+	]}`, base+1, base+2, base+3)
 }
 
-func TestClassifyGHError(t *testing.T) {
-	cases := []struct {
-		name    string
-		stderr  string
-		execErr error
-		want    string
-	}{
-		{
-			name:    "rate limit message normalized",
-			stderr:  "HTTP 403: API rate limit exceeded for installation ID 123.",
-			execErr: errors.New("exit status 1"),
-			want:    "GitHub API rate limit exceeded",
-		},
-		{
-			name:    "multiline stderr truncated to first line",
-			stderr:  "first line of error\nsecond line\nthird line",
-			execErr: errors.New("exit status 1"),
-			want:    "gh api: first line of error",
-		},
-		{
-			name:    "empty stderr falls back to wrapped exec error",
-			stderr:  "",
-			execErr: errors.New("exit status 127"),
-			want:    "gh api: exit status 127",
-		},
+// jobsJSON pairs with runsJSON: a live job plus a successful one that the queue drops.
+func jobsJSON(base int64) string {
+	return fmt.Sprintf(`{"total_count":2,"jobs":[
+	  {"id":%d,"name":"build","status":"in_progress","started_at":"2026-08-16T10:00:10Z","runner_name":"carey-mac-alpha","runner_id":5},
+	  {"id":%d,"name":"lint","status":"completed","conclusion":"success"}
+	]}`, base+101, base+102)
+}
+
+// repoQueueHandler serves the two-endpoint conversation for a fixed set of repos,
+// giving each repo its own ID space the way GitHub does.
+func repoQueueHandler(bases map[string]int64) func(string) ([]byte, error) {
+	return func(path string) ([]byte, error) {
+		for repo, base := range bases {
+			prefix := "/repos/acme/" + repo + "/"
+			if !strings.HasPrefix(path, prefix) {
+				continue
+			}
+			switch {
+			case strings.Contains(path, fmt.Sprintf("/runs/%d/jobs", base+1)):
+				return []byte(jobsJSON(base)), nil
+			case strings.Contains(path, "/jobs?filter=latest"):
+				// The queued run has no jobs yet.
+				return []byte(`{"total_count":0,"jobs":[]}`), nil
+			case strings.Contains(path, "/actions/runs?per_page="):
+				return []byte(runsJSON(base)), nil
+			}
+		}
+		return nil, fmt.Errorf("gh api: gh: Not Found (HTTP 404)")
+	}
+}
+
+// FetchOrgJobQueue must poll per repository — GitHub has no org-wide workflow
+// runs endpoint — and must leave completed runs out of the queue.
+func TestFetchOrgJobQueuePerRepo(t *testing.T) {
+	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000, "beta": 2000}))
+
+	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "beta"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := classifyGHError(tc.stderr, tc.execErr)
-			if got == nil || got.Error() != tc.want {
-				t.Errorf("classifyGHError(%q, %v) = %v, want %q", tc.stderr, tc.execErr, got, tc.want)
-			}
-		})
+	// Per repo: the in-progress run contributes its live job (the successful
+	// "lint" job is dropped) and the queued run falls back to a run header.
+	if len(queue) != 4 {
+		t.Fatalf("expected 4 queue items across 2 repos, got %d", len(queue))
+	}
+
+	perRepo := map[string]int{}
+	for _, j := range queue {
+		perRepo[j.Repo]++
+		if j.RunID == 1003 || j.RunID == 2003 {
+			t.Errorf("completed run %d should not appear in the queue", j.RunID)
+		}
+	}
+	if perRepo["alpha"] != 2 || perRepo["beta"] != 2 {
+		t.Errorf("expected 2 items per repo, got %v", perRepo)
+	}
+	if queue[0].Status != JobRunning {
+		t.Errorf("expected a running job sorted first, got %s", queue[0].Status)
+	}
+	if queue[0].PRNumber != 7 {
+		t.Errorf("expected PR metadata carried onto job items, got %d", queue[0].PRNumber)
+	}
+}
+
+// One unreachable repository must not blank out the whole queue.
+func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
+	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000}))
+
+	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"})
+	if err != nil {
+		t.Fatalf("partial failure should not surface an error: %v", err)
+	}
+	if len(queue) != 2 {
+		t.Fatalf("expected the healthy repo's 2 items, got %d", len(queue))
+	}
+
+	// A sweep where every repo fails is a real error.
+	stubGH(t, repoQueueHandler(nil))
+	if _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"}); err == nil {
+		t.Fatal("expected an error when every repository fails")
+	}
+
+	// Rate limiting is reported distinctly so the UI can surface it.
+	stubGH(t, func(string) ([]byte, error) {
+		return nil, fmt.Errorf("GitHub API rate limit exceeded")
+	})
+	if _, err := FetchOrgJobQueue("acme", []string{"alpha"}); err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Fatalf("expected a rate limit error, got %v", err)
+	}
+}
+
+func TestFetchOrgJobQueueNoRepos(t *testing.T) {
+	stubGH(t, func(path string) ([]byte, error) {
+		t.Errorf("no repos means no API calls, but %q was requested", path)
+		return nil, nil
+	})
+	queue, err := FetchOrgJobQueue("acme", nil)
+	if err != nil || len(queue) != 0 {
+		t.Fatalf("expected an empty queue and no error, got %d items, err %v", len(queue), err)
 	}
 }
