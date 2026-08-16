@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -544,6 +545,9 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 }
 
 func copyToClipboard(text string) error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("clipboard not supported on %s", runtime.GOOS)
+	}
 	cmd := exec.Command("pbcopy")
 	cmd.Stdin = strings.NewReader(text)
 	return cmd.Run()
@@ -770,17 +774,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					targetCopy = item.Path
 				}
 
-				if err := copyToClipboard(targetCopy); err == nil {
+				if err := copyToClipboard(targetCopy); err != nil {
+					m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+				} else {
 					m.setToast(fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy), 1)
 				}
 			} else if m.ActiveFocus == FocusRunners && len(m.Runners) > 0 && m.SelectedRunnerIndex < len(m.Runners) {
 				r := m.Runners[m.SelectedRunnerIndex]
-				if err := copyToClipboard(r.ID); err == nil {
+				if err := copyToClipboard(r.ID); err != nil {
+					m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+				} else {
 					m.setToast(fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID), 1)
 				}
 			} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 				j := m.JobQueue[m.SelectedJobIndex]
-				if err := copyToClipboard(j.ID); err == nil {
+				if err := copyToClipboard(j.ID); err != nil {
+					m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+				} else {
 					m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
 				}
 			}
