@@ -98,3 +98,9 @@ Launch the TUI interface:
 - **TUI Framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 - **Styling & Widgets**: [Lip Gloss](https://github.com/charmbracelet/lipgloss) & [Bubbles](https://github.com/charmbracelet/bubbles)
 - **Integrations**: `git` & GitHub CLI (`gh`)
+
+---
+
+## 📝 Contributing
+
+Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) for details on setting up your development environment, build & test workflow, commit conventions, and debugging tips.
