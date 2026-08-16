@@ -170,6 +170,10 @@ type GHJobsResponse struct {
 // ghCommandTimeout is the maximum duration for any gh CLI invocation.
 const ghCommandTimeout = 30 * time.Second
 
+// runGH is the indirection point for every gh invocation, so tests can supply
+// canned API responses instead of shelling out.
+var runGH = runGHCommand
+
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
 // Returns the stdout bytes. On failure, the error includes stderr content.
 // It is a package variable (rather than a plain func) so tests can substitute
@@ -358,7 +362,7 @@ func jobStatusFromGH(status, conclusion string) JobStatus {
 
 // FetchOrgRunners queries GitHub API for all registered organization runners.
 func FetchOrgRunners(org string) ([]*RunnerItem, error) {
-	out, err := runGHCommand("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=100", org))
+	out, err := runGH("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=100", org))
 	if err != nil {
 		return nil, err
 	}
@@ -453,7 +457,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 
 	statuses := []string{"in_progress", "queued"}
 	for _, status := range statuses {
-		out, err := runGHCommand(
+		out, err := runGH(
 			"api",
 			fmt.Sprintf("/orgs/%s/actions/runs?status=%s&per_page=50", org, status),
 		)
@@ -496,7 +500,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 
 			seenRunIDs[run.ID] = true
 
-			jobsOut, err := runGHCommand(
+			jobsOut, err := runGH(
 				"api",
 				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repoName, run.ID),
 			)
@@ -564,7 +568,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 // FetchJobLogs fetches the step log output for a specific running workflow job.
 func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
 	// Step 1: get jobs list for this run to find the target job ID
-	out, err := runGHCommand(
+	out, err := runGH(
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, runID),
 	)
@@ -634,7 +638,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	}
 
 	// Step 2: fetch raw log text
-	logOut, err := runGHCommand(
+	logOut, err := runGH(
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID),
 	)
