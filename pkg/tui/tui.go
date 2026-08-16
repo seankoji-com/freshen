@@ -2346,7 +2346,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
 	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [dd] Del Archived  [X] Prune  [c] Copy  [q] Quit"
+	footerText := "[w/1/2/3/⇥/⇧⇥] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [dd] Del Archived  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		msgText := m.ToastMsg
 		if lipgloss.Width(msgText) > m.Width {
