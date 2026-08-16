@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -400,7 +401,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 		for _, ghRepo := range orgRepos {
 			localDir := git.GetLocalDirName(ghRepo.Name)
-			localPath := fmt.Sprintf("%s/%s", m.TargetDir, localDir)
+			localPath := filepath.Join(m.TargetDir, localDir)
 
 			localExists := false
 			if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
@@ -442,7 +443,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 		for _, name := range entries {
 			if _, exists := repoMap[name]; !exists {
-				path := fmt.Sprintf("%s/%s", m.TargetDir, name)
+				path := filepath.Join(m.TargetDir, name)
 				if git.IsGitRepo(path) {
 					item := &git.RepoItem{
 						Name:          name,
