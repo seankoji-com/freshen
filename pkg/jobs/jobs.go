@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -151,6 +152,10 @@ type GHJobsResponse struct {
 
 // ghCommandTimeout is the maximum duration for any gh CLI invocation.
 const ghCommandTimeout = 30 * time.Second
+
+// runGH is the indirection point for every gh invocation, so tests can supply
+// canned API responses instead of shelling out.
+var runGH = runGHCommand
 
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
 // Returns the stdout bytes. On failure, the error includes stderr content.
@@ -414,119 +419,161 @@ func MergeRunners(newRunners []*RunnerItem, existing []*RunnerItem, jobQueue []*
 	return newRunners
 }
 
-// FetchOrgJobQueue polls GitHub API for active workflow runs across the organization using org-level endpoints.
-// This executes 2 API calls total (in_progress + queued) rather than N calls per repository, minimizing rate limits.
+// jobQueueConcurrency bounds how many repositories are polled in parallel.
+const jobQueueConcurrency = 6
+
+// jobQueueRunsPerRepo is how many recent runs are inspected per repository.
+// Runs come back newest-first and active ones are always the newest, so this
+// window comfortably covers anything still queued or in progress.
+const jobQueueRunsPerRepo = 30
+
+// activeRunStatuses are the workflow-run statuses that belong in the queue view.
+var activeRunStatuses = map[string]bool{
+	"queued":          true,
+	"in_progress":     true,
+	"waiting":         true,
+	"pending":         true,
+	"requested":       true,
+	"action_required": true,
+}
+
+// repoQueueResult is one repository's contribution to the org job queue.
+type repoQueueResult struct {
+	jobs []*JobItem
+	err  error
+}
+
+// FetchOrgJobQueue polls GitHub for active workflow runs across the tracked repositories.
+//
+// GitHub exposes no org-wide "list workflow runs" endpoint (/orgs/{org}/actions/runs
+// is a 404), so each repository is polled individually. Repos are fetched
+// concurrently, and a single unfiltered request per repo covers every active status
+// at once rather than one request per (repo, status) pair.
+//
+// A repository that fails on its own is logged and skipped; an error is only
+// returned when the whole sweep fails or GitHub reports a rate limit, so one
+// renamed or inaccessible repo cannot blank out the queue.
 func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+
+	results := make([]repoQueueResult, len(repos))
+	sem := make(chan struct{}, jobQueueConcurrency)
+	var wg sync.WaitGroup
+
+	for i, repo := range repos {
+		wg.Add(1)
+		go func(idx int, repoName string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			repoJobs, err := fetchRepoJobQueue(org, repoName)
+			results[idx] = repoQueueResult{jobs: repoJobs, err: err}
+		}(i, repo)
+	}
+	wg.Wait()
+
+	// Merge in the caller's repo order so the queue stays deterministic across polls.
 	var allJobs []*JobItem
-	seenRunIDs := make(map[int64]bool)
-	seenJobIDs := make(map[int64]bool)
-	var fetchErrors []string
+	seenJobIDs := make(map[string]bool)
+	var failures []error
+	rateLimited := false
 
-	statuses := []string{"in_progress", "queued"}
-	for _, status := range statuses {
-		out, err := runGHCommand(
-			"api",
-			fmt.Sprintf("/orgs/%s/actions/runs?status=%s&per_page=50", org, status),
-		)
-		if err != nil {
-			slog.Error("gh api org workflow runs failed", "org", org, "status", status, "error", err)
-			fetchErrors = append(fetchErrors, fmt.Sprintf("status=%s: %v", status, err))
+	for i, res := range results {
+		if res.err != nil {
+			slog.Warn("workflow runs fetch failed for repo", "org", org, "repo", repos[i], "error", res.err)
+			failures = append(failures, res.err)
+			if strings.Contains(res.err.Error(), "rate limit") {
+				rateLimited = true
+			}
 			continue
 		}
-
-		var resp GHWorkflowRunsResponse
-		if err := json.Unmarshal(out, &resp); err != nil {
-			slog.Error("failed to parse org workflow runs JSON", "org", org, "status", status, "error", err)
-			fetchErrors = append(fetchErrors, fmt.Sprintf("status=%s parse error", status))
-			continue
-		}
-
-		for _, run := range resp.WorkflowRuns {
-			if seenRunIDs[run.ID] {
+		for _, j := range res.jobs {
+			if seenJobIDs[j.ID] {
 				continue
 			}
-
-			repoName := run.Repository.Name
-			if repoName == "" {
-				repoName = "unknown"
-			}
-
-			// Filter to tracked repositories if repos filter is provided
-			if len(repos) > 0 {
-				matched := false
-				for _, r := range repos {
-					if strings.EqualFold(r, repoName) {
-						matched = true
-						break
-					}
-				}
-				if !matched {
-					continue
-				}
-			}
-
-			seenRunIDs[run.ID] = true
-
-			jobsOut, err := runGHCommand(
-				"api",
-				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repoName, run.ID),
-			)
-
-			var parsedJobsFromRun int
-			if err == nil {
-				var jobsResp GHJobsResponse
-				if err := json.Unmarshal(jobsOut, &jobsResp); err == nil && len(jobsResp.Jobs) > 0 {
-					for _, j := range jobsResp.Jobs {
-						if seenJobIDs[j.ID] {
-							continue
-						}
-						seenJobIDs[j.ID] = true
-
-						// Filter out completed success/skipped jobs
-						if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {
-							continue
-						}
-
-						jobItem := buildJobItemFromJob(j, run, repoName)
-						prNum, prTitle, prURL := extractPRInfo(run, org, repoName)
-						jobItem.PRNumber = prNum
-						jobItem.PRTitle = prTitle
-						jobItem.PRURL = prURL
-
-						allJobs = append(allJobs, jobItem)
-						parsedJobsFromRun++
-					}
-				}
-			} else {
-				slog.Debug("gh jobs endpoint failed for run, using fallback", "runID", run.ID, "repo", repoName, "error", err)
-			}
-
-			// Fallback if jobs endpoint returned no jobs
-			if parsedJobsFromRun == 0 {
-				jobItem := buildJobItemFromRun(run, repoName)
-				prNum, prTitle, prURL := extractPRInfo(run, org, repoName)
-				jobItem.PRNumber = prNum
-				jobItem.PRTitle = prTitle
-				jobItem.PRURL = prURL
-
-				allJobs = append(allJobs, jobItem)
-			}
+			seenJobIDs[j.ID] = true
+			allJobs = append(allJobs, j)
 		}
 	}
 
-	if len(fetchErrors) > 0 {
-		rateLimitCount := 0
-		for _, e := range fetchErrors {
-			if strings.Contains(e, "rate limit") {
-				rateLimitCount++
-			}
-		}
-		if rateLimitCount > 0 {
-			return FilterAndSortJobQueue(allJobs), fmt.Errorf("GitHub API rate limit exceeded")
-		}
-		return FilterAndSortJobQueue(allJobs), fmt.Errorf("failed fetching org job queue (%s)", fetchErrors[0])
+	sorted := FilterAndSortJobQueue(allJobs)
+	if rateLimited {
+		return sorted, fmt.Errorf("GitHub API rate limit exceeded")
 	}
-	return FilterAndSortJobQueue(allJobs), nil
+	if len(failures) == len(repos) {
+		return sorted, fmt.Errorf("failed fetching org job queue (%v)", failures[0])
+	}
+	return sorted, nil
+}
+
+// fetchRepoJobQueue returns the active job items for a single repository.
+func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
+	out, err := runGH(
+		"api",
+		fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=%d", org, repo, jobQueueRunsPerRepo),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp GHWorkflowRunsResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse workflow runs JSON: %w", err)
+	}
+
+	var repoJobs []*JobItem
+	seenRunIDs := make(map[int64]bool)
+
+	for _, run := range resp.WorkflowRuns {
+		if !activeRunStatuses[run.Status] || seenRunIDs[run.ID] {
+			continue
+		}
+		seenRunIDs[run.ID] = true
+
+		prNum, prTitle, prURL := extractPRInfo(run, org, repo)
+
+		var parsedJobsFromRun int
+		jobsOut, jobsErr := runGH(
+			"api",
+			fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
+		)
+		if jobsErr == nil {
+			var jobsResp GHJobsResponse
+			if err := json.Unmarshal(jobsOut, &jobsResp); err == nil {
+				for _, j := range jobsResp.Jobs {
+					// Filter out completed success/skipped jobs
+					if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {
+						continue
+					}
+
+					jobItem := buildJobItemFromJob(j, run, repo)
+					jobItem.PRNumber = prNum
+					jobItem.PRTitle = prTitle
+					jobItem.PRURL = prURL
+
+					repoJobs = append(repoJobs, jobItem)
+					parsedJobsFromRun++
+				}
+			}
+		} else {
+			slog.Debug("gh jobs endpoint failed for run, using fallback", "runID", run.ID, "repo", repo, "error", jobsErr)
+		}
+
+		// Fallback if jobs endpoint returned nothing usable
+		if parsedJobsFromRun == 0 {
+			jobItem := buildJobItemFromRun(run, repo)
+			jobItem.PRNumber = prNum
+			jobItem.PRTitle = prTitle
+			jobItem.PRURL = prURL
+
+			repoJobs = append(repoJobs, jobItem)
+		}
+	}
+
+	return repoJobs, nil
 }
 
 // FetchJobLogs fetches the step log output for a specific running workflow job.

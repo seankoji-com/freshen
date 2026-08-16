@@ -170,11 +170,24 @@ func Hyperlink(text, url string) string {
 
 // --- Messages for Bubble Tea Update Loop ---
 
-type syncFinishedMsg struct{}
+// syncFinishedMsg reports that a sync stream has closed. bulk distinguishes the
+// all-repositories sync, which drives the IsSyncing banner, from a single-repo
+// re-sync that must not clear it.
+type syncFinishedMsg struct{ bulk bool }
+
+// repoSyncMsg carries one snapshot from a background sync, along with the stream
+// it came from so the update loop can wait for the next one.
+type repoSyncMsg struct {
+	repo      *git.RepoItem
+	snapshots <-chan *git.RepoItem
+	bulk      bool
+}
 
 type repoTickMsg time.Time
 
 type runnerJobTickMsg time.Time
+
+type jobQueueTickMsg time.Time
 
 func repoTickCmd() tea.Cmd {
 	return tea.Every(5*time.Minute, func(t time.Time) tea.Msg {
@@ -185,6 +198,16 @@ func repoTickCmd() tea.Cmd {
 func runnerJobTickCmd() tea.Cmd {
 	return tea.Every(10*time.Second, func(t time.Time) tea.Msg {
 		return runnerJobTickMsg(t)
+	})
+}
+
+// jobQueueTickCmd drives the job-queue refresh on its own, slower cadence.
+// GitHub has no org-wide workflow-runs endpoint, so each poll costs one API
+// call per tracked repository; at 20s a ~20-repo org stays well inside the
+// 5,000 requests/hour limit, while the runner panel keeps its 10s refresh.
+func jobQueueTickCmd() tea.Cmd {
+	return tea.Every(20*time.Second, func(t time.Time) tea.Msg {
+		return jobQueueTickMsg(t)
 	})
 }
 
@@ -246,8 +269,6 @@ type Model struct {
 	Width       int
 	Height      int
 
-	mu sync.Mutex
-
 	// ctx is cancelled on quit (via key or OS signal) to abort in-flight git
 	// operations instead of letting them keep running after the UI exits.
 	// bgWG tracks those operations so the caller can wait for them to
@@ -303,6 +324,7 @@ func (m Model) Init() tea.Cmd {
 		m.loadJobQueueCmd(),
 		repoTickCmd(),
 		runnerJobTickCmd(),
+		jobQueueTickCmd(),
 	)
 }
 
@@ -480,24 +502,46 @@ func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
 	}
 }
 
-func (m Model) startParallelSyncCmd() tea.Cmd {
-	if m.bgWG != nil {
-		m.bgWG.Add(1)
+// syncConcurrency bounds how many repositories are synced at once.
+const syncConcurrency = 4
+
+// startSyncCmd syncs the given repositories in the background and streams their
+// state back into the update loop, one message per state change.
+//
+// The workers never touch the model's RepoItems: each gets a private clone and
+// publishes owned snapshots. Only Update — which Bubble Tea runs on a single
+// goroutine — writes to m.Repos, so the render path never reads a struct while
+// a sync is writing to it.
+func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
+	// Clone here, on the update goroutine, before any worker exists.
+	work := make([]*git.RepoItem, 0, len(items))
+	for _, item := range items {
+		if item.IsArchived {
+			continue
+		}
+		work = append(work, item.Clone())
 	}
-	return func() tea.Msg {
-		if m.bgWG != nil {
-			defer m.bgWG.Done()
+	if len(work) == 0 {
+		return func() tea.Msg { return syncFinishedMsg{bulk: bulk} }
+	}
+
+	ctx, bgWG := m.ctx, m.bgWG
+	snapshots := make(chan *git.RepoItem, len(work))
+	if bgWG != nil {
+		bgWG.Add(1)
+	}
+
+	go func() {
+		defer close(snapshots)
+		if bgWG != nil {
+			defer bgWG.Done()
 		}
 
 		var wg sync.WaitGroup
-		concurrency := 4
-		sem := make(chan struct{}, concurrency)
+		sem := make(chan struct{}, syncConcurrency)
 
-		for _, item := range m.Repos {
-			if item.IsArchived {
-				continue
-			}
-			if m.ctx.Err() != nil {
+		for _, r := range work {
+			if ctx.Err() != nil {
 				break
 			}
 
@@ -508,12 +552,58 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				git.SyncRepository(m.ctx, r)
-			}(item)
+				git.SyncRepository(ctx, r, func(snapshot *git.RepoItem) {
+					// Give up on quit rather than block on an undrained channel.
+					select {
+					case snapshots <- snapshot:
+					case <-ctx.Done():
+					}
+				})
+			}(r)
 		}
 
 		wg.Wait()
-		return syncFinishedMsg{}
+	}()
+
+	return waitForSyncSnapshot(snapshots, bulk)
+}
+
+// waitForSyncSnapshot turns the next snapshot on the stream into a message,
+// or reports the sync finished once the stream closes.
+func waitForSyncSnapshot(snapshots <-chan *git.RepoItem, bulk bool) tea.Cmd {
+	return func() tea.Msg {
+		snapshot, ok := <-snapshots
+		if !ok {
+			return syncFinishedMsg{bulk: bulk}
+		}
+		return repoSyncMsg{repo: snapshot, snapshots: snapshots, bulk: bulk}
+	}
+}
+
+// applyRepoSnapshot copies the sync-owned fields of a snapshot onto the live
+// model item. It runs on the update goroutine — the only writer of m.Repos —
+// and leaves issue/PR state alone, since other commands own that.
+func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
+	if snapshot == nil {
+		return
+	}
+	for _, item := range m.Repos {
+		if item.Name != snapshot.Name {
+			continue
+		}
+		item.Status = snapshot.Status
+		item.StatusMsg = snapshot.StatusMsg
+		item.OriginalBranch = snapshot.OriginalBranch
+		item.CurrentBranch = snapshot.CurrentBranch
+		item.DefaultBranch = snapshot.DefaultBranch
+		item.HasUnstagedChanges = snapshot.HasUnstagedChanges
+		item.ExistingPRURL = snapshot.ExistingPRURL
+		item.BranchDetails = snapshot.BranchDetails
+		item.Stashed = snapshot.Stashed
+		item.DraftPRURL = snapshot.DraftPRURL
+		item.ErrorErr = snapshot.ErrorErr
+		item.Logs = snapshot.Logs
+		return
 	}
 }
 
@@ -723,15 +813,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					if m.bgWG != nil {
-						m.bgWG.Add(1)
-					}
-					go func(r *git.RepoItem) {
-						if m.bgWG != nil {
-							defer m.bgWG.Done()
-						}
-						git.SyncRepository(m.ctx, r)
-					}(item)
+					cmds = append(cmds, m.startSyncCmd([]*git.RepoItem{item}, false))
 					m.updateViewport()
 				}
 			}
@@ -917,7 +999,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		jobs.PollStep(m.Runners, m.JobQueue)
 		m.updateViewport()
 		var cmdsToAdd []tea.Cmd
-		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd(), m.loadJobQueueCmd(), runnerJobTickCmd())
+		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd(), runnerJobTickCmd())
 		// Refresh logs for selected running job
 		if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 			selJob := m.JobQueue[m.SelectedJobIndex]
@@ -926,6 +1008,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, tea.Batch(cmdsToAdd...)
+
+	case jobQueueTickMsg:
+		return m, tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd())
 
 	case loadedRunnersMsg:
 		m.IsRunnersLoading = false
@@ -1013,11 +1098,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.autoSync && len(m.Repos) > 0 {
 			m.IsSyncing = true
 			m.updateViewport()
-			cmds = append(cmds, m.startParallelSyncCmd())
+			cmds = append(cmds, m.startSyncCmd(m.Repos, true))
 		}
 
+	case repoSyncMsg:
+		m.applyRepoSnapshot(msg.repo)
+		m.updateViewport()
+		cmds = append(cmds, waitForSyncSnapshot(msg.snapshots, msg.bulk))
+
 	case syncFinishedMsg:
-		m.IsSyncing = false
+		if msg.bulk {
+			m.IsSyncing = false
+		}
 		m.updateViewport()
 
 	case tea.WindowSizeMsg:

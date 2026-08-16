@@ -443,14 +443,77 @@ func GetDefaultBranch(path string) string {
 	return GetOriginalBranch(path)
 }
 
+// SyncProgress receives a snapshot of a repository after each state change
+// during a sync. Each snapshot is owned by the receiver — the sync never writes
+// to it again — so it can be read from another goroutine safely.
+type SyncProgress func(*RepoItem)
+
+// Clone returns a deep copy of the item, safe to hand to another goroutine.
+// Slice fields are copied rather than shared, so appends on either side stay
+// invisible to the other.
+func (r *RepoItem) Clone() *RepoItem {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	c.Logs = append([]string(nil), r.Logs...)
+	c.IssuesList = append([]IssueItem(nil), r.IssuesList...)
+	c.PRsList = append([]PRItem(nil), r.PRsList...)
+	c.BranchDetails = r.BranchDetails.clone()
+	return &c
+}
+
+func (d BranchWorktreeDetails) clone() BranchWorktreeDetails {
+	return BranchWorktreeDetails{
+		Branches:       append([]string(nil), d.Branches...),
+		LocalBranches:  append([]string(nil), d.LocalBranches...),
+		RemoteBranches: append([]string(nil), d.RemoteBranches...),
+		Worktrees:      append([]string(nil), d.Worktrees...),
+		ChangedFiles:   append([]string(nil), d.ChangedFiles...),
+	}
+}
+
+// syncSession pairs the repository being synced with the progress emitter, so
+// every state change is published as an owned snapshot rather than left for a
+// concurrent reader to catch mid-write.
+type syncSession struct {
+	item *RepoItem
+	emit SyncProgress
+}
+
+// log appends a line to the repository log and publishes a snapshot.
+func (s *syncSession) log(format string, args ...any) {
+	s.item.Logs = append(s.item.Logs, fmt.Sprintf(format, args...))
+	s.publish()
+}
+
+// finish records a terminal status alongside its log line, in one snapshot.
+func (s *syncSession) finish(status RepoStatus, statusMsg, format string, args ...any) {
+	s.item.Status = status
+	s.item.StatusMsg = statusMsg
+	s.log(format, args...)
+}
+
+func (s *syncSession) publish() {
+	if s.emit != nil {
+		s.emit(s.item.Clone())
+	}
+}
+
 // SyncRepository performs the exact branch workflow with brief status messages.
 // ctx allows the caller to abort in-flight git operations (e.g. on app quit).
-func SyncRepository(ctx context.Context, item *RepoItem) {
+//
+// item is mutated in place. When emit is non-nil it receives an owned snapshot
+// after every state change, which is how the TUI follows progress without
+// reading the struct this function is writing to.
+func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	if ctx.Err() != nil {
 		return
 	}
+	s := &syncSession{item: item, emit: emit}
+
 	item.Status = StatusSyncing
-	item.Logs = append(item.Logs, fmt.Sprintf("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
+	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)
 
 	origBranch := GetOriginalBranch(item.Path)
 	item.OriginalBranch = origBranch
@@ -463,7 +526,7 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 	if origBranch != defaultBranch {
 		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
 		if item.ExistingPRURL != "" {
-			item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Existing Open PR found: %s", item.ExistingPRURL))
+			s.log("󰏫 Existing Open PR found: %s", item.ExistingPRURL)
 		}
 	}
 
@@ -474,79 +537,66 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 	hasUnstagedChanges := strings.TrimSpace(dirtyOut.String()) != ""
 	item.HasUnstagedChanges = hasUnstagedChanges
 
-	item.Logs = append(item.Logs, fmt.Sprintf(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges))
+	s.log(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges)
 
 	if origBranch == defaultBranch {
 		if !hasUnstagedChanges {
-			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (clean). Running git pull --no-rebase origin %s...", defaultBranch, defaultBranch))
+			s.log(" On default branch '%s' (clean). Running git pull --no-rebase origin %s...", defaultBranch, defaultBranch)
 			pullCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
 			var pullOut bytes.Buffer
 			pullCmd.Stdout = &pullOut
 			pullCmd.Stderr = &pullOut
 			if err := pullCmd.Run(); err == nil {
 				if strings.Contains(pullOut.String(), "Already up to date.") {
-					item.Status = StatusUpToDate
-					item.StatusMsg = "OK"
+					s.finish(StatusUpToDate, "OK", "󰄬 Successfully pulled '%s'.", defaultBranch)
 				} else {
-					item.Status = StatusUpdated
-					item.StatusMsg = "Updated"
+					s.finish(StatusUpdated, "Updated", "󰄬 Successfully pulled '%s'.", defaultBranch)
 				}
-				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s'.", defaultBranch))
 			} else {
-				item.Status = StatusError
-				item.StatusMsg = "Pull Error"
-				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
-			}
-			return
-		} else {
-			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch))
-
-			_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run()
-			stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
-			stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
-			if err := stashCmd.Run(); err != nil {
-				item.Status = StatusError
-				item.StatusMsg = "Stash Err"
-				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to stash local changes: %v", err))
-				return
-			}
-			item.Stashed = true
-
-			if ctx.Err() != nil {
-				item.Logs = append(item.Logs, "󰅙 Sync cancelled after stashing — changes remain stashed, re-run sync to restore them.")
-				return
-			}
-
-			pullCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
-			var dirtyPullOut bytes.Buffer
-			pullCmd.Stdout = &dirtyPullOut
-			pullCmd.Stderr = &dirtyPullOut
-			if err := pullCmd.Run(); err != nil {
-				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error (continuing with stash apply): %s — %s", err.Error(), dirtyPullOut.String()))
-			}
-
-			applyCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "apply")
-			if err := applyCmd.Run(); err == nil {
-				item.Status = StatusStashedApplied
-				item.StatusMsg = "Stashed"
-				item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch))
-			} else {
-				item.Status = StatusError
-				item.StatusMsg = "Conflict"
-				item.Logs = append(item.Logs, "󰅙 Conflict occurred while applying stash!")
+				s.finish(StatusError, "Pull Error", "󰅙 git pull error: %s", pullOut.String())
 			}
 			return
 		}
+
+		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch)
+
+		_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run()
+		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
+		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
+		if err := stashCmd.Run(); err != nil {
+			s.finish(StatusError, "Stash Err", "󰅙 Failed to stash local changes: %v", err)
+			return
+		}
+		item.Stashed = true
+
+		if ctx.Err() != nil {
+			s.log("󰅙 Sync cancelled after stashing — changes remain stashed, re-run sync to restore them.")
+			return
+		}
+
+		pullCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
+		var dirtyPullOut bytes.Buffer
+		pullCmd.Stdout = &dirtyPullOut
+		pullCmd.Stderr = &dirtyPullOut
+		if err := pullCmd.Run(); err != nil {
+			s.log("󰅙 git pull error (continuing with stash apply): %s — %s", err.Error(), dirtyPullOut.String())
+		}
+
+		applyCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "apply")
+		if err := applyCmd.Run(); err == nil {
+			s.finish(StatusStashedApplied, "Stashed", "󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch)
+		} else {
+			s.finish(StatusError, "Conflict", "󰅙 Conflict occurred while applying stash!")
+		}
+		return
 	}
 
 	if !hasUnstagedChanges {
-		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' is clean. Checking out '%s' and running git pull --no-rebase origin %s...", origBranch, defaultBranch, defaultBranch))
+		s.log(" Feature branch '%s' is clean. Checking out '%s' and running git pull --no-rebase origin %s...", origBranch, defaultBranch, defaultBranch)
 
 		coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", defaultBranch)
 		if err := coCmd.Run(); err != nil {
-			item.Status = StatusError
-			item.StatusMsg = "Checkout Err"
-			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to checkout '%s': %v", defaultBranch, err))
+			s.finish(StatusError, "Checkout Err", "󰅙 Failed to checkout '%s': %v", defaultBranch, err)
 			return
 		}
 		item.CurrentBranch = defaultBranch
@@ -556,40 +606,31 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 		pullCmd.Stdout = &pullOut
 		pullCmd.Stderr = &pullOut
 		if err := pullCmd.Run(); err == nil {
-			item.Status = StatusSwitchedDefault
-			item.StatusMsg = "Switched"
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched from '%s' to '%s' and pulled.", origBranch, defaultBranch))
+			s.finish(StatusSwitchedDefault, "Switched", "󰄬 Switched from '%s' to '%s' and pulled.", origBranch, defaultBranch)
 		} else {
-			item.Status = StatusError
-			item.StatusMsg = "Pull Error"
-			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git pull error: %s", pullOut.String()))
+			s.finish(StatusError, "Pull Error", "󰅙 git pull error: %s", pullOut.String())
 		}
 		return
+	}
+
+	s.log(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch)
+
+	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run()
+	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
+	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
+	var rebaseOut bytes.Buffer
+	rebaseCmd.Stdout = &rebaseOut
+	rebaseCmd.Stderr = &rebaseOut
+
+	if err := rebaseCmd.Run(); err == nil {
+		s.finish(StatusRebased, "Rebased", "󰄬 Rebased '%s' onto '%s'.", origBranch, rebaseTarget)
 	} else {
-		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch))
-
-		_ = exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run()
-		rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
-		rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
-		var rebaseOut bytes.Buffer
-		rebaseCmd.Stdout = &rebaseOut
-		rebaseCmd.Stderr = &rebaseOut
-
-		if err := rebaseCmd.Run(); err == nil {
-			item.Status = StatusRebased
-			item.StatusMsg = "Rebased"
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Rebased '%s' onto '%s'.", origBranch, rebaseTarget))
-		} else {
-			// Use a fresh context for the abort so a mid-rebase state isn't left behind
-			// even if the sync itself was cancelled.
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
-			abortCancel()
-			item.Status = StatusRebaseConflict
-			item.StatusMsg = "Conflict"
-			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Rebase conflict: %s", rebaseOut.String()))
-		}
-		return
+		// Use a fresh context for the abort so a mid-rebase state isn't left behind
+		// even if the sync itself was cancelled.
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
+		abortCancel()
+		s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebase conflict: %s", rebaseOut.String())
 	}
 }
 
