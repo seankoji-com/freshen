@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 type RepoStatus string
@@ -366,6 +368,9 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	if issues == nil {
 		issues = []IssueItem{}
 	}
+	for i := range issues {
+		issues[i].Title = jobs.SanitizeTerminal(issues[i].Title)
+	}
 	return issues, nil
 }
 
@@ -388,6 +393,10 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 	}
 	if prs == nil {
 		prs = []PRItem{}
+	}
+	for i := range prs {
+		prs[i].Title = jobs.SanitizeTerminal(prs[i].Title)
+		prs[i].HeadRefName = jobs.SanitizeTerminal(prs[i].HeadRefName)
 	}
 	return prs, nil
 }

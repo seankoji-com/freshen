@@ -67,6 +67,24 @@ type JobItem struct {
 	IsRunHeader bool  // True when this JobItem is a run-level header, not a specific job
 }
 
+// SanitizeTerminal strips control characters from GitHub-sourced free text (titles,
+// branch names, job/run/runner names) before it reaches terminal rendering. This
+// prevents ANSI/OSC escape injection when such text is interpolated into raw escape
+// sequences (e.g. OSC 8 hyperlinks) or otherwise written to the terminal. All bytes
+// below 0x20 except space, plus 0x7F (DEL), are removed; everything else (including
+// UTF-8 multibyte sequences) passes through unchanged.
+func SanitizeTerminal(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r < 0x20 && r != ' ') || r == 0x7F {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // parseNumericID extracts the integer portion of a job ID string (e.g. "#123" -> 123).
 // Returns 0 if parsing fails, so the sort remains stable (string fallback).
 func parseNumericID(id string) int {
@@ -221,14 +239,14 @@ func formatQueuedAgo(timestamp string) string {
 func extractPRInfo(run GHWorkflowRun, org, repo string) (prNum int, prTitle string, prURL string) {
 	if len(run.PullRequests) > 0 {
 		prNum = run.PullRequests[0].Number
-		prTitle = run.PullRequests[0].Title
+		prTitle = SanitizeTerminal(run.PullRequests[0].Title)
 		prURL = run.PullRequests[0].URL
 		if prURL == "" && prNum != 0 {
 			prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
 		}
 	}
 	if prTitle == "" && run.DisplayTitle != "" {
-		prTitle = run.DisplayTitle
+		prTitle = SanitizeTerminal(run.DisplayTitle)
 	}
 	return
 }
@@ -237,7 +255,7 @@ func extractPRInfo(run GHWorkflowRun, org, repo string) (prNum int, prTitle stri
 func buildJobItemFromJob(j GHJobInfo, run GHWorkflowRun, repo string) *JobItem {
 	js := jobStatusFromGH(j.Status, j.Conclusion)
 
-	displayName := fmt.Sprintf("%s / %s", repo, j.Name)
+	displayName := fmt.Sprintf("%s / %s", repo, SanitizeTerminal(j.Name))
 
 	duration, startedAt, secs := parseDuration(j.StartedAt)
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
@@ -246,10 +264,10 @@ func buildJobItemFromJob(j GHJobInfo, run GHWorkflowRun, repo string) *JobItem {
 		ID:         fmt.Sprintf("#%d", j.ID),
 		Name:       displayName,
 		Repo:       repo,
-		Branch:     run.HeadBranch,
+		Branch:     SanitizeTerminal(run.HeadBranch),
 		Event:      run.Event,
 		Status:     js,
-		RunnerName: j.RunnerName,
+		RunnerName: SanitizeTerminal(j.RunnerName),
 		QueuedAt:   queuedAgo,
 		Duration:   duration,
 		Seconds:    secs,
@@ -274,7 +292,7 @@ func buildJobItemFromRun(run GHWorkflowRun, repo string) *JobItem {
 	if name == "" {
 		name = run.Name
 	}
-	displayName := fmt.Sprintf("%s / %s", repo, name)
+	displayName := fmt.Sprintf("%s / %s", repo, SanitizeTerminal(name))
 
 	duration, startedAt, secs := parseDuration(run.RunStartedAt)
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
@@ -283,10 +301,10 @@ func buildJobItemFromRun(run GHWorkflowRun, repo string) *JobItem {
 		ID:         fmt.Sprintf("#%d", run.ID),
 		Name:       displayName,
 		Repo:       repo,
-		Branch:     run.HeadBranch,
+		Branch:     SanitizeTerminal(run.HeadBranch),
 		Event:      run.Event,
 		Status:     js,
-		RunnerName: run.RunnerName,
+		RunnerName: SanitizeTerminal(run.RunnerName),
 		QueuedAt:   queuedAgo,
 		Duration:   duration,
 		Seconds:    secs,
@@ -359,7 +377,7 @@ func FetchOrgRunners(org string) ([]*RunnerItem, error) {
 
 		item := &RunnerItem{
 			ID:            fmt.Sprintf("runner-%d", r.ID),
-			Name:          r.Name,
+			Name:          SanitizeTerminal(r.Name),
 			Platform:      platform,
 			Status:        st,
 			CurrentJobID:  "-",

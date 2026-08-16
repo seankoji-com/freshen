@@ -6,6 +6,47 @@ import (
 	"time"
 )
 
+func TestSanitizeTerminal(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "strips OSC 8 hyperlink injection",
+			input: "evil title \x1b]8;;https://evil.example\x1b\\click me\x1b]8;;\x1b\\",
+			want:  "evil title ]8;;https://evil.example\\click me]8;;\\",
+		},
+		{
+			name:  "strips bare ESC and control bytes",
+			input: "run\x1b[31mred\x1b[0m\x07bell\x7fdel",
+			want:  "run[31mred[0mbelldel",
+		},
+		{
+			name:  "preserves spaces and normal text",
+			input: "fix: normal PR title #64",
+			want:  "fix: normal PR title #64",
+		},
+		{
+			name:  "preserves UTF-8 multibyte runes",
+			input: "unicode ✅ 日本語",
+			want:  "unicode ✅ 日本語",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SanitizeTerminal(tc.input)
+			if got != tc.want {
+				t.Errorf("SanitizeTerminal(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			if strings.ContainsAny(got, "\x1b\x07\x7f") {
+				t.Errorf("SanitizeTerminal(%q) = %q still contains control chars", tc.input, got)
+			}
+		})
+	}
+}
+
 func TestDefaultRunners(t *testing.T) {
 	runners := DefaultRunners()
 	if runners == nil {
