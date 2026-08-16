@@ -36,4 +36,4 @@ jobs:
         run: go test -v -race ./...
 
       - name: Build binary
-        run: go build -o freshen .
+        run: go build -ldflags "-X main.Version=$(git describe --tags --always 2>/dev/null || echo 1.0.0)" -o freshen .
