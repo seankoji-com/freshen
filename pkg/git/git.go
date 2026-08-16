@@ -246,11 +246,15 @@ func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 }
 
 // GetRepoBranchDetails fetches branches, worktrees, and changed file details.
-func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
+func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) BranchWorktreeDetails {
 	var details BranchWorktreeDetails
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Branches
-	cmd := exec.Command("git", "-C", path, "branch", "-a")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-a")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -269,8 +273,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Worktrees
-	cmd = exec.Command("git", "-C", path, "worktree", "list")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "worktree", "list")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -281,8 +289,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Changed files & status
-	cmd = exec.Command("git", "-C", path, "status", "--short")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "status", "--short")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -297,15 +309,23 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 }
 
 // PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
-func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
+func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) (int, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
 	// 1. Fetch & prune deleted remote-tracking references from origin
 	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
-	if err := exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run(); err != nil {
+	if err := exec.CommandContext(ctx, "git", "-C", path, "fetch", "--prune", "origin").Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: git fetch --prune failed for %s: %v\n", path, err)
 	}
 
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
 	// 2. Force remove secondary git worktrees
-	cmdWorktree := exec.Command("git", "-C", path, "worktree", "list", "--porcelain")
+	cmdWorktree := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain")
 	var wtOut bytes.Buffer
 	cmdWorktree.Stdout = &wtOut
 	if err := cmdWorktree.Run(); err == nil {
@@ -315,31 +335,35 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 				wtPath := strings.TrimPrefix(line, "worktree ")
 				wtPath = strings.TrimSpace(wtPath)
 				if wtPath != "" && wtPath != path {
-					if err := exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
+					if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
 						fmt.Fprintf(os.Stderr, "warning: git worktree remove %s failed: %v\n", wtPath, err)
 					}
 				}
 			}
 		}
 	}
-	if err := exec.Command("git", "-C", path, "worktree", "prune").Run(); err != nil {
+	if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "prune").Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: git worktree prune failed for %s: %v\n", path, err)
 	}
 
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
 	// 3. Delete local non-default branches
-	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "--format=%(refname:short)")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return 0, err
 	}
 
-	currentBranch := GetOriginalBranch(path)
+	currentBranch := GetOriginalBranch(ctx, path)
 	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
 		b = cleanBranchName(b)
 		if b != "" && b != defaultBranch && b != currentBranch {
-			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
+			delCmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-D", b)
 			if delCmd.Run() == nil {
 				deletedCount++
 			}
@@ -426,15 +450,23 @@ func IsGitRepo(path string) bool {
 }
 
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
-func GetOriginalBranch(path string) string {
-	cmd := exec.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD")
+func GetOriginalBranch(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
 		return strings.TrimSpace(out.String())
 	}
 
-	cmd = exec.Command("git", "-C", path, "rev-parse", "--short", "HEAD")
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
@@ -478,7 +510,7 @@ func GetDefaultBranch(path string) string {
 		return "master"
 	}
 
-	return GetOriginalBranch(path)
+	return GetOriginalBranch(context.Background(), path)
 }
 
 // SyncRepository performs the exact branch workflow with brief status messages.
@@ -490,13 +522,13 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 	item.Status = StatusSyncing
 	item.Logs = append(item.Logs, fmt.Sprintf("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name))
 
-	origBranch := GetOriginalBranch(item.Path)
+	origBranch := GetOriginalBranch(ctx, item.Path)
 	item.OriginalBranch = origBranch
 	item.CurrentBranch = origBranch
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
 
-	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
+	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
 		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
@@ -653,21 +685,25 @@ func SwitchBranch(item *RepoItem, targetBranch string) error {
 }
 
 // CommitPushPRAndSwitchDefault commits unstaged changes, pushes to origin, creates/updates PR, and switches back to default branch.
-func CommitPushPRAndSwitchDefault(item *RepoItem) error {
+func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	branch := item.OriginalBranch
 	if branch == "" || branch == item.DefaultBranch {
 		return fmt.Errorf("cannot raise PR from default branch")
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
 
-	if err := exec.Command("git", "-C", item.Path, "add", "-A").Run(); err != nil {
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").Run(); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git add -A failed: %v", err))
 		return err
 	}
 
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	commitCmd := exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg)
+	commitCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg)
 	var commitOut bytes.Buffer
 	commitCmd.Stdout = &commitOut
 	commitCmd.Stderr = &commitOut
@@ -680,14 +716,22 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 		}
 	}
 
-	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	pushCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "push", "-u", "origin", branch)
 	if err := pushCmd.Run(); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
 		return err
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	if item.ExistingPRURL == "" {
-		prCmd := exec.Command("gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
+		prCmd := exec.CommandContext(ctx, "gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
 		prCmd.Dir = item.Path
 		var prOut bytes.Buffer
 		prCmd.Stdout = &prOut
@@ -704,7 +748,11 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
 
-	coCmd := exec.Command("git", "-C", item.Path, "checkout", item.DefaultBranch)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", item.DefaultBranch)
 	if err := coCmd.Run(); err == nil {
 		item.CurrentBranch = item.DefaultBranch
 		item.Status = StatusPRCreated
