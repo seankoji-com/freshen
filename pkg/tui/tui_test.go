@@ -557,3 +557,77 @@ func TestTruncateStringMultiByteUTF8(t *testing.T) {
 		t.Errorf("expected rune count <= 30, got %d for %q", len(runes), truncated)
 	}
 }
+
+// applyRepoSnapshot merges the sync-owned fields of a background snapshot onto
+// the live item, without clobbering issue/PR state that other commands own.
+func TestApplyRepoSnapshotMergesSyncFieldsOnly(t *testing.T) {
+	m := newTestModel("/tmp", "acme")
+	live := &git.RepoItem{
+		Name:            "alpha",
+		GHRepoName:      "alpha",
+		Status:          git.StatusPending,
+		Logs:            []string{"stale"},
+		IssuesList:      []git.IssueItem{{Number: 3, Title: "keep me"}},
+		HasLoadedIssues: true,
+		OpenIssuesCount: 3,
+	}
+	m.Repos = []*git.RepoItem{live, {Name: "beta", Status: git.StatusPending}}
+
+	m.applyRepoSnapshot(&git.RepoItem{
+		Name:          "alpha",
+		Status:        git.StatusUpdated,
+		StatusMsg:     "Updated",
+		CurrentBranch: "main",
+		Stashed:       true,
+		Logs:          []string{"one", "two"},
+	})
+
+	if live.Status != git.StatusUpdated || live.StatusMsg != "Updated" {
+		t.Errorf("sync fields not applied: %s / %s", live.Status, live.StatusMsg)
+	}
+	if live.CurrentBranch != "main" || !live.Stashed {
+		t.Errorf("branch/stash state not applied: %+v", live)
+	}
+	if len(live.Logs) != 2 {
+		t.Errorf("expected the snapshot's logs, got %v", live.Logs)
+	}
+	// Issue state is loaded by a different command and must survive the merge.
+	if !live.HasLoadedIssues || len(live.IssuesList) != 1 || live.OpenIssuesCount != 3 {
+		t.Errorf("snapshot clobbered issue state: %+v", live)
+	}
+	if m.Repos[1].Status != git.StatusPending {
+		t.Errorf("snapshot leaked onto an unrelated repo: %s", m.Repos[1].Status)
+	}
+}
+
+// A snapshot for a repo that is no longer in the model (e.g. a periodic refresh
+// dropped it) must be ignored rather than panic.
+func TestApplyRepoSnapshotUnknownRepo(t *testing.T) {
+	m := newTestModel("/tmp", "acme")
+	m.Repos = []*git.RepoItem{{Name: "alpha", Status: git.StatusPending}}
+
+	m.applyRepoSnapshot(&git.RepoItem{Name: "ghost", Status: git.StatusUpdated})
+	m.applyRepoSnapshot(nil)
+
+	if m.Repos[0].Status != git.StatusPending {
+		t.Errorf("unknown snapshot altered the model: %s", m.Repos[0].Status)
+	}
+}
+
+// startSyncCmd must hand workers private clones, never the model's own items.
+func TestStartSyncCmdSkipsArchivedAndClones(t *testing.T) {
+	m := newTestModel("/tmp", "acme")
+	archived := &git.RepoItem{Name: "old", IsArchived: true, Status: git.StatusArchived}
+	m.Repos = []*git.RepoItem{archived}
+
+	// Every candidate is archived, so the stream finishes immediately without
+	// starting a worker.
+	msg := m.startSyncCmd(m.Repos, true)()
+	finished, ok := msg.(syncFinishedMsg)
+	if !ok || !finished.bulk {
+		t.Fatalf("expected a bulk syncFinishedMsg, got %#v", msg)
+	}
+	if archived.Status != git.StatusArchived {
+		t.Errorf("archived repo was touched: %s", archived.Status)
+	}
+}
