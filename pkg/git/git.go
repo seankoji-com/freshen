@@ -181,10 +181,11 @@ func GetGHRepoName(localDir string) string {
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
 func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 	cmd := exec.Command("gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
+		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w: %s", org, err, strings.TrimSpace(errOut.String()))
 	}
 
 	var repos []GHRepoInfo
@@ -199,10 +200,11 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
 	cmd := exec.Command("gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gh api graphql failed for org %s: %w: %s", org, err, strings.TrimSpace(errOut.String()))
 	}
 
 	var resp GraphQLOrgResponse
@@ -277,7 +279,10 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 // PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
 func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 	// 1. Fetch & prune deleted remote-tracking references from origin
-	_ = exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run()
+	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
+	if err := exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: git fetch --prune failed for %s: %v\n", path, err)
+	}
 
 	// 2. Force remove secondary git worktrees
 	cmdWorktree := exec.Command("git", "-C", path, "worktree", "list", "--porcelain")
@@ -290,12 +295,16 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 				wtPath := strings.TrimPrefix(line, "worktree ")
 				wtPath = strings.TrimSpace(wtPath)
 				if wtPath != "" && wtPath != path {
-					_ = exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run()
+					if err := exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
+						fmt.Fprintf(os.Stderr, "warning: git worktree remove %s failed: %v\n", wtPath, err)
+					}
 				}
 			}
 		}
 	}
-	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
+	if err := exec.Command("git", "-C", path, "worktree", "prune").Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: git worktree prune failed for %s: %v\n", path, err)
+	}
 
 	// 3. Delete local non-default branches
 	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
@@ -377,10 +386,13 @@ func FetchExistingPRURL(repoPath, branch string) string {
 	}
 	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
 	cmd.Dir = repoPath
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err == nil {
 		return strings.TrimSpace(out.String())
+	} else {
+		fmt.Fprintf(os.Stderr, "warning: gh pr list failed for %s: %v: %s\n", branch, err, strings.TrimSpace(errOut.String()))
 	}
 	return ""
 }
@@ -426,9 +438,13 @@ func GetDefaultBranch(path string) string {
 
 	cmd = exec.Command("gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
 	out.Reset()
+	var ghErrOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &ghErrOut
 	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
 		return strings.TrimSpace(out.String())
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: gh repo view failed for %s: %v: %s\n", path, err, strings.TrimSpace(ghErrOut.String()))
 	}
 
 	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main")
@@ -470,7 +486,9 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 	isDirtyCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "status", "--porcelain")
 	var dirtyOut bytes.Buffer
 	isDirtyCmd.Stdout = &dirtyOut
-	_ = isDirtyCmd.Run()
+	if err := isDirtyCmd.Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git status --porcelain failed: %v", err))
+	}
 	hasUnstagedChanges := strings.TrimSpace(dirtyOut.String()) != ""
 	item.HasUnstagedChanges = hasUnstagedChanges
 
@@ -501,7 +519,9 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 		} else {
 			item.Logs = append(item.Logs, fmt.Sprintf(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch))
 
-			_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run()
+			if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
+				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git add . failed (continuing with stash): %v", err))
+			}
 			stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
 			stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 			if err := stashCmd.Run(); err != nil {
@@ -568,7 +588,9 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 	} else {
 		item.Logs = append(item.Logs, fmt.Sprintf(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch))
 
-		_ = exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run()
+		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run(); err != nil {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git fetch origin failed (continuing with rebase attempt): %v", err))
+		}
 		rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
 		rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
 		var rebaseOut bytes.Buffer
@@ -583,7 +605,9 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 			// Use a fresh context for the abort so a mid-rebase state isn't left behind
 			// even if the sync itself was cancelled.
 			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
+			if err := exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run(); err != nil {
+				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git rebase --abort failed: %v", err))
+			}
 			abortCancel()
 			item.Status = StatusRebaseConflict
 			item.StatusMsg = "Conflict"
@@ -615,9 +639,24 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 
 	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
 
-	_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
+	if err := exec.Command("git", "-C", item.Path, "add", "-A").Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git add -A failed: %v", err))
+		return err
+	}
+
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
+	commitCmd := exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg)
+	var commitOut bytes.Buffer
+	commitCmd.Stdout = &commitOut
+	commitCmd.Stderr = &commitOut
+	if err := commitCmd.Run(); err != nil {
+		if strings.Contains(commitOut.String(), "nothing to commit") {
+			item.Logs = append(item.Logs, "Nothing to commit; continuing to push existing commits.")
+		} else {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git commit failed: %v: %s", err, strings.TrimSpace(commitOut.String())))
+			return err
+		}
+	}
 
 	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
 	if err := pushCmd.Run(); err != nil {
@@ -657,7 +696,12 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 // CloneRepo clones a repository from GitHub organization into local path.
 func CloneRepo(org, ghRepoName, targetPath string) error {
 	cmd := exec.Command("gh", "repo", "clone", fmt.Sprintf("%s/%s", org, ghRepoName), targetPath)
-	return cmd.Run()
+	var errOut bytes.Buffer
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("gh repo clone %s/%s failed: %w: %s", org, ghRepoName, err, strings.TrimSpace(errOut.String()))
+	}
+	return nil
 }
 
 // DeleteLocalRepo removes the local directory for an archived repository.
