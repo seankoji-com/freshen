@@ -21,7 +21,7 @@ import (
 // operations to stop after the TUI exits, before returning anyway.
 const shutdownWait = 5 * time.Second
 
-const Version = "1.0.0"
+var Version = "1.0.0"
 
 // validatePrerequisites checks that freshen has access to required tools.
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
