@@ -42,6 +42,13 @@ const (
 	FocusJobs
 )
 
+// --- Sync and Refresh Intervals ---
+const (
+	repoTickInterval      = 5 * time.Minute
+	runnerJobTickInterval = 10 * time.Second
+	syncConcurrency       = 4
+)
+
 // --- NerdFont Glyphs & Color Palette ---
 var (
 	iconLeaf     = "🍃"
@@ -179,13 +186,13 @@ type repoTickMsg time.Time
 type runnerJobTickMsg time.Time
 
 func repoTickCmd() tea.Cmd {
-	return tea.Every(5*time.Minute, func(t time.Time) tea.Msg {
+	return tea.Every(repoTickInterval, func(t time.Time) tea.Msg {
 		return repoTickMsg(t)
 	})
 }
 
 func runnerJobTickCmd() tea.Cmd {
-	return tea.Every(10*time.Second, func(t time.Time) tea.Msg {
+	return tea.Every(runnerJobTickInterval, func(t time.Time) tea.Msg {
 		return runnerJobTickMsg(t)
 	})
 }
@@ -515,8 +522,7 @@ func (m Model) bgGuard(task func()) func() {
 func (m Model) startParallelSyncCmd() tea.Cmd {
 	run := m.bgGuard(func() {
 		var wg sync.WaitGroup
-		concurrency := 4
-		sem := make(chan struct{}, concurrency)
+		sem := make(chan struct{}, syncConcurrency)
 
 		for _, item := range m.Repos {
 			if item.IsArchived {

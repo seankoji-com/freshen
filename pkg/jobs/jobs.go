@@ -170,6 +170,13 @@ type GHJobsResponse struct {
 // ghCommandTimeout is the maximum duration for any gh CLI invocation.
 const ghCommandTimeout = 30 * time.Second
 
+// API pagination page sizes
+const (
+	runnersPageSize      = 100
+	workflowRunsPageSize = 50
+	jobsPageSize         = 50
+)
+
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
 // Returns the stdout bytes. On failure, the error includes stderr content.
 // It is a package variable (rather than a plain func) so tests can substitute
@@ -358,7 +365,7 @@ func jobStatusFromGH(status, conclusion string) JobStatus {
 
 // FetchOrgRunners queries GitHub API for all registered organization runners.
 func FetchOrgRunners(org string) ([]*RunnerItem, error) {
-	out, err := runGHCommand("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=100", org))
+	out, err := runGHCommand("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=%d", org, runnersPageSize))
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +462,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 	for _, status := range statuses {
 		out, err := runGHCommand(
 			"api",
-			fmt.Sprintf("/orgs/%s/actions/runs?status=%s&per_page=50", org, status),
+			fmt.Sprintf("/orgs/%s/actions/runs?status=%s&per_page=%d", org, status, workflowRunsPageSize),
 		)
 		if err != nil {
 			slog.Error("gh api org workflow runs failed", "org", org, "status", status, "error", err)
@@ -498,7 +505,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 
 			jobsOut, err := runGHCommand(
 				"api",
-				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repoName, run.ID),
+				fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repoName, run.ID, jobsPageSize),
 			)
 
 			var parsedJobsFromRun int
@@ -566,7 +573,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	// Step 1: get jobs list for this run to find the target job ID
 	out, err := runGHCommand(
 		"api",
-		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, runID),
+		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, runID, jobsPageSize),
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("jobs list: %w", err)

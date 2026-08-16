@@ -41,6 +41,16 @@ func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]by
 // runner is the package-level CommandRunner; tests swap it for a fake.
 var runner CommandRunner = &execRunner{}
 
+// API pagination limits and timeouts
+const (
+	defaultRepoLimit   = 1000
+	graphQLRepoLimit   = 100
+	defaultIssueLimit  = 50
+	defaultPRLimit     = 50
+	fetchTimeout       = 6 * time.Second
+	rebaseAbortTimeout = 10 * time.Second
+)
+
 type RepoStatus string
 
 const (
@@ -230,7 +240,7 @@ func GetGHRepoName(localDir string) string {
 
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
 func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
-	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
+	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", fmt.Sprintf("%d", defaultRepoLimit), "--json", "name,isArchived,url,sshUrl")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
 	}
@@ -245,7 +255,7 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
-	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
+	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org, graphQLRepoLimit)
 	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
 	if err != nil {
 		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
@@ -395,11 +405,11 @@ func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) 
 
 // FetchOpenIssuesList retrieves open GitHub issues with a 6-second timeout context.
 func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
+	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultIssueLimit), "--json", "number,title,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -421,11 +431,11 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 
 // FetchOpenPRsList retrieves open GitHub pull requests with a 6-second timeout context.
 func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultPRLimit), "--json", "number,title,headRefName,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -667,7 +677,7 @@ func SyncRepository(ctx context.Context, item *RepoItem) {
 		} else {
 			// Use a fresh context for the abort so a mid-rebase state isn't left behind
 			// even if the sync itself was cancelled.
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
 			if err := exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run(); err != nil {
 				item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git rebase --abort failed: %v", err))
 			}
