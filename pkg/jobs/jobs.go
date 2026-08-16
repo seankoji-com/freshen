@@ -172,7 +172,11 @@ const ghCommandTimeout = 30 * time.Second
 
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
 // Returns the stdout bytes. On failure, the error includes stderr content.
-func runGHCommand(args ...string) ([]byte, error) {
+// It is a package variable (rather than a plain func) so tests can substitute
+// a fake implementation instead of shelling out to the real gh CLI.
+var runGHCommand = defaultRunGHCommand
+
+func defaultRunGHCommand(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ghCommandTimeout)
 	defer cancel()
 
@@ -186,20 +190,27 @@ func runGHCommand(args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("gh api call timed out after %s: args=%v", ghCommandTimeout, args)
 	}
 	if err != nil {
-		errStr := strings.TrimSpace(stderr.String())
-		if strings.Contains(errStr, "API rate limit exceeded") {
-			return nil, fmt.Errorf("GitHub API rate limit exceeded")
-		}
-		// Take only the first line of stderr to avoid multiline dumps in UI toasts
-		if firstLine, _, ok := strings.Cut(errStr, "\n"); ok && firstLine != "" {
-			errStr = firstLine
-		}
-		if errStr != "" {
-			return nil, fmt.Errorf("gh api: %s", errStr)
-		}
-		return nil, fmt.Errorf("gh api: %w", err)
+		return nil, classifyGHError(stderr.String(), err)
 	}
 	return stdout.Bytes(), nil
+}
+
+// classifyGHError converts a failed gh invocation's stderr and exec error into
+// the error returned to callers: rate-limit responses are normalized to a
+// stable message, and multiline stderr is trimmed to its first line so UI
+// toasts don't get flooded with dumps.
+func classifyGHError(stderrOut string, execErr error) error {
+	errStr := strings.TrimSpace(stderrOut)
+	if strings.Contains(errStr, "API rate limit exceeded") {
+		return fmt.Errorf("GitHub API rate limit exceeded")
+	}
+	if firstLine, _, ok := strings.Cut(errStr, "\n"); ok && firstLine != "" {
+		errStr = firstLine
+	}
+	if errStr != "" {
+		return fmt.Errorf("gh api: %s", errStr)
+	}
+	return fmt.Errorf("gh api: %w", execErr)
 }
 
 // formatDuration returns a human-readable duration string from seconds.
