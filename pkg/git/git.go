@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -162,6 +163,15 @@ func GetLocalDirName(ghRepo string) string {
 	case "careynas.net":
 		return "wiki.robot.house"
 	default:
+		// Sanitize: reject paths containing /, \, or .. to prevent directory traversal
+		if strings.ContainsAny(ghRepo, "/\\") || strings.Contains(ghRepo, "..") || filepath.Base(ghRepo) != ghRepo {
+			// Return the base name with .. stripped
+			base := filepath.Base(ghRepo)
+			if base == "." || base == ".." {
+				base = ""
+			}
+			return base
+		}
 		return ghRepo
 	}
 }
