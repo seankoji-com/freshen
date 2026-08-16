@@ -240,6 +240,10 @@ type Model struct {
 	RunnerFetchFailed   bool
 	JobQueueFetchFailed bool
 
+	// pendingDeleteIndex holds the Repos index awaiting a second 'd' press
+	// to confirm deletion of an archived repo; -1 means no pending delete.
+	pendingDeleteIndex int
+
 	Spinner     spinner.Model
 	ProgressBar progress.Model
 	Viewport    viewport.Model
@@ -281,6 +285,7 @@ func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.C
 		SelectedIndex:       0,
 		SelectedRunnerIndex: 0,
 		SelectedJobIndex:    0,
+		pendingDeleteIndex:  -1,
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
@@ -561,6 +566,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		m.setToast("", 0)
+		if msg.String() != "d" {
+			m.pendingDeleteIndex = -1
+		}
 		switch msg.String() {
 
 		case "q", "ctrl+c":
@@ -809,18 +817,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if item.IsArchived {
-					_ = git.DeleteLocalRepo(item.Path)
-					deletedName := item.Name
+					if m.pendingDeleteIndex == m.SelectedIndex {
+						m.pendingDeleteIndex = -1
+						if err := git.DeleteLocalRepo(item.Path); err != nil {
+							m.setToast(fmt.Sprintf(" ⚠ Failed to delete '%s': %v", item.Name, err), 2)
+						} else {
+							deletedName := item.Name
 
-					m.Repos = append(m.Repos[:m.SelectedIndex], m.Repos[m.SelectedIndex+1:]...)
-					m.TotalCount = len(m.Repos)
+							m.Repos = append(m.Repos[:m.SelectedIndex], m.Repos[m.SelectedIndex+1:]...)
+							m.TotalCount = len(m.Repos)
 
-					if m.SelectedIndex >= len(m.Repos) && len(m.Repos) > 0 {
-						m.SelectedIndex = len(m.Repos) - 1
+							if m.SelectedIndex >= len(m.Repos) && len(m.Repos) > 0 {
+								m.SelectedIndex = len(m.Repos) - 1
+							}
+
+							m.setToast(fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName), 1)
+							m.updateViewport()
+						}
+					} else {
+						m.pendingDeleteIndex = m.SelectedIndex
+						m.setToast(fmt.Sprintf(" ⚠ Press 'd' again to delete archived repo '%s'.", item.Name), 2)
 					}
-
-					m.setToast(fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName), 1)
-					m.updateViewport()
 				}
 			}
 		}
@@ -2319,7 +2336,7 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
 	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [d] Del Archived  [X] Prune  [c] Copy  [q] Quit"
+	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [dd] Del Archived  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		msgText := m.ToastMsg
 		if lipgloss.Width(msgText) > m.Width {
