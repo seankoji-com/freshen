@@ -545,6 +545,12 @@ func (m Model) bgGuard(task func()) func() {
 // syncConcurrency bounds how many repositories are synced at once.
 const syncConcurrency = 4
 
+// syncRepositoryFn abstracts git.SyncRepository behind a package-level func
+// var so tests can control per-repo sync timing and observe the worker
+// pool's concurrency limit and cancellation behavior in startSyncCmd without
+// touching real git repos on disk.
+var syncRepositoryFn = git.SyncRepository
+
 // startSyncCmd syncs the given repositories in the background and streams their
 // state back into the update loop, one message per state change.
 //
@@ -592,7 +598,7 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				git.SyncRepository(ctx, r, func(snapshot *git.RepoItem) {
+				syncRepositoryFn(ctx, r, func(snapshot *git.RepoItem) {
 					// Give up on quit rather than block on an undrained channel.
 					select {
 					case snapshots <- snapshot:
