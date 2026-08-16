@@ -512,6 +512,12 @@ func (m Model) bgGuard(task func()) func() {
 	}
 }
 
+// syncRepositoryFn abstracts git.SyncRepository behind a package-level func
+// var so tests can control per-repo sync timing and observe the worker
+// pool's concurrency limit and cancellation behavior in startParallelSyncCmd
+// without touching real git repos on disk.
+var syncRepositoryFn = git.SyncRepository
+
 func (m Model) startParallelSyncCmd() tea.Cmd {
 	run := m.bgGuard(func() {
 		var wg sync.WaitGroup
@@ -533,7 +539,7 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				git.SyncRepository(m.ctx, r)
+				syncRepositoryFn(m.ctx, r)
 			}(item)
 		}
 

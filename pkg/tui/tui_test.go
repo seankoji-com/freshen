@@ -2,10 +2,12 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -555,5 +557,343 @@ func TestTruncateStringMultiByteUTF8(t *testing.T) {
 	runes := []rune(truncated)
 	if len(runes) > 30 {
 		t.Errorf("expected rune count <= 30, got %d for %q", len(runes), truncated)
+	}
+}
+
+// --- Orchestration command / message-handler error-branch coverage (#70) ---
+
+func TestHandleLoadedRunnersMsg(t *testing.T) {
+	t.Run("error surfaces toast and failure flag", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.IsRunnersLoading = true
+		m.handleLoadedRunnersMsg(loadedRunnersMsg{err: errors.New("boom")})
+
+		if m.IsRunnersLoading {
+			t.Errorf("expected IsRunnersLoading false after load completes")
+		}
+		if !m.RunnerFetchFailed {
+			t.Errorf("expected RunnerFetchFailed true on error")
+		}
+		if m.ConsecutiveErrors != 1 {
+			t.Errorf("expected ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors)
+		}
+		if m.ToastPriority != 2 {
+			t.Errorf("expected error-priority toast (2), got %d", m.ToastPriority)
+		}
+		if !strings.Contains(m.ToastMsg, "Runner fetch failed") || !strings.Contains(m.ToastMsg, "boom") {
+			t.Errorf("expected toast to mention the fetch failure, got %q", m.ToastMsg)
+		}
+	})
+
+	t.Run("success clears failure flag and merges runners", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.RunnerFetchFailed = true
+		m.ConsecutiveErrors = 3
+		m.handleLoadedRunnersMsg(loadedRunnersMsg{runners: []*jobs.RunnerItem{{ID: "r1", Name: "runner-1"}}})
+
+		if m.RunnerFetchFailed {
+			t.Errorf("expected RunnerFetchFailed to clear on success")
+		}
+		if m.ConsecutiveErrors != 0 {
+			t.Errorf("expected ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors)
+		}
+		if len(m.Runners) != 1 {
+			t.Errorf("expected 1 runner merged in, got %d", len(m.Runners))
+		}
+	})
+
+	t.Run("success with no runners sets an info toast", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.handleLoadedRunnersMsg(loadedRunnersMsg{runners: nil})
+
+		if !strings.Contains(m.ToastMsg, "No registered runners") {
+			t.Errorf("expected empty-runners toast, got %q", m.ToastMsg)
+		}
+		if m.ToastPriority != 1 {
+			t.Errorf("expected info-priority toast (1), got %d", m.ToastPriority)
+		}
+	})
+}
+
+func TestHandleLoadedJobQueueMsg(t *testing.T) {
+	t.Run("error with empty queue sets failure flag and toast", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.IsJobQueueLoading = true
+		cmd := m.handleLoadedJobQueueMsg(loadedJobQueueMsg{err: errors.New("api down")})
+
+		if m.IsJobQueueLoading {
+			t.Errorf("expected IsJobQueueLoading false after load completes")
+		}
+		if !m.JobQueueFetchFailed {
+			t.Errorf("expected JobQueueFetchFailed true on error")
+		}
+		if m.ConsecutiveErrors != 1 {
+			t.Errorf("expected ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors)
+		}
+		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Job queue may be incomplete") {
+			t.Errorf("expected error toast about the incomplete job queue, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
+		}
+		if cmd != nil {
+			t.Errorf("expected nil cmd when the errored fetch returned no partial data")
+		}
+	})
+
+	t.Run("error with partial queue still applies it and returns a log-fetch cmd", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.ActiveFocus = FocusJobs
+		partial := []*jobs.JobItem{
+			{ID: "run-1", Repo: "repo1", Name: "repo1 / ci", Status: jobs.JobRunning, RunID: 1, IsRunHeader: true},
+			{ID: "#1", Repo: "repo1", Name: "repo1 / ci / build", Status: jobs.JobRunning, RunID: 1},
+		}
+		cmd := m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: partial, err: errors.New("timeout")})
+
+		if !m.JobQueueFetchFailed {
+			t.Errorf("expected JobQueueFetchFailed true on error")
+		}
+		if len(m.JobQueue) == 0 {
+			t.Errorf("expected partial queue data to still be applied to model state")
+		}
+		if cmd == nil {
+			t.Errorf("expected a log-fetch cmd for the running selected job despite the error")
+		}
+	})
+
+	t.Run("success resets failure state", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.JobQueueFetchFailed = true
+		m.ConsecutiveErrors = 5
+		m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: nil})
+
+		if m.JobQueueFetchFailed {
+			t.Errorf("expected JobQueueFetchFailed to clear on success")
+		}
+		if m.ConsecutiveErrors != 0 {
+			t.Errorf("expected ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors)
+		}
+	})
+}
+
+func TestHandleLoadedJobLogsMsg(t *testing.T) {
+	t.Run("error with no existing logs surfaces the failure on the job", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.JobQueue = []*jobs.JobItem{{ID: "#1", Name: "repo1 / ci / build", RunID: 1}}
+		m.handleLoadedJobLogsMsg(loadedJobLogsMsg{jobID: "#1", err: errors.New("connection reset")})
+
+		logs := m.JobQueue[0].Logs
+		if len(logs) != 1 || !strings.Contains(logs[0], "log fetch failed") || !strings.Contains(logs[0], "connection reset") {
+			t.Errorf("expected job Logs to surface the fetch error, got %v", logs)
+		}
+	})
+
+	t.Run("error for an unmatched job id is a no-op", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.JobQueue = []*jobs.JobItem{{ID: "#1", Name: "repo1 / ci / build", RunID: 1, Logs: []string{"existing log line"}}}
+		m.handleLoadedJobLogsMsg(loadedJobLogsMsg{jobID: "#unknown", err: errors.New("boom")})
+
+		logs := m.JobQueue[0].Logs
+		if len(logs) != 1 || logs[0] != "existing log line" {
+			t.Errorf("expected untouched job logs when jobID doesn't match, got %v", logs)
+		}
+	})
+
+	t.Run("success overwrites logs and gh job id", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.JobQueue = []*jobs.JobItem{{ID: "#1", Name: "repo1 / ci / build", RunID: 1}}
+		m.handleLoadedJobLogsMsg(loadedJobLogsMsg{jobID: "#1", ghJobID: 42, logs: []string{"line1", "line2"}})
+
+		if len(m.JobQueue[0].Logs) != 2 || m.JobQueue[0].GHJobID != 42 {
+			t.Errorf("expected logs and GHJobID to be updated, got logs=%v ghJobID=%d", m.JobQueue[0].Logs, m.JobQueue[0].GHJobID)
+		}
+	})
+}
+
+func TestHandleOrgSyncedMsg(t *testing.T) {
+	t.Run("error surfaces toast and reports handled", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		m.IsOrgSyncing = true
+		_, handled := m.handleOrgSyncedMsg(orgSyncedMsg{err: errors.New("gh auth expired")})
+
+		if m.IsOrgSyncing {
+			t.Errorf("expected IsOrgSyncing false after load completes")
+		}
+		if !handled {
+			t.Errorf("expected handled=true on error")
+		}
+		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Fetch failed") || !strings.Contains(m.ToastMsg, "gh auth expired") {
+			t.Errorf("expected error toast about the fetch failure, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
+		}
+	})
+
+	t.Run("success without autoSync does not trigger a parallel sync", func(t *testing.T) {
+		m := newTestModel("/tmp/test", "test-org")
+		cmd, handled := m.handleOrgSyncedMsg(orgSyncedMsg{repos: []*git.RepoItem{{Name: "repo1"}}, autoSync: false})
+
+		if handled {
+			t.Errorf("expected handled=false on success")
+		}
+		if cmd != nil {
+			t.Errorf("expected nil cmd when autoSync is false")
+		}
+		if m.IsSyncing {
+			t.Errorf("expected IsSyncing to remain false when autoSync is false")
+		}
+	})
+
+	t.Run("success with autoSync starts a parallel sync", func(t *testing.T) {
+		orig := syncRepositoryFn
+		defer func() { syncRepositoryFn = orig }()
+		called := make(chan struct{}, 1)
+		syncRepositoryFn = func(ctx context.Context, item *git.RepoItem) {
+			called <- struct{}{}
+		}
+
+		m := newTestModel("/tmp/test", "test-org")
+		cmd, handled := m.handleOrgSyncedMsg(orgSyncedMsg{repos: []*git.RepoItem{{Name: "repo1"}}, autoSync: true})
+
+		if handled {
+			t.Errorf("expected handled=false on success")
+		}
+		if !m.IsSyncing {
+			t.Errorf("expected IsSyncing true when autoSync triggers a parallel sync")
+		}
+		if cmd == nil {
+			t.Fatalf("expected a non-nil sync cmd when autoSync is true")
+		}
+		cmd()
+
+		select {
+		case <-called:
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected syncRepositoryFn to be invoked for the loaded repo")
+		}
+	})
+}
+
+// TestStartParallelSyncCmd_SemaphoreCapsConcurrency proves the worker pool's
+// semaphore only allows the hardcoded concurrency limit (4) of syncs to run
+// at once, and that a 5th repo's sync is held back until a slot frees.
+func TestStartParallelSyncCmd_SemaphoreCapsConcurrency(t *testing.T) {
+	orig := syncRepositoryFn
+	defer func() { syncRepositoryFn = orig }()
+
+	const repoCount = 5 // one more than the hardcoded concurrency limit of 4
+	started := make(chan struct{}, repoCount)
+	release := make(chan struct{})
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem) {
+		started <- struct{}{}
+		<-release
+	}
+
+	m := newTestModel("/tmp/test", "test-org")
+	repos := make([]*git.RepoItem, repoCount)
+	for i := range repos {
+		repos[i] = &git.RepoItem{Name: fmt.Sprintf("repo%d", i)}
+	}
+	m.Repos = repos
+
+	cmd := m.startParallelSyncCmd()
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+
+	// Exactly 4 (the concurrency cap) should start without any release.
+	for i := 0; i < 4; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected 4 syncs to start concurrently, only observed %d", i)
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("5th sync started before any slot was freed; semaphore did not cap concurrency")
+	case <-time.After(100 * time.Millisecond):
+		// expected: the 5th is blocked acquiring the semaphore.
+	}
+
+	// Free one slot; the 5th should now be able to start.
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the 5th sync to start once a slot freed")
+	}
+
+	// Release the remaining 4 in-flight syncs so the command can finish.
+	for i := 0; i < 4; i++ {
+		release <- struct{}{}
+	}
+
+	select {
+	case msg := <-done:
+		if _, ok := msg.(syncFinishedMsg); !ok {
+			t.Errorf("expected syncFinishedMsg, got %T", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("startParallelSyncCmd did not complete after all slots were released")
+	}
+}
+
+// TestStartParallelSyncCmd_ContextCancellationStopsPendingWork proves that
+// cancelling the model's context stops repos that haven't yet been dispatched
+// from ever starting, even though already-dispatched syncs are allowed to
+// finish (the loop breaks on ctx.Err() rather than aborting in-flight work).
+func TestStartParallelSyncCmd_ContextCancellationStopsPendingWork(t *testing.T) {
+	orig := syncRepositoryFn
+	defer func() { syncRepositoryFn = orig }()
+
+	const repoCount = 6 // more than the concurrency limit (4), so repos remain pending
+	started := make(chan struct{}, repoCount)
+	release := make(chan struct{}, repoCount)
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem) {
+		started <- struct{}{}
+		<-release
+	}
+
+	m := newTestModel("/tmp/test", "test-org")
+	repos := make([]*git.RepoItem, repoCount)
+	for i := range repos {
+		repos[i] = &git.RepoItem{Name: fmt.Sprintf("repo%d", i)}
+	}
+	m.Repos = repos
+
+	cmd := m.startParallelSyncCmd()
+	done := make(chan tea.Msg, 1)
+	go func() { done <- cmd() }()
+
+	// Let the concurrency cap's worth of syncs start and occupy every slot;
+	// at this point at least 2 repos are still pending (never yet checked
+	// against ctx or the semaphore).
+	for i := 0; i < 4; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected 4 syncs to start, only observed %d", i)
+		}
+	}
+
+	m.cancel()
+
+	// Free every slot generously. At most one more repo (whichever had
+	// already passed its ctx check before cancellation landed) may still
+	// start, but the loop breaks on the first ctx.Err() it observes, so the
+	// last pending repo can never start once cancellation has landed.
+	totalStarted := 4
+	for i := 0; i < repoCount; i++ {
+		release <- struct{}{}
+		select {
+		case <-started:
+			totalStarted++
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	if totalStarted >= repoCount {
+		t.Errorf("expected fewer than %d syncs to run once cancellation landed, got %d", repoCount, totalStarted)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startParallelSyncCmd did not complete after releasing in-flight syncs")
 	}
 }
