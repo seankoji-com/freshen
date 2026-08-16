@@ -2,6 +2,7 @@
 
 > Token-efficient handbook for Claude, OpenCode, AGY, and other coding agents.
 > Read this first, then pull supplementary docs in `docs/` as needed.
+> Humans: see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev workflow.
 
 ## What this repo is
 

@@ -2,6 +2,8 @@
 
 **freshen** is a high-performance, interactive TUI (Terminal User Interface) application built with [Go](https://go.dev) and [Bubble Tea](https://github.com/charmbracelet/bubbletea) to manage, synchronize, stash, pull, and clean up multi-repository setups across GitHub organizations.
 
+> **Contributing?** See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, build/test commands, and the CI-critical `scripts/` directory.
+
 ---
 
 ## 🌟 Key Features
