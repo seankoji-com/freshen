@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -107,5 +108,130 @@ func TestMergeRunnersCrossReference(t *testing.T) {
 	}
 	if !strings.Contains(beta.OutputLogs[0], "Runner online") {
 		t.Errorf("expected 'Runner online' in new runner logs, got: %s", beta.OutputLogs[0])
+	}
+}
+
+// stubGH swaps the gh runner for the duration of a test, so the org job queue
+// can be exercised against canned API responses instead of the network.
+func stubGH(t *testing.T, handler func(path string) ([]byte, error)) {
+	t.Helper()
+	original := runGH
+	t.Cleanup(func() { runGH = original })
+
+	runGH = func(args ...string) ([]byte, error) {
+		return handler(args[len(args)-1])
+	}
+}
+
+// runsJSON is one repository's run list: an in-progress run, a queued run whose
+// jobs have not materialised yet, and a completed run that must be ignored.
+func runsJSON(base int64) string {
+	return fmt.Sprintf(`{"total_count":3,"workflow_runs":[
+	  {"id":%d,"name":"CI","display_title":"fix things","status":"in_progress","event":"pull_request","head_branch":"topic","created_at":"2026-08-16T10:00:00Z","run_started_at":"2026-08-16T10:00:05Z","pull_requests":[{"number":7,"title":"Fix things","html_url":"https://example.invalid/pull/7"}]},
+	  {"id":%d,"name":"CI","display_title":"queued one","status":"queued","event":"push","head_branch":"main","created_at":"2026-08-16T10:01:00Z"},
+	  {"id":%d,"name":"CI","display_title":"done","status":"completed","event":"push","head_branch":"main","created_at":"2026-08-16T09:00:00Z"}
+	]}`, base+1, base+2, base+3)
+}
+
+// jobsJSON pairs with runsJSON: a live job plus a successful one that the queue drops.
+func jobsJSON(base int64) string {
+	return fmt.Sprintf(`{"total_count":2,"jobs":[
+	  {"id":%d,"name":"build","status":"in_progress","started_at":"2026-08-16T10:00:10Z","runner_name":"carey-mac-alpha","runner_id":5},
+	  {"id":%d,"name":"lint","status":"completed","conclusion":"success"}
+	]}`, base+101, base+102)
+}
+
+// repoQueueHandler serves the two-endpoint conversation for a fixed set of repos,
+// giving each repo its own ID space the way GitHub does.
+func repoQueueHandler(bases map[string]int64) func(string) ([]byte, error) {
+	return func(path string) ([]byte, error) {
+		for repo, base := range bases {
+			prefix := "/repos/acme/" + repo + "/"
+			if !strings.HasPrefix(path, prefix) {
+				continue
+			}
+			switch {
+			case strings.Contains(path, fmt.Sprintf("/runs/%d/jobs", base+1)):
+				return []byte(jobsJSON(base)), nil
+			case strings.Contains(path, "/jobs?filter=latest"):
+				// The queued run has no jobs yet.
+				return []byte(`{"total_count":0,"jobs":[]}`), nil
+			case strings.Contains(path, "/actions/runs?per_page="):
+				return []byte(runsJSON(base)), nil
+			}
+		}
+		return nil, fmt.Errorf("gh api: gh: Not Found (HTTP 404)")
+	}
+}
+
+// FetchOrgJobQueue must poll per repository — GitHub has no org-wide workflow
+// runs endpoint — and must leave completed runs out of the queue.
+func TestFetchOrgJobQueuePerRepo(t *testing.T) {
+	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000, "beta": 2000}))
+
+	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "beta"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Per repo: the in-progress run contributes its live job (the successful
+	// "lint" job is dropped) and the queued run falls back to a run header.
+	if len(queue) != 4 {
+		t.Fatalf("expected 4 queue items across 2 repos, got %d", len(queue))
+	}
+
+	perRepo := map[string]int{}
+	for _, j := range queue {
+		perRepo[j.Repo]++
+		if j.RunID == 1003 || j.RunID == 2003 {
+			t.Errorf("completed run %d should not appear in the queue", j.RunID)
+		}
+	}
+	if perRepo["alpha"] != 2 || perRepo["beta"] != 2 {
+		t.Errorf("expected 2 items per repo, got %v", perRepo)
+	}
+	if queue[0].Status != JobRunning {
+		t.Errorf("expected a running job sorted first, got %s", queue[0].Status)
+	}
+	if queue[0].PRNumber != 7 {
+		t.Errorf("expected PR metadata carried onto job items, got %d", queue[0].PRNumber)
+	}
+}
+
+// One unreachable repository must not blank out the whole queue.
+func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
+	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000}))
+
+	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"})
+	if err != nil {
+		t.Fatalf("partial failure should not surface an error: %v", err)
+	}
+	if len(queue) != 2 {
+		t.Fatalf("expected the healthy repo's 2 items, got %d", len(queue))
+	}
+
+	// A sweep where every repo fails is a real error.
+	stubGH(t, repoQueueHandler(nil))
+	if _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"}); err == nil {
+		t.Fatal("expected an error when every repository fails")
+	}
+
+	// Rate limiting is reported distinctly so the UI can surface it.
+	stubGH(t, func(string) ([]byte, error) {
+		return nil, fmt.Errorf("GitHub API rate limit exceeded")
+	})
+	if _, err := FetchOrgJobQueue("acme", []string{"alpha"}); err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Fatalf("expected a rate limit error, got %v", err)
+	}
+}
+
+func TestFetchOrgJobQueueNoRepos(t *testing.T) {
+	stubGH(t, func(path string) ([]byte, error) {
+		t.Errorf("no repos means no API calls, but %q was requested", path)
+		return nil, nil
+	})
+	queue, err := FetchOrgJobQueue("acme", nil)
+	if err != nil || len(queue) != 0 {
+		t.Fatalf("expected an empty queue and no error, got %d items, err %v", len(queue), err)
 	}
 }
