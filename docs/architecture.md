@@ -29,6 +29,7 @@ pkg/
 - `FetchOrgRepos(org)` — shells out to `gh repo list` (JSON), returns all org repos
 - `FetchOrgRepoCounts(org)` — GraphQL query for open issues/PRs per repo
 - `SyncRepository(item)` — the core workflow. Determines default branch, checks dirty state, then:
+  - If not cloned locally: clones repo into target directory via `gh repo clone` (with `git clone` fallback), sets status `CLONED`
   - On default, clean: `git pull`
   - On default, dirty: `git stash && git pull && git stash apply`
   - On feature, clean: `git checkout default && git pull`
@@ -58,7 +59,7 @@ pkg/
 
 ## Package `pkg/tui` — Bubble Tea UI
 
-**Model struct:** ~25 fields including all app state — repos, runners, jobQueue, focus state, tab state, spinner, progress bar, viewport.
+**Model struct:** App state — repos, runners, jobQueue, focus state, tab state, spinner, progress bar, viewport, error tracking (`RunnerPermissionDenied`, `RunnerFetchFailed`, `JobQueueFetchFailed`).
 
 **Focus model:** Three-column left pane with focusable panels:
 - `FocusRepos` (0) — repository list with status badges
@@ -72,7 +73,8 @@ pkg/
 **Key behaviors:**
 - `Init()` fires 5 commands in batch: spinner tick, org repo load, runners load, job queue load, and two periodic ticks
 - Repo tick: every 5 minutes
-- Runner/job tick: every 10 seconds
+- Runner/job tick: every 10 seconds (skips runner query if `RunnerPermissionDenied` is set)
+- Runner permissions: HTTP 403 / non-admin runner access errors are caught gracefully (`RunnerPermissionDenied`), suppressing recurring toast alerts and displaying an informative notice in the runners panel
 - Job queue polling fetches real GitHub API data; no mock simulation
 - Job log fetching targets running jobs via 4-step fallback matching
 - Toast notifications for job status transitions (QUEUED→RUNNING, etc.)
@@ -86,19 +88,22 @@ pkg/
 - `parseJobHierarchy(fullName, repo)` — splits `"repo / workflow / job-name"` into (runName, jobName)
 - `findJobForRunner(runner, queue)` — 4-step matching: exact name, case-insensitive, any assigned, any running
 - `reconcileRunnerJobs(runners, queue, targetOrg)` — ensures running runners have corresponding queue entries
+- `isRunnerPermissionError(err)` — detects HTTP 403 / fine-grained admin permission errors from runner API calls
 - `highlightLogLine(line)` — regex-based syntax highlighting for log output
 - `getAvailableTags()` — collects unique runner tags for filter navigation
 
 ## Data flow
 
 1. On start: `Init()` → parallel `loadOrgReposCmd`, `loadRunnersCmd`, `loadJobQueueCmd`
-2. Org sync completes → `startParallelSyncCmd` (4 concurrent workers) → `SyncRepository` per repo
+2. Org sync completes → `startParallelSyncCmd` (4 concurrent workers) → `SyncRepository` per repo (clones uncloned repos if missing)
 3. Periodic ticks refresh org repos (5min) and runners+jobs (10s)
 4. Job log fetching is on-demand: triggered when selecting a running job; refreshed on each poll tick
 5. Left pane selection drives right-pane viewport content via `updateViewport()`
 
 ## Testing
 
+Tests in `pkg/git/git_test.go` test: deep cloning of `RepoItem`, progress snapshot publishing, offline sync execution, cancelled context handling, auto-cloning of uncloned repositories during sync.
+
 Tests in `pkg/jobs/jobs_test.go` test: default constructors, `FilterAndSortJobQueue`, `PollStep`, `mergeRunners` cross-referencing.
 
-Tests in `pkg/tui/tui_test.go` test: view height constraints, header stickiness, viewport initial offset, `loadJobQueueCmd` fallback, runner rendering (no "Busy" word, hyperlink presence), table ordering, toast notifications, hyperlink OSC 8 syntax, focused run viewport, Enter/Esc focus toggle.
+Tests in `pkg/tui/tui_test.go` test: view height constraints, header stickiness, viewport initial offset, `loadJobQueueCmd` fallback, runner rendering (no "Busy" word, hyperlink presence, empty state variants, permission notice), runner permission error detection, table ordering, toast notifications, hyperlink OSC 8 syntax, focused run viewport, Enter/Esc focus toggle.
