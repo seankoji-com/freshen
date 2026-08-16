@@ -171,6 +171,12 @@ type GHJobsResponse struct {
 // ghCommandTimeout is the maximum duration for any gh CLI invocation.
 const ghCommandTimeout = 30 * time.Second
 
+// API pagination page sizes
+const (
+	runnersPageSize = 100
+	jobsPageSize    = 50
+)
+
 // runGH is the indirection point for every gh invocation, so tests can supply
 // canned API responses instead of shelling out.
 var runGH = runGHCommand
@@ -363,7 +369,7 @@ func jobStatusFromGH(status, conclusion string) JobStatus {
 
 // FetchOrgRunners queries GitHub API for all registered organization runners.
 func FetchOrgRunners(org string) ([]*RunnerItem, error) {
-	out, err := runGH("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=100", org))
+	out, err := runGH("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=%d", org, runnersPageSize))
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +573,7 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
 		var parsedJobsFromRun int
 		jobsOut, jobsErr := runGH(
 			"api",
-			fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
+			fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, run.ID, jobsPageSize),
 		)
 		if jobsErr == nil {
 			var jobsResp GHJobsResponse
@@ -610,7 +616,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	// Step 1: get jobs list for this run to find the target job ID
 	out, err := runGH(
 		"api",
-		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, runID),
+		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, runID, jobsPageSize),
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("jobs list: %w", err)

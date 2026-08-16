@@ -42,6 +42,12 @@ const (
 	FocusJobs
 )
 
+// --- Sync and Refresh Intervals ---
+const (
+	repoTickInterval      = 5 * time.Minute
+	runnerJobTickInterval = 10 * time.Second
+)
+
 // --- NerdFont Glyphs & Color Palette ---
 var (
 	iconLeaf     = "🍃"
@@ -192,13 +198,13 @@ type runnerJobTickMsg time.Time
 type jobQueueTickMsg time.Time
 
 func repoTickCmd() tea.Cmd {
-	return tea.Every(5*time.Minute, func(t time.Time) tea.Msg {
+	return tea.Every(repoTickInterval, func(t time.Time) tea.Msg {
 		return repoTickMsg(t)
 	})
 }
 
 func runnerJobTickCmd() tea.Cmd {
-	return tea.Every(10*time.Second, func(t time.Time) tea.Msg {
+	return tea.Every(runnerJobTickInterval, func(t time.Time) tea.Msg {
 		return runnerJobTickMsg(t)
 	})
 }
@@ -244,6 +250,7 @@ type loadedPRsMsg struct {
 type Model struct {
 	TargetDir           string
 	TargetOrg           string
+	Concurrency         int
 	Repos               []*git.RepoItem
 	Runners             []*jobs.RunnerItem
 	JobQueue            []*jobs.JobItem
@@ -287,7 +294,7 @@ type Model struct {
 // NewModel constructs the TUI model. ctx should be cancelled by the caller
 // (e.g. on quit or an OS signal) to abort in-flight background git
 // operations; bgWG tracks those operations for a bounded shutdown wait.
-func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
+func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(colorSecondary)
@@ -302,6 +309,7 @@ func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.C
 	return Model{
 		TargetDir:           targetDir,
 		TargetOrg:           targetOrg,
+		Concurrency:         concurrency,
 		Repos:               make([]*git.RepoItem, 0),
 		Runners:             make([]*jobs.RunnerItem, 0),
 		JobQueue:            make([]*jobs.JobItem, 0),
@@ -445,7 +453,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 			}
 
 			if git.IsGitRepo(localPath) {
-				item.CurrentBranch = git.GetOriginalBranch(localPath)
+				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
 				item.DefaultBranch = git.GetDefaultBranch(localPath)
 			}
 
@@ -472,7 +480,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 						GHRepoName:    git.GetGHRepoName(name),
 						Path:          path,
 						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch: git.GetOriginalBranch(path),
+						CurrentBranch: git.GetOriginalBranch(m.ctx, path),
 						DefaultBranch: git.GetDefaultBranch(path),
 						Status:        git.StatusPending,
 						Logs:          make([]string, 0),
@@ -566,7 +574,11 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 		defer close(snapshots)
 
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, syncConcurrency)
+		concurrency := m.Concurrency
+		if concurrency <= 0 {
+			concurrency = syncConcurrency
+		}
+		sem := make(chan struct{}, concurrency)
 
 		for _, r := range work {
 			if ctx.Err() != nil {
@@ -979,10 +991,10 @@ func (m *Model) handleKeyTab4() (tea.Cmd, bool) {
 func (m *Model) handleKeyPrune() {
 	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 		item := m.Repos[m.SelectedIndex]
-		count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
+		count, err := git.PruneBranchesAndWorktrees(m.ctx, item.Path, item.DefaultBranch)
 		if err == nil {
-			item.CurrentBranch = git.GetOriginalBranch(item.Path)
-			item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+			item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+			item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
 			m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
 			m.updateViewport()
@@ -1046,8 +1058,8 @@ func (m *Model) handleKeySwitchBranch() {
 			target = item.DefaultBranch
 		}
 		if err := git.SwitchBranch(item, target); err == nil {
-			item.CurrentBranch = git.GetOriginalBranch(item.Path)
-			item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+			item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+			item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 			m.updateViewport()
 		}
 	}
@@ -1058,9 +1070,9 @@ func (m *Model) handleKeyPush() {
 		item := m.Repos[m.SelectedIndex]
 		if !item.IsArchived {
 			go m.bgGuard(func() {
-				if err := git.CommitPushPRAndSwitchDefault(item); err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+				if err := git.CommitPushPRAndSwitchDefault(m.ctx, item); err == nil {
+					item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+					item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 				}
 			})()
 			m.updateViewport()

@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 // CommandRunner abstracts external command execution so it can be faked in tests.
@@ -37,6 +40,16 @@ func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]by
 
 // runner is the package-level CommandRunner; tests swap it for a fake.
 var runner CommandRunner = &execRunner{}
+
+// API pagination limits and timeouts
+const (
+	defaultRepoLimit   = 1000
+	graphQLRepoLimit   = 100
+	defaultIssueLimit  = 50
+	defaultPRLimit     = 50
+	fetchTimeout       = 6 * time.Second
+	rebaseAbortTimeout = 10 * time.Second
+)
 
 type RepoStatus string
 
@@ -88,6 +101,23 @@ type BranchWorktreeDetails struct {
 	ChangedFiles   []string
 }
 
+// cleanBranchName trims whitespace and strips one leading * or + marker with or without a following space.
+func cleanBranchName(s string) string {
+	clean := strings.TrimSpace(s)
+	// Strip one leading * or + with or without a following space
+	if strings.HasPrefix(clean, "* ") {
+		clean = strings.TrimPrefix(clean, "* ")
+	} else if strings.HasPrefix(clean, "+ ") {
+		clean = strings.TrimPrefix(clean, "+ ")
+	} else if strings.HasPrefix(clean, "*") {
+		clean = strings.TrimPrefix(clean, "*")
+	} else if strings.HasPrefix(clean, "+") {
+		clean = strings.TrimPrefix(clean, "+")
+	}
+	clean = strings.TrimSpace(clean)
+	return clean
+}
+
 // GetLocalBranches returns local branch entries.
 func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	if len(d.LocalBranches) > 0 {
@@ -95,10 +125,7 @@ func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	}
 	var local []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if !strings.HasPrefix(clean, "remotes/") {
 			local = append(local, b)
 		}
@@ -113,10 +140,7 @@ func (d BranchWorktreeDetails) GetRemoteBranches() []string {
 	}
 	var remote []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if strings.HasPrefix(clean, "remotes/") {
 			remote = append(remote, b)
 		}
@@ -182,6 +206,7 @@ func ShortenHomePath(path string) string {
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
+// The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
 func GetLocalDirName(ghRepo string) string {
 	switch ghRepo {
 	case ".github":
@@ -194,6 +219,7 @@ func GetLocalDirName(ghRepo string) string {
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
+// The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
 func GetGHRepoName(localDir string) string {
 	switch localDir {
 	case "github":
@@ -207,7 +233,7 @@ func GetGHRepoName(localDir string) string {
 
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
 func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
-	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
+	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", fmt.Sprintf("%d", defaultRepoLimit), "--json", "name,isArchived,url,sshUrl")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
 	}
@@ -222,7 +248,7 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
-	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
+	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org, graphQLRepoLimit)
 	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
 	if err != nil {
 		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
@@ -244,11 +270,15 @@ func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 }
 
 // GetRepoBranchDetails fetches branches, worktrees, and changed file details.
-func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
+func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) BranchWorktreeDetails {
 	var details BranchWorktreeDetails
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Branches
-	cmd := exec.Command("git", "-C", path, "branch", "-a")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-a")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -256,10 +286,7 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 			if trimmed := strings.TrimSpace(line); trimmed != "" {
 				details.Branches = append(details.Branches, trimmed)
 
-				clean := trimmed
-				clean = strings.TrimPrefix(clean, "* ")
-				clean = strings.TrimPrefix(clean, "+ ")
-				clean = strings.TrimSpace(clean)
+				clean := cleanBranchName(trimmed)
 
 				if strings.HasPrefix(clean, "remotes/") {
 					details.RemoteBranches = append(details.RemoteBranches, trimmed)
@@ -270,8 +297,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Worktrees
-	cmd = exec.Command("git", "-C", path, "worktree", "list")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "worktree", "list")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -282,8 +313,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Changed files & status
-	cmd = exec.Command("git", "-C", path, "status", "--short")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "status", "--short")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -298,12 +333,23 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 }
 
 // PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
-func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
+func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) (int, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
 	// 1. Fetch & prune deleted remote-tracking references from origin
-	_ = exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run()
+	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
+	if err := exec.CommandContext(ctx, "git", "-C", path, "fetch", "--prune", "origin").Run(); err != nil {
+		slog.Warn("git fetch --prune failed", "path", path, "error", err)
+	}
+
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 
 	// 2. Force remove secondary git worktrees
-	cmdWorktree := exec.Command("git", "-C", path, "worktree", "list", "--porcelain")
+	cmdWorktree := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain")
 	var wtOut bytes.Buffer
 	cmdWorktree.Stdout = &wtOut
 	if err := cmdWorktree.Run(); err == nil {
@@ -313,32 +359,35 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 				wtPath := strings.TrimPrefix(line, "worktree ")
 				wtPath = strings.TrimSpace(wtPath)
 				if wtPath != "" && wtPath != path {
-					_ = exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run()
+					if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
+						slog.Warn("git worktree remove failed", "worktreePath", wtPath, "error", err)
+					}
 				}
 			}
 		}
 	}
-	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
+	if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "prune").Run(); err != nil {
+		slog.Warn("git worktree prune failed", "path", path, "error", err)
+	}
+
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 
 	// 3. Delete local non-default branches
-	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "--format=%(refname:short)")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return 0, err
 	}
 
-	currentBranch := GetOriginalBranch(path)
+	currentBranch := GetOriginalBranch(ctx, path)
 	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
-		b = strings.TrimSpace(b)
-		if strings.HasPrefix(b, "+") || strings.HasPrefix(b, "*") {
-			b = strings.TrimPrefix(b, "+")
-			b = strings.TrimPrefix(b, "*")
-			b = strings.TrimSpace(b)
-		}
+		b = cleanBranchName(b)
 		if b != "" && b != defaultBranch && b != currentBranch {
-			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
+			delCmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-D", b)
 			if delCmd.Run() == nil {
 				deletedCount++
 			}
@@ -349,11 +398,11 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 
 // FetchOpenIssuesList retrieves open GitHub issues with a 6-second timeout context.
 func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
+	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultIssueLimit), "--json", "number,title,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -367,16 +416,19 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	if issues == nil {
 		issues = []IssueItem{}
 	}
+	for i := range issues {
+		issues[i].Title = jobs.SanitizeTerminal(issues[i].Title)
+	}
 	return issues, nil
 }
 
 // FetchOpenPRsList retrieves open GitHub pull requests with a 6-second timeout context.
 func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultPRLimit), "--json", "number,title,headRefName,url")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
@@ -389,6 +441,10 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 	}
 	if prs == nil {
 		prs = []PRItem{}
+	}
+	for i := range prs {
+		prs[i].Title = jobs.SanitizeTerminal(prs[i].Title)
+		prs[i].HeadRefName = jobs.SanitizeTerminal(prs[i].HeadRefName)
 	}
 	return prs, nil
 }
@@ -415,13 +471,21 @@ func IsGitRepo(path string) bool {
 }
 
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
-func GetOriginalBranch(path string) string {
-	out, err := runner.Run(context.Background(), "git", "-C", path, "symbolic-ref", "--short", "HEAD")
+func GetOriginalBranch(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
 	if err == nil && strings.TrimSpace(string(out)) != "" {
 		return strings.TrimSpace(string(out))
 	}
 
-	out, err = runner.Run(context.Background(), "git", "-C", path, "rev-parse", "--short", "HEAD")
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	out, err = runner.Run(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
 	if err == nil && strings.TrimSpace(string(out)) != "" {
 		return strings.TrimSpace(string(out))
 	}
@@ -453,7 +517,7 @@ func GetDefaultBranch(path string) string {
 		return "master"
 	}
 
-	return GetOriginalBranch(path)
+	return GetOriginalBranch(context.Background(), path)
 }
 
 // SyncProgress receives a snapshot of a repository after each state change
@@ -528,13 +592,13 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	item.Status = StatusSyncing
 	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)
 
-	origBranch := GetOriginalBranch(item.Path)
+	origBranch := GetOriginalBranch(ctx, item.Path)
 	item.OriginalBranch = origBranch
 	item.CurrentBranch = origBranch
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
 
-	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
+	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
 		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
@@ -640,7 +704,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	} else {
 		// Use a fresh context for the abort so a mid-rebase state isn't left behind
 		// even if the sync itself was cancelled.
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
 		_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
 		abortCancel()
 		s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebase conflict: %s", rebaseOut.String())
@@ -661,26 +725,40 @@ func SwitchBranch(item *RepoItem, targetBranch string) error {
 }
 
 // CommitPushPRAndSwitchDefault commits unstaged changes, pushes to origin, creates/updates PR, and switches back to default branch.
-func CommitPushPRAndSwitchDefault(item *RepoItem) error {
+func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	branch := item.OriginalBranch
 	if branch == "" || branch == item.DefaultBranch {
 		return fmt.Errorf("cannot raise PR from default branch")
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
 
-	_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
+	// add/commit are best-effort: if there's nothing to commit (or the commit
+	// otherwise no-ops), we still want to push whatever's already committed.
+	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").Run()
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
+	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg).Run()
 
-	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	pushCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "push", "-u", "origin", branch)
 	if err := pushCmd.Run(); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
 		return err
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	if item.ExistingPRURL == "" {
-		prCmd := exec.Command("gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
+		prCmd := exec.CommandContext(ctx, "gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
 		prCmd.Dir = item.Path
 		var prOut bytes.Buffer
 		prCmd.Stdout = &prOut
@@ -697,7 +775,11 @@ func CommitPushPRAndSwitchDefault(item *RepoItem) error {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
 
-	coCmd := exec.Command("git", "-C", item.Path, "checkout", item.DefaultBranch)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", item.DefaultBranch)
 	if err := coCmd.Run(); err == nil {
 		item.CurrentBranch = item.DefaultBranch
 		item.Status = StatusPRCreated

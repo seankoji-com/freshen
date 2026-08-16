@@ -363,7 +363,7 @@ func TestGetOriginalBranch(t *testing.T) {
 			symbolicHeadKey: {out: []byte("feature/thing\n")},
 		})
 
-		if got := GetOriginalBranch(path); got != "feature/thing" {
+		if got := GetOriginalBranch(context.Background(), path); got != "feature/thing" {
 			t.Errorf("GetOriginalBranch() = %q, want %q", got, "feature/thing")
 		}
 	})
@@ -374,7 +374,7 @@ func TestGetOriginalBranch(t *testing.T) {
 			revParseKey:     {out: []byte("deadbee\n")},
 		})
 
-		if got := GetOriginalBranch(path); got != "deadbee" {
+		if got := GetOriginalBranch(context.Background(), path); got != "deadbee" {
 			t.Errorf("GetOriginalBranch() = %q, want %q", got, "deadbee")
 		}
 	})
@@ -385,7 +385,7 @@ func TestGetOriginalBranch(t *testing.T) {
 			revParseKey:     {err: errors.New("fatal: bad revision 'HEAD'")},
 		})
 
-		if got := GetOriginalBranch(path); got != "HEAD" {
+		if got := GetOriginalBranch(context.Background(), path); got != "HEAD" {
 			t.Errorf("GetOriginalBranch() = %q, want %q", got, "HEAD")
 		}
 	})
