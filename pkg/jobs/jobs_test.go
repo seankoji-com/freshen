@@ -1,11 +1,63 @@
 package jobs
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return b
+}
+
+func TestSanitizeTerminal(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "strips OSC 8 hyperlink injection",
+			input: "evil title \x1b]8;;https://evil.example\x1b\\click me\x1b]8;;\x1b\\",
+			want:  "evil title ]8;;https://evil.example\\click me]8;;\\",
+		},
+		{
+			name:  "strips bare ESC and control bytes",
+			input: "run\x1b[31mred\x1b[0m\x07bell\x7fdel",
+			want:  "run[31mred[0mbelldel",
+		},
+		{
+			name:  "preserves spaces and normal text",
+			input: "fix: normal PR title #64",
+			want:  "fix: normal PR title #64",
+		},
+		{
+			name:  "preserves UTF-8 multibyte runes",
+			input: "unicode ✅ 日本語",
+			want:  "unicode ✅ 日本語",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SanitizeTerminal(tc.input)
+			if got != tc.want {
+				t.Errorf("SanitizeTerminal(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+			if strings.ContainsAny(got, "\x1b\x07\x7f") {
+				t.Errorf("SanitizeTerminal(%q) = %q still contains control chars", tc.input, got)
+			}
+		})
+	}
+}
 
 func TestDefaultRunners(t *testing.T) {
 	runners := DefaultRunners()
@@ -233,5 +285,299 @@ func TestFetchOrgJobQueueNoRepos(t *testing.T) {
 	queue, err := FetchOrgJobQueue("acme", nil)
 	if err != nil || len(queue) != 0 {
 		t.Fatalf("expected an empty queue and no error, got %d items, err %v", len(queue), err)
+	}
+}
+
+func TestFetchOrgRunners(t *testing.T) {
+	t.Run("valid runners", func(t *testing.T) {
+		resp := GHRunnersResponse{
+			TotalCount: 2,
+			Runners: []GHRunnerInfo{
+				{ID: 1, Name: "carey-mac-alpha\x1b[31m", OS: "macOS", Status: "online", Busy: true, Labels: []GHRunnerLabel{{Name: "self-hosted"}, {Name: "ARM64"}}},
+				{ID: 2, Name: "carey-mac-beta", OS: "macOS", Status: "offline", Busy: false, Labels: []GHRunnerLabel{{Name: "self-hosted"}}},
+			},
+		}
+		stubGH(t, func(path string) ([]byte, error) {
+			if !strings.Contains(path, "actions/runners") {
+				t.Fatalf("unexpected path: %s", path)
+			}
+			return mustJSON(t, resp), nil
+		})
+
+		runners, err := FetchOrgRunners("acme")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(runners) != 2 {
+			t.Fatalf("expected 2 runners, got %d", len(runners))
+		}
+		if runners[0].Status != RunnerRunning {
+			t.Errorf("expected busy runner RUNNING, got %s", runners[0].Status)
+		}
+		if runners[0].Platform != "macOS/ARM64" {
+			t.Errorf("expected platform macOS/ARM64, got %q", runners[0].Platform)
+		}
+		if strings.ContainsAny(runners[0].Name, "\x1b") {
+			t.Errorf("expected sanitized runner name, got %q", runners[0].Name)
+		}
+		if runners[1].Status != RunnerOffline {
+			t.Errorf("expected offline runner OFFLINE, got %s", runners[1].Status)
+		}
+	})
+
+	t.Run("empty runners", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return mustJSON(t, GHRunnersResponse{TotalCount: 0}), nil
+		})
+		runners, err := FetchOrgRunners("acme")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(runners) != 0 {
+			t.Errorf("expected 0 runners, got %d", len(runners))
+		}
+	})
+
+	t.Run("malformed JSON", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return []byte("{not valid json"), nil
+		})
+		_, err := FetchOrgRunners("acme")
+		if err == nil || !strings.Contains(err.Error(), "failed to parse runners JSON") {
+			t.Fatalf("expected parse error, got %v", err)
+		}
+	})
+
+	t.Run("gh command failure", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return nil, errors.New("gh api: 404 not found")
+		})
+		if _, err := FetchOrgRunners("acme"); err == nil {
+			t.Fatal("expected error to propagate")
+		}
+	})
+}
+
+func TestExtractPRInfo(t *testing.T) {
+	cases := []struct {
+		name        string
+		run         GHWorkflowRun
+		wantNum     int
+		wantTitle   string
+		wantURLFunc func(t *testing.T, got string)
+	}{
+		{
+			name: "PR with URL present",
+			run: GHWorkflowRun{
+				PullRequests: []GHPullRequestInfo{{Number: 5, Title: "my title", URL: "https://github.com/acme/repo/pull/5"}},
+			},
+			wantNum:   5,
+			wantTitle: "my title",
+			wantURLFunc: func(t *testing.T, got string) {
+				if got != "https://github.com/acme/repo/pull/5" {
+					t.Errorf("expected provided URL preserved, got %q", got)
+				}
+			},
+		},
+		{
+			name: "PR without URL builds one",
+			run: GHWorkflowRun{
+				PullRequests: []GHPullRequestInfo{{Number: 9, Title: "another\x1b[0m"}},
+			},
+			wantNum:   9,
+			wantTitle: "another[0m",
+			wantURLFunc: func(t *testing.T, got string) {
+				if got != "https://github.com/acme/repo/pull/9" {
+					t.Errorf("expected constructed URL, got %q", got)
+				}
+			},
+		},
+		{
+			name:      "no PR falls back to DisplayTitle",
+			run:       GHWorkflowRun{DisplayTitle: "run title\x07"},
+			wantNum:   0,
+			wantTitle: "run title",
+			wantURLFunc: func(t *testing.T, got string) {
+				if got != "" {
+					t.Errorf("expected empty URL, got %q", got)
+				}
+			},
+		},
+		{
+			name:      "no PR, no DisplayTitle",
+			run:       GHWorkflowRun{},
+			wantNum:   0,
+			wantTitle: "",
+			wantURLFunc: func(t *testing.T, got string) {
+				if got != "" {
+					t.Errorf("expected empty URL, got %q", got)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			num, title, url := extractPRInfo(tc.run, "acme", "repo")
+			if num != tc.wantNum {
+				t.Errorf("expected PR number %d, got %d", tc.wantNum, num)
+			}
+			if title != tc.wantTitle {
+				t.Errorf("expected title %q, got %q", tc.wantTitle, title)
+			}
+			tc.wantURLFunc(t, url)
+		})
+	}
+}
+
+func TestFetchJobLogs(t *testing.T) {
+	t.Run("jobs list command fails", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return nil, errors.New("boom")
+		})
+		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
+		if err == nil || !strings.Contains(err.Error(), "jobs list:") {
+			t.Fatalf("expected jobs list error, got %v", err)
+		}
+	})
+
+	t.Run("jobs list malformed JSON", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return []byte("{bad"), nil
+		})
+		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
+		if err == nil || !strings.Contains(err.Error(), "jobs parse:") {
+			t.Fatalf("expected jobs parse error, got %v", err)
+		}
+	})
+
+	t.Run("no job found", func(t *testing.T) {
+		stubGH(t, func(path string) ([]byte, error) {
+			return mustJSON(t, GHJobsResponse{}), nil
+		})
+		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
+		if err == nil || !strings.Contains(err.Error(), "no job found") {
+			t.Fatalf("expected no-job error, got %v", err)
+		}
+	})
+
+	t.Run("matches by GHJobID and returns trimmed raw logs", func(t *testing.T) {
+		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{{ID: 55, Name: "build", Status: "in_progress"}}}
+		stubGH(t, func(path string) ([]byte, error) {
+			if strings.Contains(path, "jobs?filter=latest") {
+				return mustJSON(t, jobsResp), nil
+			}
+			if strings.Contains(path, "actions/jobs/55/logs") {
+				return []byte("line1\nline2\nline3\n"), nil
+			}
+			t.Fatalf("unexpected path: %v", path)
+			return nil, nil
+		})
+
+		lines, jobID, err := FetchJobLogs("acme", "repo", 1, 55, "", 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if jobID != 55 {
+			t.Errorf("expected jobID 55, got %d", jobID)
+		}
+		if len(lines) != 2 || lines[0] != "line2" || lines[1] != "line3" {
+			t.Errorf("expected last 2 lines, got %v", lines)
+		}
+	})
+
+	t.Run("falls back to step glyphs when logs unavailable", func(t *testing.T) {
+		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{
+			{ID: 60, Name: "build", Status: "in_progress", Steps: []GHJobStep{
+				{Number: 1, Name: "checkout", Status: "completed", Conclusion: "success"},
+				{Number: 2, Name: "test", Status: "in_progress"},
+			}},
+		}}
+		stubGH(t, func(path string) ([]byte, error) {
+			if strings.Contains(path, "jobs?filter=latest") {
+				return mustJSON(t, jobsResp), nil
+			}
+			if strings.Contains(path, "actions/jobs/60/logs") {
+				return nil, errors.New("logs unavailable")
+			}
+			t.Fatalf("unexpected path: %v", path)
+			return nil, nil
+		})
+
+		lines, jobID, err := FetchJobLogs("acme", "repo", 1, 60, "", 10)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if jobID != 60 {
+			t.Errorf("expected jobID 60, got %d", jobID)
+		}
+		if len(lines) != 2 {
+			t.Fatalf("expected 2 step lines, got %d: %v", len(lines), lines)
+		}
+		if !strings.Contains(lines[0], "✓") || !strings.Contains(lines[0], "checkout") {
+			t.Errorf("expected success glyph for checkout step, got %q", lines[0])
+		}
+		if !strings.Contains(lines[1], "▶") || !strings.Contains(lines[1], "test") {
+			t.Errorf("expected in_progress glyph for test step, got %q", lines[1])
+		}
+	})
+
+	t.Run("matches by job name substring fallback", func(t *testing.T) {
+		jobsResp := GHJobsResponse{Jobs: []GHJobInfo{{ID: 70, Name: "build-and-test", Status: "queued"}}}
+		stubGH(t, func(path string) ([]byte, error) {
+			if strings.Contains(path, "jobs?filter=latest") {
+				return mustJSON(t, jobsResp), nil
+			}
+			if strings.Contains(path, "actions/jobs/70/logs") {
+				return []byte("only line\n"), nil
+			}
+			t.Fatalf("unexpected path: %v", path)
+			return nil, nil
+		})
+
+		_, jobID, err := FetchJobLogs("acme", "repo", 1, 0, "build", 10)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if jobID != 70 {
+			t.Errorf("expected substring match to find job 70, got %d", jobID)
+		}
+	})
+}
+
+func TestClassifyGHError(t *testing.T) {
+	cases := []struct {
+		name    string
+		stderr  string
+		execErr error
+		want    string
+	}{
+		{
+			name:    "rate limit message normalized",
+			stderr:  "HTTP 403: API rate limit exceeded for installation ID 123.",
+			execErr: errors.New("exit status 1"),
+			want:    "GitHub API rate limit exceeded",
+		},
+		{
+			name:    "multiline stderr truncated to first line",
+			stderr:  "first line of error\nsecond line\nthird line",
+			execErr: errors.New("exit status 1"),
+			want:    "gh api: first line of error",
+		},
+		{
+			name:    "empty stderr falls back to wrapped exec error",
+			stderr:  "",
+			execErr: errors.New("exit status 127"),
+			want:    "gh api: exit status 127",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyGHError(tc.stderr, tc.execErr)
+			if got == nil || got.Error() != tc.want {
+				t.Errorf("classifyGHError(%q, %v) = %v, want %q", tc.stderr, tc.execErr, got, tc.want)
+			}
+		})
 	}
 }
