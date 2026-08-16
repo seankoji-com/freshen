@@ -480,15 +480,26 @@ func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
 	}
 }
 
-func (m Model) startParallelSyncCmd() tea.Cmd {
+// bgGuard wraps task with bgWG tracking: Add(1) runs immediately (on the
+// caller's goroutine, before any `go` statement), and Done() is deferred
+// inside the returned function so it always fires once task completes,
+// whether that function is invoked inline or launched in a new goroutine.
+// This is the single choke point background git tasks must go through so
+// the bgWG guard can't be skipped at a launch site.
+func (m Model) bgGuard(task func()) func() {
 	if m.bgWG != nil {
 		m.bgWG.Add(1)
 	}
-	return func() tea.Msg {
+	return func() {
 		if m.bgWG != nil {
 			defer m.bgWG.Done()
 		}
+		task()
+	}
+}
 
+func (m Model) startParallelSyncCmd() tea.Cmd {
+	run := m.bgGuard(func() {
 		var wg sync.WaitGroup
 		concurrency := 4
 		sem := make(chan struct{}, concurrency)
@@ -513,6 +524,9 @@ func (m Model) startParallelSyncCmd() tea.Cmd {
 		}
 
 		wg.Wait()
+	})
+	return func() tea.Msg {
+		run()
 		return syncFinishedMsg{}
 	}
 }
@@ -723,15 +737,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					if m.bgWG != nil {
-						m.bgWG.Add(1)
-					}
-					go func(r *git.RepoItem) {
-						if m.bgWG != nil {
-							defer m.bgWG.Done()
-						}
-						git.SyncRepository(m.ctx, r)
-					}(item)
+					go m.bgGuard(func() {
+						git.SyncRepository(m.ctx, item)
+					})()
 					m.updateViewport()
 				}
 			}
@@ -780,12 +788,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
-					go func(r *git.RepoItem) {
-						if err := git.CommitPushPRAndSwitchDefault(r); err == nil {
-							r.CurrentBranch = git.GetOriginalBranch(r.Path)
-							r.BranchDetails = git.GetRepoBranchDetails(r.Path, r.DefaultBranch)
+					go m.bgGuard(func() {
+						if err := git.CommitPushPRAndSwitchDefault(item); err == nil {
+							item.CurrentBranch = git.GetOriginalBranch(item.Path)
+							item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
 						}
-					}(item)
+					})()
 					m.updateViewport()
 				}
 			}
