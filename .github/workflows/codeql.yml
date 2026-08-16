@@ -6,8 +6,9 @@ name: CodeQL analysis (free)
 # repos), so there is no Security-tab integration — review findings via the
 # artifact + the per-run "Findings summary" in the job summary.
 #
-# build-mode: none = buildless extraction (no npm/build step). CodeQL CLI has no
-# linux/arm64 build, so this is pinned to X64 runners only.
+# build-mode: autobuild — CodeQL 2.26+ rejects build-mode none for Go, so the
+# job installs Go (setup-go, version from go.mod) and lets CodeQL autobuild.
+# CodeQL CLI has no linux/arm64 build, so this is pinned to X64 runners only.
 
 on:
   push:
@@ -37,11 +38,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
-          build-mode: none
+          build-mode: autobuild
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4
