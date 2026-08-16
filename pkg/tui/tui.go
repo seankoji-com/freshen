@@ -423,7 +423,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 			}
 
 			if git.IsGitRepo(localPath) {
-				item.CurrentBranch = git.GetOriginalBranch(localPath)
+				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
 				item.DefaultBranch = git.GetDefaultBranch(localPath)
 			}
 
@@ -450,7 +450,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 						GHRepoName:    git.GetGHRepoName(name),
 						Path:          path,
 						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch: git.GetOriginalBranch(path),
+						CurrentBranch: git.GetOriginalBranch(m.ctx, path),
 						DefaultBranch: git.GetDefaultBranch(path),
 						Status:        git.StatusPending,
 						Logs:          make([]string, 0),
@@ -743,10 +743,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "X":
 			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 				item := m.Repos[m.SelectedIndex]
-				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
+				count, err := git.PruneBranchesAndWorktrees(m.ctx, item.Path, item.DefaultBranch)
 				if err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+					item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+					item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
 					m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
 					m.updateViewport()
@@ -804,8 +804,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					target = item.DefaultBranch
 				}
 				if err := git.SwitchBranch(item, target); err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+					item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+					item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 					m.updateViewport()
 				}
 			}
@@ -815,9 +815,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				item := m.Repos[m.SelectedIndex]
 				if !item.IsArchived {
 					go m.bgGuard(func() {
-						if err := git.CommitPushPRAndSwitchDefault(item); err == nil {
-							item.CurrentBranch = git.GetOriginalBranch(item.Path)
-							item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
+						if err := git.CommitPushPRAndSwitchDefault(m.ctx, item); err == nil {
+							item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+							item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
 						}
 					})()
 					m.updateViewport()
