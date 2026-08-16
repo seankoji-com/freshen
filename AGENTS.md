@@ -43,3 +43,4 @@ go test ./...                  # test
 - `docs/architecture.md` — full package layout, data flow, type catalog, function catalog
 - `docs/conventions.md` — code patterns, naming, testing style, Lip Gloss conventions
 - `docs/dependencies.md` — Go modules, external binaries, build requirements
+- `docs/persona-review-setup.md` — persona review CI: routine/App/secret setup, scripts, validation checklist
