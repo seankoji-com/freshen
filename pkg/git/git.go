@@ -61,6 +61,23 @@ type BranchWorktreeDetails struct {
 	ChangedFiles   []string
 }
 
+// cleanBranchName trims whitespace and strips one leading * or + marker with or without a following space.
+func cleanBranchName(s string) string {
+	clean := strings.TrimSpace(s)
+	// Strip one leading * or + with or without a following space
+	if strings.HasPrefix(clean, "* ") {
+		clean = strings.TrimPrefix(clean, "* ")
+	} else if strings.HasPrefix(clean, "+ ") {
+		clean = strings.TrimPrefix(clean, "+ ")
+	} else if strings.HasPrefix(clean, "*") {
+		clean = strings.TrimPrefix(clean, "*")
+	} else if strings.HasPrefix(clean, "+") {
+		clean = strings.TrimPrefix(clean, "+")
+	}
+	clean = strings.TrimSpace(clean)
+	return clean
+}
+
 // GetLocalBranches returns local branch entries.
 func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	if len(d.LocalBranches) > 0 {
@@ -68,10 +85,7 @@ func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	}
 	var local []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if !strings.HasPrefix(clean, "remotes/") {
 			local = append(local, b)
 		}
@@ -86,10 +100,7 @@ func (d BranchWorktreeDetails) GetRemoteBranches() []string {
 	}
 	var remote []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if strings.HasPrefix(clean, "remotes/") {
 			remote = append(remote, b)
 		}
@@ -235,10 +246,7 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 			if trimmed := strings.TrimSpace(line); trimmed != "" {
 				details.Branches = append(details.Branches, trimmed)
 
-				clean := trimmed
-				clean = strings.TrimPrefix(clean, "* ")
-				clean = strings.TrimPrefix(clean, "+ ")
-				clean = strings.TrimSpace(clean)
+				clean := cleanBranchName(trimmed)
 
 				if strings.HasPrefix(clean, "remotes/") {
 					details.RemoteBranches = append(details.RemoteBranches, trimmed)
@@ -317,12 +325,7 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 	currentBranch := GetOriginalBranch(path)
 	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
-		b = strings.TrimSpace(b)
-		if strings.HasPrefix(b, "+") || strings.HasPrefix(b, "*") {
-			b = strings.TrimPrefix(b, "+")
-			b = strings.TrimPrefix(b, "*")
-			b = strings.TrimSpace(b)
-		}
+		b = cleanBranchName(b)
 		if b != "" && b != defaultBranch && b != currentBranch {
 			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
 			if delCmd.Run() == nil {
