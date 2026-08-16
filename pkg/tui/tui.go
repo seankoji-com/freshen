@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -151,7 +153,7 @@ var (
 	cellNameStyle       = lipgloss.NewStyle().Width(20)
 	cellBranchStyle     = lipgloss.NewStyle().Width(20)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
-	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
+	cellIssuesStyle     = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
 
 	// Pre-compiled regex for highlightLogLine (package level to avoid re-compiling on every call)
 	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
@@ -258,10 +260,11 @@ type Model struct {
 	TotalCount          int
 	ToastMsg            string
 	FocusedRunID        int64 // When non-zero, a specific workflow run is focused
-	ToastPriority       int   // higher priority overrides lower; 0 = none, 1 = info, 2 = error
-	ConsecutiveErrors   int
-	RunnerFetchFailed   bool
-	JobQueueFetchFailed bool
+	ToastPriority          int // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	ConsecutiveErrors      int
+	RunnerFetchFailed      bool
+	RunnerPermissionDenied bool
+	JobQueueFetchFailed    bool
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -409,7 +412,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 		for _, ghRepo := range orgRepos {
 			localDir := git.GetLocalDirName(ghRepo.Name)
-			localPath := fmt.Sprintf("%s/%s", m.TargetDir, localDir)
+			localPath := filepath.Join(m.TargetDir, localDir)
 
 			localExists := false
 			if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
@@ -426,6 +429,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 				Path:       localPath,
 				URL:        ghRepo.URL,
 				IsArchived: ghRepo.IsArchived,
+				IsNew:      !localExists,
 				Status:     git.StatusPending,
 				Logs:       make([]string, 0),
 			}
@@ -451,7 +455,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 		for _, name := range entries {
 			if _, exists := repoMap[name]; !exists {
-				path := fmt.Sprintf("%s/%s", m.TargetDir, name)
+				path := filepath.Join(m.TargetDir, name)
 				if git.IsGitRepo(path) {
 					item := &git.RepoItem{
 						Name:          name,
@@ -608,7 +612,21 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 }
 
 func copyToClipboard(text string) error {
-	cmd := exec.Command("pbcopy")
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		if _, err := exec.LookPath("wl-copy"); err == nil {
+			cmd = exec.Command("wl-copy")
+		} else if _, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		} else {
+			cmd = exec.Command("xsel", "--clipboard", "--input")
+		}
+	}
 	cmd.Stdin = strings.NewReader(text)
 	return cmd.Run()
 }
@@ -662,7 +680,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ActiveFocus = (m.ActiveFocus + 1) % 3
 			m.updateViewport()
 
-		case "up":
+		case "up", "k":
 			switch m.ActiveFocus {
 			case FocusRepos:
 				if m.SelectedIndex > 0 {
@@ -702,7 +720,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "down":
+		case "down", "j":
 			switch m.ActiveFocus {
 			case FocusRepos:
 				if m.SelectedIndex < len(m.Repos)-1 {
@@ -744,36 +762,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "right", "l", "tab":
+		case "tab":
+			m.ActiveFocus = (m.ActiveFocus + 1) % 3
+			m.updateViewport()
+			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+				j := m.JobQueue[m.SelectedJobIndex]
+				if j.Status == jobs.JobRunning {
+					cmds = append(cmds, m.loadJobLogsCmd(j))
+				}
+			}
+
+		case "shift+tab":
+			m.ActiveFocus = (m.ActiveFocus + 2) % 3
+			m.updateViewport()
+			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+				j := m.JobQueue[m.SelectedJobIndex]
+				if j.Status == jobs.JobRunning {
+					cmds = append(cmds, m.loadJobLogsCmd(j))
+				}
+			}
+
+		case "right", "l":
 			if m.ActiveFocus == FocusRunners {
 				tags := m.getAvailableTags()
 				if len(tags) > 0 {
 					m.SelectedTagIndex = (m.SelectedTagIndex + 1) % len(tags)
 					m.updateViewport()
 				}
-			} else if m.ActiveFocus == FocusRepos {
+			} else {
+				m.ActiveFocus = FocusRepos
 				m.ActiveTab = (m.ActiveTab + 1) % 4
 				m.updateViewport()
 				return m, m.triggerTabFetch()
-			} else {
-				m.ActiveFocus = (m.ActiveFocus + 1) % 3
-				m.updateViewport()
 			}
 
-		case "left", "h", "shift+tab":
+		case "left", "h":
 			if m.ActiveFocus == FocusRunners {
 				tags := m.getAvailableTags()
 				if len(tags) > 0 {
 					m.SelectedTagIndex = (m.SelectedTagIndex - 1 + len(tags)) % len(tags)
 					m.updateViewport()
 				}
-			} else if m.ActiveFocus == FocusRepos {
+			} else {
+				m.ActiveFocus = FocusRepos
 				m.ActiveTab = (m.ActiveTab + 3) % 4
 				m.updateViewport()
 				return m, m.triggerTabFetch()
-			} else {
-				m.ActiveFocus = (m.ActiveFocus + 2) % 3
-				m.updateViewport()
 			}
 
 		case "1":
@@ -782,18 +816,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateViewport()
 
 		case "2":
-			m.ActiveFocus = FocusRunners
+			m.ActiveFocus = FocusRepos
+			m.ActiveTab = TabBranches
 			m.updateViewport()
 
 		case "3":
-			m.ActiveFocus = FocusJobs
+			m.ActiveFocus = FocusRepos
+			m.ActiveTab = TabIssues
 			m.updateViewport()
+			return m, m.triggerTabFetch()
 
 		case "4":
-			if m.ActiveFocus == FocusRepos {
-				m.ActiveTab = TabPRs
+			m.ActiveFocus = FocusRepos
+			m.ActiveTab = TabPRs
+			m.updateViewport()
+			return m, m.triggerTabFetch()
+
+		case "a", "s":
+			if !m.IsSyncing && len(m.Repos) > 0 {
+				m.IsSyncing = true
+				m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
+				cmds = append(cmds, m.startSyncCmd(m.Repos, true))
 				m.updateViewport()
-				return m, m.triggerTabFetch()
 			}
 
 		case "X":
@@ -919,7 +963,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateViewport()
 
 	case tea.MouseMsg:
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if msg.Button == tea.MouseButtonWheelUp {
+			m.Viewport.LineUp(3)
+		} else if msg.Button == tea.MouseButtonWheelDown {
+			m.Viewport.LineDown(3)
+		} else if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 			// Click in Left Column Panes
 			if msg.X < m.Width/2 {
 				// Use panel heights from View() layout instead of content lengths
@@ -999,7 +1047,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		jobs.PollStep(m.Runners, m.JobQueue)
 		m.updateViewport()
 		var cmdsToAdd []tea.Cmd
-		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd(), runnerJobTickCmd())
+		if !m.RunnerPermissionDenied {
+			cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
+		}
+		cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd())
 		// Refresh logs for selected running job
 		if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 			selJob := m.JobQueue[m.SelectedJobIndex]
@@ -1016,19 +1067,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.IsRunnersLoading = false
 		if msg.err != nil {
 			m.RunnerFetchFailed = true
-			m.ConsecutiveErrors++
-			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
-			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+			if isRunnerPermissionError(msg.err) {
+				m.RunnerPermissionDenied = true
+				slog.Debug("runner fetch forbidden (org admin permissions required)", "org", m.TargetOrg, "error", msg.err)
+				if len(m.Runners) == 0 && len(m.JobQueue) > 0 {
+					m.Runners = extractRunnersFromJobQueue(m.JobQueue, m.Runners)
+				}
+			} else {
+				m.ConsecutiveErrors++
+				slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
+				m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+			}
 		} else {
 			m.RunnerFetchFailed = false
+			m.RunnerPermissionDenied = false
 			m.ConsecutiveErrors = 0
 			// Always update runners, even if empty
 			merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
 			m.Runners = merged
-
-			if len(m.Runners) == 0 {
-				m.setToast(" No registered runners found for org.", 1)
-			}
 
 			m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
 			m.updateViewport()
@@ -1043,6 +1099,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
 			if len(msg.queue) > 0 {
 				m.processJobQueueUpdate(msg.queue)
+				if len(m.Runners) == 0 || m.RunnerPermissionDenied {
+					m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
+				}
 				cmds = append(cmds, m.triggerLogFetchForSelectedJob())
 			}
 			m.updateViewport()
@@ -1050,6 +1109,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.JobQueueFetchFailed = false
 			m.ConsecutiveErrors = 0
 			m.processJobQueueUpdate(msg.queue)
+			if len(m.Runners) == 0 || m.RunnerPermissionDenied {
+				m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
+			}
 			cmds = append(cmds, m.triggerLogFetchForSelectedJob())
 			m.updateViewport()
 		}
@@ -1998,30 +2060,36 @@ func (m Model) View() string {
 
 	// ------------------ PANEL 1: REPOSITORIES ------------------
 	var repoLines []string
-	availRepoW := paneInnerWidth - 14
-	if availRepoW < 38 {
-		availRepoW = 38
+
+	// Fixed columns & overhead:
+	// Row prefix: 2 chars ("> " or "  ")
+	// Status icon: 2 chars ("✓ ")
+	// Spaces: 3 chars (between name/branch, branch/prs, prs/issues)
+	// PRs column: 4 chars
+	// ISS column: 4 chars
+	// Total overhead = 2 + 2 + 3 + 4 + 4 = 15 chars
+	availRepoW := paneInnerWidth - 15
+	if availRepoW < 16 {
+		availRepoW = 16
 	}
 	repoNameW := (availRepoW * 45) / 100
-	if repoNameW < 18 {
-		repoNameW = 18
+	if repoNameW < 8 {
+		repoNameW = 8
 	}
 	branchW := availRepoW - repoNameW
-	if branchW < 20 {
-		branchW = 20
-	} else if branchW > 35 {
-		branchW = 35
+	if branchW < 8 {
+		branchW = 8
 	}
 
 	dynCellNameStyle := lipgloss.NewStyle().Width(repoNameW)
 	dynCellBranchStyle := lipgloss.NewStyle().Width(branchW)
 
-	repoHeader := fmt.Sprintf("%s%s %s %s %s",
+	repoHeader := fmt.Sprintf("  %s%s %s %s %s",
 		cellStatusIconStyle.Render(""),
 		dynCellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
 		dynCellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
-		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
+		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISS"),
 	)
 	repoLines = append(repoLines, clipLine(repoHeader))
 	repoLines = append(repoLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
@@ -2048,20 +2116,20 @@ func (m Model) View() string {
 		for i := startIdx; i < endIdx; i++ {
 			item := m.Repos[i]
 			statusIconStr := cellStatusIconStyle.Render(m.renderStatusBadge(item))
-			nameCell := dynCellNameStyle.Render(truncateString(item.Name, repoNameW-1))
+			nameCell := dynCellNameStyle.Render(truncateString(item.Name, repoNameW))
 
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
 				branchStr = "-"
 			}
-			branchStr = truncateString(branchStr, branchW-1)
-			displayText := fmt.Sprintf(" %s", branchStr)
+			branchStr = truncateString(branchStr, branchW)
+			displayText := branchStr
 
 			var branchStyle lipgloss.Style
 			isDefaultBranch := branchStr == "main" || branchStr == "master"
 
 			if item.IsArchived {
-				displayText = " Archived"
+				displayText = "Archived"
 				branchStyle = lipgloss.NewStyle().Foreground(colorMuted).Strikethrough(true)
 			} else if item.Status == git.StatusError || item.Status == git.StatusRebaseConflict {
 				branchStyle = lipgloss.NewStyle().Foreground(colorRed).Bold(true)
@@ -2096,7 +2164,7 @@ func (m Model) View() string {
 			line := fmt.Sprintf("%s%s %s %s %s", statusIconStr, nameCell, branchCell, prsCell, issuesCell)
 
 			if m.ActiveFocus == FocusRepos && i == m.SelectedIndex {
-				repoLines = append(repoLines, clipLine(selectedRowStyle.Width(paneInnerWidth).Render("> "+line)))
+				repoLines = append(repoLines, clipLine(selectedRowStyle.Render("> "+line)))
 			} else {
 				repoLines = append(repoLines, clipLine(normalRowStyle.Render("  "+line)))
 			}
@@ -2180,7 +2248,11 @@ func (m Model) View() string {
 	}
 
 	if !m.IsRunnersLoading && len(runningNames) == 0 && len(idleNames) == 0 && len(offlineNames) == 0 {
-		runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No registered runners found for org.")))
+		if m.RunnerFetchFailed && !m.RunnerPermissionDenied {
+			runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" Failed to fetch registered runners.")))
+		} else {
+			runnerLines = append(runnerLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(" No active self-hosted runners or jobs detected.")))
+		}
 	}
 
 	runnerStyle := borderBoxStyle
@@ -2390,13 +2462,17 @@ func (m Model) View() string {
 	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
 
 	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w/1/2/3] Focus  [↑/↓] Select  [←/→/h/l] Tabs  [j/k] Scroll  [r] Sync  [b] Branch  [p] Push/PR  [d] Del Archived  [X] Prune  [c] Copy  [q] Quit"
+	footerText := "[w] Focus  [↑/↓/j/k] Select  [1-4/←/→] Tabs  [a] Sync All  [r] Sync  [b] Branch  [p] Push/PR  [d] Del  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		msgText := m.ToastMsg
 		if lipgloss.Width(msgText) > m.Width {
 			msgText = truncateString(msgText, m.Width)
 		}
-		footerText = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(msgText)
+		toastColor := colorGreen
+		if m.ToastPriority == 2 {
+			toastColor = colorRed
+		}
+		footerText = lipgloss.NewStyle().Foreground(toastColor).Bold(true).Render(msgText)
 	} else if lipgloss.Width(footerText) > m.Width {
 		footerText = truncateString(footerText, m.Width)
 	}
@@ -2418,7 +2494,7 @@ func (m Model) renderStatusBadge(item *git.RepoItem) string {
 	switch item.Status {
 	case git.StatusUpToDate:
 		return badgeUpToDate.Render(iconSuccess)
-	case git.StatusUpdated:
+	case git.StatusUpdated, git.StatusCloned:
 		return badgeUpdated.Render(iconSuccess)
 	case git.StatusStashedApplied:
 		return badgeStash.Render(iconStash)
@@ -2437,6 +2513,18 @@ func (m Model) renderStatusBadge(item *git.RepoItem) string {
 	default:
 		return lipgloss.NewStyle().Foreground(colorMuted).Render(iconPending)
 	}
+}
+
+func isRunnerPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "403") ||
+		strings.Contains(errStr, "permission") ||
+		strings.Contains(errStr, "org admin") ||
+		strings.Contains(errStr, "must be an org admin") ||
+		strings.Contains(errStr, "fine-grained permission")
 }
 
 func truncateString(str string, maxLen int) string {
@@ -2589,4 +2677,52 @@ func (m Model) getMatchingRunners() []*jobs.RunnerItem {
 		}
 	}
 	return matching
+}
+
+func extractRunnersFromJobQueue(queue []*jobs.JobItem, existing []*jobs.RunnerItem) []*jobs.RunnerItem {
+	runnerMap := make(map[string]*jobs.RunnerItem)
+	for _, r := range existing {
+		runnerMap[r.Name] = r
+	}
+	for _, j := range queue {
+		if j.RunnerName == "" || j.RunnerName == "worker" {
+			continue
+		}
+		if r, ok := runnerMap[j.RunnerName]; ok {
+			if j.Status == jobs.JobRunning {
+				r.Status = jobs.RunnerRunning
+				r.CurrentJobID = j.ID
+				r.CurrentJob = j.Name
+				r.LastHeartbeat = time.Now()
+			}
+		} else {
+			st := jobs.RunnerIdle
+			currJob := "-"
+			currJobID := "-"
+			if j.Status == jobs.JobRunning {
+				st = jobs.RunnerRunning
+				currJob = j.Name
+				currJobID = j.ID
+			}
+			runnerMap[j.RunnerName] = &jobs.RunnerItem{
+				ID:            j.RunnerID,
+				Name:          j.RunnerName,
+				Platform:      "GitHub Actions",
+				Status:        st,
+				CurrentJobID:  currJobID,
+				CurrentJob:    currJob,
+				Tags:          []string{"actions"},
+				LastHeartbeat: time.Now(),
+				OutputLogs:    []string{fmt.Sprintf("[%s] Runner active for job %s", time.Now().Format("15:04:05"), j.Name)},
+			}
+		}
+	}
+	var res []*jobs.RunnerItem
+	for _, r := range runnerMap {
+		res = append(res, r)
+	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Name < res[j].Name
+	})
+	return res
 }

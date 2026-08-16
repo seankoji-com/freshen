@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -520,6 +521,53 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	item.CurrentBranch = origBranch
 	defaultBranch := GetDefaultBranch(item.Path)
 	item.DefaultBranch = defaultBranch
+
+	if !IsGitRepo(item.Path) {
+		target := item.URL
+		if target == "" && item.GHRepoName != "" {
+			target = item.GHRepoName
+		}
+		if target == "" {
+			s.finish(StatusError, "Not Found", "󰅙 '%s' is not a local git repository and has no remote repository target.", item.Path)
+			return
+		}
+
+		s.log("↳ Repository not found locally. Cloning %s into %s...", target, item.Path)
+		if err := os.MkdirAll(filepath.Dir(item.Path), 0o755); err != nil {
+			s.finish(StatusError, "Clone Err", "󰅙 Failed to create directory: %v", err)
+			return
+		}
+
+		cloneCmd := exec.CommandContext(ctx, "gh", "repo", "clone", target, item.Path)
+		var cloneOut bytes.Buffer
+		cloneCmd.Stdout = &cloneOut
+		cloneCmd.Stderr = &cloneOut
+		if err := cloneCmd.Run(); err != nil {
+			if item.URL != "" {
+				gitCloneCmd := exec.CommandContext(ctx, "git", "clone", item.URL, item.Path)
+				var gitCloneOut bytes.Buffer
+				gitCloneCmd.Stdout = &gitCloneOut
+				gitCloneCmd.Stderr = &gitCloneOut
+				if gitErr := gitCloneCmd.Run(); gitErr != nil {
+					s.finish(StatusError, "Clone Err", "󰅙 Failed to clone '%s': %s", target, strings.TrimSpace(cloneOut.String()+"\n"+gitCloneOut.String()))
+					return
+				}
+			} else {
+				s.finish(StatusError, "Clone Err", "󰅙 Failed to clone '%s': %s", target, strings.TrimSpace(cloneOut.String()))
+				return
+			}
+		}
+
+		item.IsNew = false
+		origBranch = GetOriginalBranch(item.Path)
+		defaultBranch = GetDefaultBranch(item.Path)
+		item.OriginalBranch = origBranch
+		item.CurrentBranch = origBranch
+		item.DefaultBranch = defaultBranch
+		item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
+		s.finish(StatusCloned, "Cloned", "󰄬 Successfully cloned into '%s' (%s).", item.Path, defaultBranch)
+		return
+	}
 
 	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
 

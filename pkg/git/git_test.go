@@ -136,3 +136,56 @@ func TestSyncRepositoryRespectsCancelledContext(t *testing.T) {
 		t.Errorf("cancelled sync did work anyway: %d snapshots, %d logs", published, len(item.Logs))
 	}
 }
+
+func TestSyncRepositoryClonesUnclonedRepo(t *testing.T) {
+	src := newTestRepo(t)
+	dest := t.TempDir() + "/deep/nested/dir/cloned-repo"
+
+	item := &RepoItem{
+		Name: "cloned-repo",
+		URL:  src,
+		Path: dest,
+		Logs: []string{},
+	}
+
+	SyncRepository(context.Background(), item, nil)
+
+	if item.Status != StatusCloned {
+		t.Fatalf("expected status CLONED, got %s (logs: %v)", item.Status, item.Logs)
+	}
+	if item.StatusMsg != "Cloned" {
+		t.Errorf("expected StatusMsg 'Cloned', got %q", item.StatusMsg)
+	}
+	if !IsGitRepo(dest) {
+		t.Errorf("expected %s to be a git repository after clone", dest)
+	}
+	if item.DefaultBranch != "main" {
+		t.Errorf("expected default branch main, got %s", item.DefaultBranch)
+	}
+	if item.CurrentBranch != "main" {
+		t.Errorf("expected current branch main, got %s", item.CurrentBranch)
+	}
+	if item.OriginalBranch != "main" {
+		t.Errorf("expected original branch main, got %s", item.OriginalBranch)
+	}
+	if item.IsNew {
+		t.Errorf("expected IsNew to be false after successful clone")
+	}
+}
+
+func TestSyncRepositoryUnclonedRepoWithoutTarget(t *testing.T) {
+	item := &RepoItem{
+		Name: "missing-repo",
+		Path: t.TempDir() + "/nonexistent",
+		Logs: []string{},
+	}
+
+	SyncRepository(context.Background(), item, nil)
+
+	if item.Status != StatusError {
+		t.Fatalf("expected status ERROR when no target URL/name, got %s", item.Status)
+	}
+	if item.StatusMsg != "Not Found" {
+		t.Errorf("expected StatusMsg 'Not Found', got %q", item.StatusMsg)
+	}
+}
