@@ -14,6 +14,33 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// CommandRunner abstracts external command execution so it can be faked in tests.
+// Implementations return stdout on success; on failure the returned error should
+// include any stderr output so callers get diagnostic detail without managing buffers.
+type CommandRunner interface {
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+// execRunner is the production CommandRunner backed by exec.CommandContext.
+type execRunner struct{}
+
+func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return out.Bytes(), fmt.Errorf("%w: %s", err, stderr)
+		}
+		return out.Bytes(), err
+	}
+	return out.Bytes(), nil
+}
+
+// runner is the package-level CommandRunner; tests swap it for a fake.
+var runner CommandRunner = &execRunner{}
+
 type RepoStatus string
 
 const (
@@ -203,16 +230,13 @@ func GetGHRepoName(localDir string) string {
 
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
 func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
-	cmd := exec.Command("gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
-	var out, errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w: %s", org, err, strings.TrimSpace(errOut.String()))
+	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
 	}
 
 	var repos []GHRepoInfo
-	if err := json.Unmarshal(out.Bytes(), &repos); err != nil {
+	if err := json.Unmarshal(out, &repos); err != nil {
 		return nil, fmt.Errorf("failed to parse gh JSON output: %w", err)
 	}
 
@@ -222,16 +246,13 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
-	cmd := exec.Command("gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
-	var out, errOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errOut
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("gh api graphql failed for org %s: %w: %s", org, err, strings.TrimSpace(errOut.String()))
+	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
+	if err != nil {
+		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
 	}
 
 	var resp GraphQLOrgResponse
-	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, err
 	}
 
@@ -455,22 +476,18 @@ func GetOriginalBranch(ctx context.Context, path string) string {
 		return "HEAD"
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
 	}
 
 	if ctx.Err() != nil {
 		return "HEAD"
 	}
 
-	cmd = exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
-	out.Reset()
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+	out, err = runner.Run(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
 	}
 
 	return "HEAD"
@@ -478,11 +495,9 @@ func GetOriginalBranch(ctx context.Context, path string) string {
 
 // GetDefaultBranch determines default branch (main/master) for a git repository.
 func GetDefaultBranch(path string) string {
-	cmd := exec.Command("git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		ref := strings.TrimSpace(out.String())
+	out, err := runner.Run(context.Background(), "git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
+	if err == nil {
+		ref := strings.TrimSpace(string(out))
 		ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
 		ref = strings.TrimPrefix(ref, "origin/")
 		if ref != "" {
@@ -490,23 +505,17 @@ func GetDefaultBranch(path string) string {
 		}
 	}
 
-	cmd = exec.Command("gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
-	out.Reset()
-	var ghErrOut bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &ghErrOut
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+	out, err = runner.Run(context.Background(), "gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
 	} else if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: gh repo view failed for %s: %v: %s\n", path, err, strings.TrimSpace(ghErrOut.String()))
+		fmt.Fprintf(os.Stderr, "warning: gh repo view failed for %s: %v\n", path, err)
 	}
 
-	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main")
-	if cmd.Run() == nil {
+	if _, err := runner.Run(context.Background(), "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
 		return "main"
 	}
-	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master")
-	if cmd.Run() == nil {
+	if _, err := runner.Run(context.Background(), "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
 		return "master"
 	}
 
