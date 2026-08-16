@@ -196,6 +196,7 @@ func ShortenHomePath(path string) string {
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
+// The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
 func GetLocalDirName(ghRepo string) string {
 	switch ghRepo {
 	case ".github":
@@ -217,6 +218,7 @@ func GetLocalDirName(ghRepo string) string {
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
+// The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
 func GetGHRepoName(localDir string) string {
 	switch localDir {
 	case "github":

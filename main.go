@@ -52,15 +52,21 @@ func main() {
 	var (
 		dirFlag            string
 		orgFlag            string
+		concurrencyFlag    int
 		nonInteractiveFlag bool
 		versionFlag        bool
 	)
 
 	homeDir, _ := os.UserHomeDir()
 	defaultReposDir := filepath.Join(homeDir, "repos")
+	defaultOrg := os.Getenv("FRESHEN_ORG")
+	if defaultOrg == "" {
+		defaultOrg = "seankoji-com"
+	}
 
 	flag.StringVar(&dirFlag, "dir", defaultReposDir, "Target directory containing repository subfolders")
-	flag.StringVar(&orgFlag, "org", "seankoji-com", "Target GitHub Organization")
+	flag.StringVar(&orgFlag, "org", defaultOrg, "Target GitHub Organization")
+	flag.IntVar(&concurrencyFlag, "concurrency", 4, "Number of concurrent repository sync operations")
 	flag.BoolVar(&nonInteractiveFlag, "non-interactive", false, "Run in non-interactive terminal batch mode")
 	flag.BoolVar(&nonInteractiveFlag, "y", false, "Run in non-interactive terminal batch mode (shorthand)")
 	flag.BoolVar(&versionFlag, "version", false, "Show freshen version")
@@ -99,7 +105,7 @@ func main() {
 	// Launch TUI Application
 	var bgWG sync.WaitGroup
 	p := tea.NewProgram(
-		tui.NewModel(targetDir, orgFlag, ctx, stop, &bgWG),
+		tui.NewModel(targetDir, orgFlag, concurrencyFlag, ctx, stop, &bgWG),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)

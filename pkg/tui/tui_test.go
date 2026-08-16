@@ -19,7 +19,7 @@ import (
 func newTestModel(targetDir, targetOrg string) Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
-	return NewModel(targetDir, targetOrg, ctx, cancel, &wg)
+	return NewModel(targetDir, targetOrg, 4, ctx, cancel, &wg)
 }
 
 func TestFocusedRunViewportRendering(t *testing.T) {

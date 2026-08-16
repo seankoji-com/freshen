@@ -221,6 +221,7 @@ type loadedPRsMsg struct {
 type Model struct {
 	TargetDir           string
 	TargetOrg           string
+	Concurrency         int
 	Repos               []*git.RepoItem
 	Runners             []*jobs.RunnerItem
 	JobQueue            []*jobs.JobItem
@@ -266,7 +267,7 @@ type Model struct {
 // NewModel constructs the TUI model. ctx should be cancelled by the caller
 // (e.g. on quit or an OS signal) to abort in-flight background git
 // operations; bgWG tracks those operations for a bounded shutdown wait.
-func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
+func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(colorSecondary)
@@ -281,6 +282,7 @@ func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.C
 	return Model{
 		TargetDir:           targetDir,
 		TargetOrg:           targetOrg,
+		Concurrency:         concurrency,
 		Repos:               make([]*git.RepoItem, 0),
 		Runners:             make([]*jobs.RunnerItem, 0),
 		JobQueue:            make([]*jobs.JobItem, 0),
@@ -515,7 +517,7 @@ func (m Model) bgGuard(task func()) func() {
 func (m Model) startParallelSyncCmd() tea.Cmd {
 	run := m.bgGuard(func() {
 		var wg sync.WaitGroup
-		concurrency := 4
+		concurrency := m.Concurrency
 		sem := make(chan struct{}, concurrency)
 
 		for _, item := range m.Repos {
