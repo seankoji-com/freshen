@@ -378,6 +378,9 @@ func FetchOrgRunners(org string) ([]*RunnerItem, error) {
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse runners JSON: %w", err)
 	}
+	if len(resp.Runners) == runnersPageSize {
+		slog.Warn("runners result may be truncated at page size", "org", org, "pageSize", runnersPageSize)
+	}
 
 	var parsed []*RunnerItem
 	for _, r := range resp.Runners {
@@ -577,7 +580,12 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
 		)
 		if jobsErr == nil {
 			var jobsResp GHJobsResponse
-			if err := json.Unmarshal(jobsOut, &jobsResp); err == nil {
+			if err := json.Unmarshal(jobsOut, &jobsResp); err != nil {
+				slog.Warn("failed to parse jobs JSON for run, using fallback", "runID", run.ID, "repo", repo, "error", err)
+			} else if len(jobsResp.Jobs) > 0 {
+				if len(jobsResp.Jobs) == jobsPageSize {
+					slog.Warn("jobs result may be truncated at page size", "runID", run.ID, "repo", repo, "pageSize", jobsPageSize)
+				}
 				for _, j := range jobsResp.Jobs {
 					// Filter out completed success/skipped jobs
 					if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {

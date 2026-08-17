@@ -5,7 +5,7 @@
 - **Go 1.26+** (module: `github.com/seankoji-com/freshen`)
 - Build: `go build -o freshen main.go`
 - Run tests: `go test ./...`
-- No Makefile. CI/CD via GitHub Actions in .github/workflows/.
+- Makefile with build/test/vet/install/coverage/clean targets (see Makefile). CI/CD via GitHub Actions in .github/workflows/ (see docs/persona-review-setup.md).
 
 ## Project organization
 

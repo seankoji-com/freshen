@@ -206,11 +206,32 @@ func ShortenHomePath(path string) string {
 	return path
 }
 
+// aliasToRemote and aliasToLocal hold user-supplied repo alias pairs
+// registered via the repeatable --alias local=remote flag (see AddAlias).
+// They are consulted before the built-in defaults below, so a user-supplied
+// pair overrides a built-in one for the same key.
+var (
+	aliasToRemote = make(map[string]string) // local -> remote
+	aliasToLocal  = make(map[string]string) // remote -> local
+)
+
+// AddAlias registers a local/remote repo alias pair, overriding the built-in
+// defaults in GetLocalDirName/GetGHRepoName for that pair. Intended to be
+// called during flag parsing, before any concurrent use of this package.
+func AddAlias(local, remote string) {
+	aliasToRemote[local] = remote
+	aliasToLocal[remote] = local
+}
+
 // GetLocalDirName maps GitHub repository name to local folder alias.
 // The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
+// User-supplied aliases from --alias take precedence; see AddAlias.
 // The result is always sanitised to a single path segment so callers can safely
 // join it onto a parent directory (see sanitizeDirName).
 func GetLocalDirName(ghRepo string) string {
+	if local, ok := aliasToLocal[ghRepo]; ok {
+		return sanitizeDirName(local)
+	}
 	var name string
 	switch ghRepo {
 	case ".github":
@@ -241,7 +262,11 @@ func sanitizeDirName(name string) string {
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
 // The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
+// User-supplied aliases from --alias take precedence; see AddAlias.
 func GetGHRepoName(localDir string) string {
+	if remote, ok := aliasToRemote[localDir]; ok {
+		return remote
+	}
 	switch localDir {
 	case "github":
 		return ".github"

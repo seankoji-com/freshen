@@ -1,6 +1,7 @@
 # Contributing to freshen
 
 Thank you for your interest in contributing to freshen! This guide covers the development workflow, build process, and debugging tips.
+(AGENTS.md is the agent-shaped handbook; this file is for humans.)
 
 ---
 
@@ -143,13 +144,18 @@ gh api /user
 
 ## Scripts
 
-The `scripts/` directory contains utilities used in the CI/CD pipeline:
+The `scripts/` directory contains utilities used by the CI/CD pipeline. They
+are referenced by CI but are not part of the Go build — a contributor can
+break the persona review pipeline by touching them unknowingly, so treat them
+as production code.
 
 ### `hunk-validate.py`
 
 **Purpose**: Validates that review comments fall within PR diff hunks.
 
-This script reads review comments from stdin and compares them against diff hunks from a JSON file. It classifies comments as either in-hunk (within the diff) or out-of-hunk (outside the modified lines). Out-of-hunk comments are typically demoted to the review summary section.
+Reads comment JSON from stdin and hunks JSON from the first positional
+argument; classifies each comment as in-hunk (line range overlaps a diff
+hunk, clamped to it) or out-of-hunk (demoted to the review summary).
 
 **Usage**:
 ```bash
@@ -162,9 +168,16 @@ cat comments.json | python3 scripts/hunk-validate.py hunks.json
 
 ### `persona-review-post.sh`
 
-**Purpose**: Posts Open Code Review (OCR) findings as a persona-based GitHub App.
+**Purpose**: Posts Open Code Review (OCR) findings as a specific persona's
+GitHub App identity, with marker-based dedup to prevent reposting on
+subsequent pushes.
 
-This script reads OCR results, deduplicates findings against existing PR comments, validates comment positions against diff hunks (using `hunk-validate.py`), and posts the review under a specific persona's GitHub App identity. It supports batched inline comments and summary-only reviews, with fail-closed error handling for API failures.
+Reads OCR results (default `/tmp/ocr-result.json`), deduplicates against
+existing PR comments (exact match on path+line for single-line, IoU > 0.95
+for multi-line), validates positions against diff hunks via
+`hunk-validate.py`, and posts the review under the persona's own identity.
+Replaces alibaba/open-code-review's built-in posting, which cannot use
+per-persona App tokens.
 
 **Usage**:
 ```bash
@@ -184,7 +197,9 @@ export PERSONA_TOKEN="ghu_..."
 - `PERSONA_TOKEN` — GitHub App installation token
 - `OCR_RESULT_PATH` — path to OCR JSON output (default: `/tmp/ocr-result.json`)
 
-**CI Consumer**: Called by reusable workflow in the `.github/workflows/` and the org-wide persona review pipeline to post persona-specific code reviews on pull requests.
+**CI Consumer**: Not invoked by any workflow in this repo. Its caller is the
+org-level `seankoji-com/.github` reusable workflow (see
+[docs/persona-review-setup.md](docs/persona-review-setup.md)).
 
 ---
 

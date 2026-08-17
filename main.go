@@ -26,10 +26,32 @@ const shutdownWait = 5 * time.Second
 
 var Version = "1.0.0"
 
+// aliasFlags implements flag.Value for a repeatable --alias local=remote flag,
+// letting a user add to or override the built-in repo alias pairs in
+// pkg/git without editing source.
+type aliasFlags []string
+
+func (a *aliasFlags) String() string { return strings.Join(*a, ",") }
+
+func (a *aliasFlags) Set(value string) error {
+	local, remote, ok := strings.Cut(value, "=")
+	if !ok || local == "" || remote == "" {
+		return fmt.Errorf("invalid --alias value %q, expected local=remote", value)
+	}
+	git.AddAlias(local, remote)
+	*a = append(*a, value)
+	return nil
+}
+
 // validatePrerequisites checks that freshen has access to required tools.
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
 // The gh auth check is skipped if versionFlag is true (version printing needs nothing).
 func validatePrerequisites(versionFlag bool) {
+	// Skip all checks if printing version (it needs nothing)
+	if versionFlag {
+		return
+	}
+
 	// Check for git on PATH
 	_, err := exec.LookPath("git")
 	if err != nil {
@@ -37,13 +59,11 @@ func validatePrerequisites(versionFlag bool) {
 		os.Exit(1)
 	}
 
-	// Skip gh check if printing version (it needs nothing)
-	if versionFlag {
-		return
-	}
-
-	// Check for authenticated GitHub CLI
-	cmd := exec.Command("gh", "auth", "status")
+	// Check for authenticated GitHub CLI, bounded so a hung network doesn't
+	// block indefinitely before any logging is configured.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "auth", "status")
 	err = cmd.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "freshen requires an authenticated GitHub CLI. Run: gh auth login.")
@@ -58,6 +78,7 @@ func main() {
 		concurrencyFlag    int
 		nonInteractiveFlag bool
 		versionFlag        bool
+		aliasFlag          aliasFlags
 	)
 
 	homeDir, _ := os.UserHomeDir()
@@ -74,6 +95,7 @@ func main() {
 	flag.BoolVar(&nonInteractiveFlag, "y", false, "Run in non-interactive terminal batch mode (shorthand)")
 	flag.BoolVar(&versionFlag, "version", false, "Show freshen version")
 	flag.BoolVar(&versionFlag, "v", false, "Show freshen version (shorthand)")
+	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
 	flag.Parse()
 

@@ -36,4 +36,8 @@ jobs:
         run: go test -v -race ./...
 
       - name: Build binary
-        run: go build -ldflags "-X main.Version=$(git describe --tags --always 2>/dev/null || echo 1.0.0)" -o freshen .
+        # `--always` falls back to the abbreviated commit SHA and never fails,
+        # so no "|| echo" fallback is needed here.
+        # Note: if a v-prefixed tag is ever created, main.go's version-print
+        # format already adds its own "v" prefix, which would double up.
+        run: go build -ldflags "-X main.Version=$(git describe --tags --always)" -o freshen .
