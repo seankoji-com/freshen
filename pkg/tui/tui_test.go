@@ -676,15 +676,17 @@ func TestHandleLoadedRunnersMsg(t *testing.T) {
 		}
 	})
 
-	t.Run("success with no runners sets an info toast", func(t *testing.T) {
+	t.Run("success with no runners does not toast", func(t *testing.T) {
 		m := newTestModel("/tmp/test", "test-org")
 		m.handleLoadedRunnersMsg(loadedRunnersMsg{runners: nil})
 
-		if !strings.Contains(m.ToastMsg, "No registered runners") {
-			t.Errorf("expected empty-runners toast, got %q", m.ToastMsg)
+		// The empty-runner state is surfaced in the runners panel rather than
+		// as a recurring toast (see TestRenderRunnersPanelEmptyStateVariants).
+		if m.ToastMsg != "" {
+			t.Errorf("expected no toast for the empty-runners case, got %q", m.ToastMsg)
 		}
-		if m.ToastPriority != 1 {
-			t.Errorf("expected info-priority toast (1), got %d", m.ToastPriority)
+		if m.RunnerFetchFailed {
+			t.Errorf("expected RunnerFetchFailed to stay clear on a successful empty load")
 		}
 	})
 }
@@ -978,5 +980,364 @@ func TestStartSyncCmdContextCancellationStopsPendingWork(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("startSyncCmd did not complete after releasing in-flight syncs")
+	}
+}
+
+func TestLoadedRunnersMsgPermissionDenied(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	permErr := fmt.Errorf("gh api: gh: You must be an org admin or have the runners and runner groups fine-grained permission. (HTTP 403)")
+
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#1", Name: "myrepo / ci", Status: jobs.JobRunning, RunnerName: "actions-worker-1", RunnerID: "100"},
+	}
+
+	newModel, _ := m.Update(loadedRunnersMsg{err: permErr})
+	updated := newModel.(Model)
+
+	if !updated.RunnerPermissionDenied {
+		t.Errorf("expected RunnerPermissionDenied to be true on HTTP 403 error")
+	}
+	if updated.ToastMsg != "" {
+		t.Errorf("expected no error toast on runner permission denied, got %q", updated.ToastMsg)
+	}
+	if updated.ConsecutiveErrors != 0 {
+		t.Errorf("expected ConsecutiveErrors to be 0 for permission denied, got %d", updated.ConsecutiveErrors)
+	}
+	if len(updated.Runners) != 1 || updated.Runners[0].Name != "actions-worker-1" {
+		t.Errorf("expected runner to be extracted from active job queue on permission denied, got %+v", updated.Runners)
+	}
+
+	updated.Width = 120
+	updated.Height = 40
+	view := updated.View()
+	if !strings.Contains(view, "actions-worker-1") {
+		t.Errorf("expected view to contain extracted runner name, got:\n%s", view)
+	}
+}
+
+func TestIsRunnerPermissionError(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{fmt.Errorf("gh api: gh: You must be an org admin or have the runners and runner groups fine-grained permission. (HTTP 403)"), true},
+		{fmt.Errorf("HTTP 403: Forbidden"), true},
+		{fmt.Errorf("must be an org admin to access this resource"), true},
+		{fmt.Errorf("permission denied"), true},
+		{fmt.Errorf("network connection timed out"), false},
+		{fmt.Errorf("500 Internal Server Error"), false},
+	}
+
+	for _, tt := range tests {
+		got := isRunnerPermissionError(tt.err)
+		if got != tt.want {
+			t.Errorf("isRunnerPermissionError(%v) = %v; want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
+func TestRenderRunnersPanelEmptyStateVariants(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.Width = 120
+	m.Height = 40
+
+	// 1. Normal empty state
+	m.IsRunnersLoading = false
+	m.RunnerFetchFailed = false
+	m.RunnerPermissionDenied = false
+	viewNormal := m.View()
+	if !strings.Contains(viewNormal, "No active self-hosted runners or jobs detected.") {
+		t.Errorf("expected normal empty state message, got:\n%s", viewNormal)
+	}
+
+	// 2. Generic fetch failure
+	m.RunnerFetchFailed = true
+	m.RunnerPermissionDenied = false
+	viewFail := m.View()
+	if !strings.Contains(viewFail, "Failed to fetch registered runners.") {
+		t.Errorf("expected fetch failed message, got:\n%s", viewFail)
+	}
+
+	// 3. Permission denied with no active jobs
+	m.RunnerFetchFailed = true
+	m.RunnerPermissionDenied = true
+	viewPerm := m.View()
+	if !strings.Contains(viewPerm, "No active self-hosted runners or jobs detected.") {
+		t.Errorf("expected clean message without 403 error text, got:\n%s", viewPerm)
+	}
+}
+
+func TestRenderStatusBadgeCloned(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	item := &git.RepoItem{
+		Name:   "repo1",
+		Status: git.StatusCloned,
+	}
+	badge := m.renderStatusBadge(item)
+	if badge == "" {
+		t.Errorf("expected non-empty badge for StatusCloned")
+	}
+}
+
+func TestVimNavigationJK(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", Status: git.StatusUpToDate},
+		{Name: "repo2", Status: git.StatusUpToDate},
+	}
+	m.Runners = []*jobs.RunnerItem{
+		{ID: "r1", Name: "runner1", Status: jobs.RunnerIdle},
+	}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#1", Name: "job1", Status: jobs.JobRunning},
+	}
+
+	// 1. Press 'j' to move down repo list
+	m.ActiveFocus = FocusRepos
+	m.SelectedIndex = 0
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(Model)
+	if m.SelectedIndex != 1 || m.ActiveFocus != FocusRepos {
+		t.Errorf("expected SelectedIndex=1, ActiveFocus=FocusRepos after 'j', got idx=%d focus=%d", m.SelectedIndex, m.ActiveFocus)
+	}
+
+	// 2. Press 'j' at bottom of repos to transition to runners
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRunners {
+		t.Errorf("expected transition to FocusRunners, got %d", m.ActiveFocus)
+	}
+
+	// 3. Press 'k' at top of runners to transition back to repos
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRepos || m.SelectedIndex != 1 {
+		t.Errorf("expected transition back to FocusRepos at bottom, got focus=%d idx=%d", m.ActiveFocus, m.SelectedIndex)
+	}
+
+	// 4. Press 'k' to move up in repos
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	m = newM.(Model)
+	if m.SelectedIndex != 0 {
+		t.Errorf("expected SelectedIndex=0 after 'k', got %d", m.SelectedIndex)
+	}
+}
+
+func TestTabNumberKeys1234(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", GHRepoName: "repo1", Status: git.StatusUpToDate},
+	}
+
+	// Test '2' -> TabBranches
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	m = newM.(Model)
+	if m.ActiveTab != TabBranches {
+		t.Errorf("expected TabBranches after '2', got %d", m.ActiveTab)
+	}
+
+	// Test '3' -> TabIssues
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = newM.(Model)
+	if m.ActiveTab != TabIssues {
+		t.Errorf("expected TabIssues after '3', got %d", m.ActiveTab)
+	}
+
+	// Test '4' -> TabPRs
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	m = newM.(Model)
+	if m.ActiveTab != TabPRs {
+		t.Errorf("expected TabPRs after '4', got %d", m.ActiveTab)
+	}
+
+	// Test '1' -> TabLogs
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	m = newM.(Model)
+	if m.ActiveTab != TabLogs {
+		t.Errorf("expected TabLogs after '1', got %d", m.ActiveTab)
+	}
+}
+
+func TestSyncAllKeyAS(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", Status: git.StatusPending},
+	}
+
+	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	m = newM.(Model)
+
+	if !m.IsSyncing {
+		t.Errorf("expected IsSyncing to be true after pressing 'a'")
+	}
+	if cmd == nil {
+		t.Errorf("expected cmd to be returned for parallel sync")
+	}
+	if !strings.Contains(m.ToastMsg, "Starting parallel sync") {
+		t.Errorf("expected sync toast message, got %q", m.ToastMsg)
+	}
+}
+
+func TestMouseWheelScrolling(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.Width = 100
+	m.Height = 30
+	m.Repos = []*git.RepoItem{
+		{Name: "repo1", Logs: make([]string, 50)},
+	}
+	m.updateViewport()
+
+	// Initial offset is 0
+	if m.Viewport.YOffset != 0 {
+		t.Errorf("expected initial YOffset=0, got %d", m.Viewport.YOffset)
+	}
+
+	// Scroll down
+	wheelDown := tea.MouseMsg{Button: tea.MouseButtonWheelDown}
+	newM, _ := m.Update(wheelDown)
+	m = newM.(Model)
+	if m.Viewport.YOffset == 0 {
+		t.Errorf("expected YOffset > 0 after MouseButtonWheelDown")
+	}
+
+	// Scroll up
+	wheelUp := tea.MouseMsg{Button: tea.MouseButtonWheelUp}
+	newM, _ = m.Update(wheelUp)
+	m = newM.(Model)
+	if m.Viewport.YOffset != 0 {
+		t.Errorf("expected YOffset=0 after scrolling back up, got %d", m.Viewport.YOffset)
+	}
+}
+
+func TestMultiResolutionRendering(t *testing.T) {
+	resolutions := []struct {
+		w, h int
+	}{
+		{80, 24},
+		{100, 30},
+		{120, 40},
+		{160, 50},
+		{200, 60},
+	}
+
+	for _, res := range resolutions {
+		m := newTestModel("/tmp", "test-org")
+		m.Width = res.w
+		m.Height = res.h
+		m.Repos = []*git.RepoItem{
+			{Name: "alpha-long-repository-name", CurrentBranch: "feat/cool-feature", Status: git.StatusUpdated, OpenIssuesCount: 3, OpenPRsCount: 1},
+			{Name: "beta", CurrentBranch: "main", Status: git.StatusUpToDate},
+		}
+		m.Runners = []*jobs.RunnerItem{
+			{ID: "r1", Name: "mac-mini-runner", Status: jobs.RunnerRunning, Platform: "macOS/ARM64", Tags: []string{"self-hosted"}},
+		}
+		m.JobQueue = []*jobs.JobItem{
+			{ID: "#42", Name: "alpha / ci / build", Status: jobs.JobRunning, Duration: "1m 12s", RunnerName: "mac-mini-runner"},
+		}
+
+		view := m.View()
+		lines := strings.Split(view, "\n")
+		if len(lines) > res.h {
+			t.Errorf("Resolution %dx%d: rendered %d lines exceeding max height %d", res.w, res.h, len(lines), res.h)
+		}
+		for i, line := range lines {
+			lineWidth := lipgloss.Width(line)
+			if lineWidth > res.w {
+				t.Errorf("Resolution %dx%d Line %d: width %d exceeds max width %d (%q)", res.w, res.h, i, lineWidth, res.w, line)
+			}
+		}
+	}
+}
+
+func TestTabKeyJumpsBetweenLeftPanels(t *testing.T) {
+	m := newTestModel("/tmp", "test-org")
+	m.ActiveFocus = FocusRepos
+
+	// 1. Tab: Repos -> Runners
+	newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRunners {
+		t.Errorf("expected FocusRunners after Tab, got %d", m.ActiveFocus)
+	}
+
+	// 2. Tab: Runners -> Jobs
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusJobs {
+		t.Errorf("expected FocusJobs after Tab, got %d", m.ActiveFocus)
+	}
+
+	// 3. Tab: Jobs -> Repos
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRepos {
+		t.Errorf("expected FocusRepos after Tab, got %d", m.ActiveFocus)
+	}
+
+	// 4. Shift+Tab: Repos -> Jobs
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusJobs {
+		t.Errorf("expected FocusJobs after Shift+Tab, got %d", m.ActiveFocus)
+	}
+
+	// 5. Shift+Tab: Jobs -> Runners
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRunners {
+		t.Errorf("expected FocusRunners after Shift+Tab, got %d", m.ActiveFocus)
+	}
+
+	// 6. Shift+Tab: Runners -> Repos
+	newM, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
+	m = newM.(Model)
+	if m.ActiveFocus != FocusRepos {
+		t.Errorf("expected FocusRepos after Shift+Tab, got %d", m.ActiveFocus)
+	}
+}
+
+func TestRepoTableNoLineWrappingAndAlignment(t *testing.T) {
+	widths := []int{80, 100, 120, 140, 180, 240}
+
+	for _, w := range widths {
+		m := newTestModel("/tmp/test", "test-org")
+		m.Width = w
+		m.Height = 40
+		m.ActiveFocus = FocusRepos
+		m.IsOrgSyncing = false
+		m.SelectedIndex = 0
+		m.Repos = []*git.RepoItem{
+			{Name: ".dotfiles", CurrentBranch: "master", Status: git.StatusUpToDate, OpenPRsCount: 2, OpenIssuesCount: 9, HasLoadedCounts: true},
+			{Name: "kumon-automation", CurrentBranch: "feat/long-branch-name-12345", Status: git.StatusCloned, OpenPRsCount: 12, OpenIssuesCount: 45, HasLoadedCounts: true},
+			{Name: "careynas.net", CurrentBranch: "main", Status: git.StatusStashedApplied, OpenPRsCount: 0, OpenIssuesCount: 1, HasLoadedCounts: true},
+		}
+
+		view := m.View()
+		lines := strings.Split(view, "\n")
+
+		// The repo table should never wrap rows onto subsequent lines (such as a solitary '9' or '45')
+		for lineIdx, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			// A line containing only a number or punctuation indicates wrapping
+			if trimmed == "9" || trimmed == "45" || trimmed == "2" || trimmed == "12" {
+				t.Errorf("Width %d Line %d: orphan wrapped number found: %q\nFull View:\n%s", w, lineIdx, trimmed, view)
+			}
+		}
+
+		// The first selected row (.dotfiles) should contain both PR count '2' and Issue count '9' on the same line
+		foundDotfilesWithCounts := false
+		for _, line := range lines {
+			if strings.Contains(line, ".dotf") {
+				if strings.Contains(line, "2") && strings.Contains(line, "9") {
+					foundDotfilesWithCounts = true
+				} else {
+					t.Errorf("Width %d: .dotfiles row missing PR or Issue count: %q", w, line)
+				}
+			}
+		}
+		if !foundDotfilesWithCounts {
+			t.Errorf("Width %d: .dotfiles row with counts not found in view", w)
+		}
 	}
 }
