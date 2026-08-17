@@ -1,12 +1,13 @@
 # Contributing to freshen
 
-Thank you for your interest in contributing to freshen! This guide covers the
-development workflow, build process, and the CI-critical scripts in `scripts/`.
+Thank you for your interest in contributing to freshen! This guide covers the development workflow, build process, and debugging tips.
 (AGENTS.md is the agent-shaped handbook; this file is for humans.)
 
 ---
 
 ## Prerequisites
+
+Before you start, ensure you have:
 
 - **Go 1.26 or later** — [install from golang.org](https://golang.org/dl)
 - **git** — for version control
@@ -14,7 +15,6 @@ development workflow, build process, and the CI-critical scripts in `scripts/`.
   - Authenticate with your GitHub account: `gh auth login`
 
 Verify prerequisites:
-
 ```bash
 go version
 git --version
@@ -25,14 +25,42 @@ gh auth status
 
 ## Build & Test
 
+### Using Makefile Targets
+
+The project includes a Makefile with convenient build and test targets:
+
 ```bash
 # Build the binary
-go build -o freshen main.go
+make build
 
 # Run tests
-go test ./...
+make test
 
 # Run Go's static analysis
+make vet
+
+# Run tests with coverage report
+make coverage
+
+# Clean build artifacts
+make clean
+
+# Install system-wide
+make install
+```
+
+### Using Go Commands Directly
+
+If you prefer to run commands directly:
+
+```bash
+# Build
+go build -o freshen .
+
+# Test
+go test -race ./...
+
+# Static analysis
 go vet ./...
 
 # Test with coverage
@@ -53,15 +81,13 @@ Use conventional branch names that reflect the type of work:
 - **Refactoring**: `refactor/short-description`
 
 Example:
-
 ```bash
 git checkout -b feat/add-filtering-to-repos-panel
 ```
 
 ### Commit Message Style
 
-Follow conventional commit format. Refer to the project's git history for
-style examples:
+Follow conventional commit format. Refer to the project's git history for style examples:
 
 ```bash
 git log --oneline
@@ -84,7 +110,6 @@ docs: update README installation instructions
 5. Ensure CI checks pass (tests, vet, formatting).
 
 Example:
-
 ```bash
 git push -u origin feat/add-filtering-to-repos-panel
 gh pr create --title "feat: add filtering to repos panel" \
@@ -97,7 +122,7 @@ gh pr create --title "feat: add filtering to repos panel" \
 
 ### GitHub CLI Authentication Errors
 
-If you see `freshen requires an authenticated GitHub CLI. Run: gh auth login`:
+If you see `freshen requires an authenticated GitHub CLI. Run: gh auth login.`:
 
 ```bash
 # Check your current authentication status
@@ -112,11 +137,8 @@ gh api /user
 
 ### Common Issues
 
-- **`Permission denied` on `gh` commands**: Ensure the token has appropriate
-  permissions (repo, read:org). Re-run `gh auth login` and select the right
-  scopes.
-- **Tests fail due to missing dependencies**: Run `go mod tidy` to ensure all
-  dependencies are available.
+- **`Permission denied` on `gh` commands**: Ensure the token has appropriate permissions (repo, read:org). Re-run `gh auth login` and select the right scopes.
+- **Tests fail due to missing dependencies**: Run `go mod tidy` to ensure all dependencies are available.
 
 ---
 
@@ -136,15 +158,13 @@ argument; classifies each comment as in-hunk (line range overlaps a diff
 hunk, clamped to it) or out-of-hunk (demoted to the review summary).
 
 **Usage**:
-
 ```bash
 cat comments.json | python3 scripts/hunk-validate.py hunks.json
 ```
 
 **Output**: JSON with `in_hunk` and `out_of_hunk` arrays.
 
-**CI Consumer**: Called by `scripts/persona-review-post.sh` to validate OCR
-(Open Code Review) findings before posting to GitHub.
+**CI Consumer**: Called by `scripts/persona-review-post.sh` to validate OCR (Open Code Review) findings before posting to GitHub.
 
 ### `persona-review-post.sh`
 
@@ -160,7 +180,6 @@ Replaces alibaba/open-code-review's built-in posting, which cannot use
 per-persona App tokens.
 
 **Usage**:
-
 ```bash
 export PERSONA_ID="grumpy-engineer"
 export OWNER_REPO="seankoji-com/freshen"
@@ -171,7 +190,6 @@ export PERSONA_TOKEN="ghu_..."
 ```
 
 **Environment Variables**:
-
 - `PERSONA_ID` — persona identifier (e.g., "sre", "grumpy-engineer")
 - `OWNER_REPO` — owner/repo (e.g., "seankoji-com/freshen")
 - `PR_NUMBER` — pull request number
@@ -179,12 +197,12 @@ export PERSONA_TOKEN="ghu_..."
 - `PERSONA_TOKEN` — GitHub App installation token
 - `OCR_RESULT_PATH` — path to OCR JSON output (default: `/tmp/ocr-result.json`)
 
-**CI Consumer**: The org-wide persona review pipeline (reusable workflows in
-`.github/workflows/`) posts persona-specific code reviews on pull requests.
+**CI Consumer**: Not invoked by any workflow in this repo. Its caller is the
+org-level `seankoji-com/.github` reusable workflow (see
+[docs/persona-review-setup.md](docs/persona-review-setup.md)).
 
 ---
 
 ## Questions?
 
-If you run into issues or have questions, feel free to open an issue in the
-repository or reach out to the maintainers.
+If you run into issues or have questions, feel free to open an issue in the repository or reach out to the maintainers.

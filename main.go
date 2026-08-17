@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -23,27 +25,89 @@ import (
 // operations to stop after the TUI exits, before returning anyway.
 const shutdownWait = 5 * time.Second
 
-const Version = "1.0.0"
+var Version = "1.0.0"
+
+// aliasFlags implements flag.Value for a repeatable --alias local=remote flag,
+// letting a user add to or override the built-in repo alias pairs in
+// pkg/git without editing source.
+type aliasFlags []string
+
+func (a *aliasFlags) String() string { return strings.Join(*a, ",") }
+
+func (a *aliasFlags) Set(value string) error {
+	local, remote, ok := strings.Cut(value, "=")
+	if !ok || local == "" || remote == "" {
+		return fmt.Errorf("invalid --alias value %q, expected local=remote", value)
+	}
+	if err := git.AddAlias(local, remote); err != nil {
+		return fmt.Errorf("invalid --alias value %q: %w", value, err)
+	}
+	*a = append(*a, value)
+	return nil
+}
+
+// validatePrerequisites checks that freshen has access to required tools.
+// It exits with status 1 and writes to stderr if any critical prerequisite is missing.
+// Both the git-on-PATH check and the gh auth check are skipped if versionFlag
+// is true (version printing needs nothing).
+func validatePrerequisites(versionFlag bool) {
+	// Skip all checks if printing version (it needs nothing)
+	if versionFlag {
+		return
+	}
+
+	// Check for git on PATH
+	_, err := exec.LookPath("git")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "freshen requires git on PATH.")
+		os.Exit(1)
+	}
+
+	// Check for authenticated GitHub CLI, bounded so a hung network doesn't
+	// block indefinitely before any logging is configured.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "auth", "status")
+	err = cmd.Run()
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "freshen timed out checking GitHub CLI auth status (network issue?). Check your connection and try again.")
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "freshen requires an authenticated GitHub CLI. Run: gh auth login.")
+		os.Exit(1)
+	}
+}
 
 func main() {
 	var (
 		dirFlag            string
 		orgFlag            string
+		concurrencyFlag    int
 		nonInteractiveFlag bool
 		versionFlag        bool
+		aliasFlag          aliasFlags
 	)
 
 	homeDir, _ := os.UserHomeDir()
 	defaultReposDir := filepath.Join(homeDir, "repos")
+	defaultOrg := os.Getenv("FRESHEN_ORG")
+	if defaultOrg == "" {
+		defaultOrg = "seankoji-com"
+	}
 
 	flag.StringVar(&dirFlag, "dir", defaultReposDir, "Target directory containing repository subfolders")
-	flag.StringVar(&orgFlag, "org", "seankoji-com", "Target GitHub Organization")
+	flag.StringVar(&orgFlag, "org", defaultOrg, "Target GitHub Organization")
+	flag.IntVar(&concurrencyFlag, "concurrency", 4, "Number of concurrent repository sync operations")
 	flag.BoolVar(&nonInteractiveFlag, "non-interactive", false, "Run in non-interactive terminal batch mode")
 	flag.BoolVar(&nonInteractiveFlag, "y", false, "Run in non-interactive terminal batch mode (shorthand)")
 	flag.BoolVar(&versionFlag, "version", false, "Show freshen version")
 	flag.BoolVar(&versionFlag, "v", false, "Show freshen version (shorthand)")
+	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
 	flag.Parse()
+
+	validatePrerequisites(versionFlag)
 
 	if versionFlag {
 		fmt.Printf("freshen v%s\n", Version)
@@ -79,7 +143,7 @@ func main() {
 
 	var bgWG sync.WaitGroup
 	p := tea.NewProgram(
-		tui.NewModel(targetDir, orgFlag, ctx, stop, &bgWG),
+		tui.NewModel(targetDir, orgFlag, concurrencyFlag, ctx, stop, &bgWG),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
@@ -171,7 +235,13 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
 
 	// Delete archived repos & clone missing active repos
 	for _, ghRepo := range orgRepos {
-		localDir := git.GetLocalDirName(ghRepo.Name)
+		localDir, ok := git.GetLocalDirName(ghRepo.Name)
+		if !ok {
+			// An unusable name must never be joined onto targetDir: the join would
+			// resolve to targetDir itself and hand the whole repos root to RemoveAll.
+			fmt.Printf("Warning: skipping repo '%s': no safe local directory name\n", ghRepo.Name)
+			continue
+		}
 		localPath := filepath.Join(targetDir, localDir)
 
 		if ghRepo.IsArchived {

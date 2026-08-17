@@ -5,11 +5,51 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/jobs"
+)
+
+// CommandRunner abstracts external command execution so it can be faked in tests.
+// Implementations return stdout on success; on failure the returned error should
+// include any stderr output so callers get diagnostic detail without managing buffers.
+type CommandRunner interface {
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+// execRunner is the production CommandRunner backed by exec.CommandContext.
+type execRunner struct{}
+
+func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return out.Bytes(), fmt.Errorf("%w: %s", err, stderr)
+		}
+		return out.Bytes(), err
+	}
+	return out.Bytes(), nil
+}
+
+// runner is the package-level CommandRunner; tests swap it for a fake.
+var runner CommandRunner = &execRunner{}
+
+// API pagination limits and timeouts
+const (
+	defaultRepoLimit   = 1000
+	graphQLRepoLimit   = 100
+	defaultIssueLimit  = 50
+	defaultPRLimit     = 50
+	fetchTimeout       = 6 * time.Second
+	rebaseAbortTimeout = 10 * time.Second
 )
 
 type RepoStatus string
@@ -62,6 +102,23 @@ type BranchWorktreeDetails struct {
 	ChangedFiles   []string
 }
 
+// cleanBranchName trims whitespace and strips one leading * or + marker with or without a following space.
+func cleanBranchName(s string) string {
+	clean := strings.TrimSpace(s)
+	// Strip one leading * or + with or without a following space
+	if strings.HasPrefix(clean, "* ") {
+		clean = strings.TrimPrefix(clean, "* ")
+	} else if strings.HasPrefix(clean, "+ ") {
+		clean = strings.TrimPrefix(clean, "+ ")
+	} else if strings.HasPrefix(clean, "*") {
+		clean = strings.TrimPrefix(clean, "*")
+	} else if strings.HasPrefix(clean, "+") {
+		clean = strings.TrimPrefix(clean, "+")
+	}
+	clean = strings.TrimSpace(clean)
+	return clean
+}
+
 // GetLocalBranches returns local branch entries.
 func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	if len(d.LocalBranches) > 0 {
@@ -69,10 +126,7 @@ func (d BranchWorktreeDetails) GetLocalBranches() []string {
 	}
 	var local []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if !strings.HasPrefix(clean, "remotes/") {
 			local = append(local, b)
 		}
@@ -87,10 +141,7 @@ func (d BranchWorktreeDetails) GetRemoteBranches() []string {
 	}
 	var remote []string
 	for _, b := range d.Branches {
-		clean := strings.TrimSpace(b)
-		clean = strings.TrimPrefix(clean, "* ")
-		clean = strings.TrimPrefix(clean, "+ ")
-		clean = strings.TrimSpace(clean)
+		clean := cleanBranchName(b)
 		if strings.HasPrefix(clean, "remotes/") {
 			remote = append(remote, b)
 		}
@@ -155,20 +206,90 @@ func ShortenHomePath(path string) string {
 	return path
 }
 
+// aliasToRemote and aliasToLocal hold user-supplied repo alias pairs
+// registered via the repeatable --alias local=remote flag (see AddAlias).
+// They are consulted before the built-in defaults below, so a user-supplied
+// pair overrides a built-in one for the same key.
+var (
+	aliasToRemote = make(map[string]string) // local -> remote
+	aliasToLocal  = make(map[string]string) // remote -> local
+)
+
+// AddAlias registers a local/remote repo alias pair, overriding the built-in
+// defaults in GetLocalDirName/GetGHRepoName for that pair. Intended to be
+// called during flag parsing, before any concurrent use of this package.
+// The local half is validated here (it becomes a directory name joined onto the
+// target directory), so a bad --alias is a startup error rather than a runtime
+// path collapse. The remote half is validated the same way because it is used
+// as a clone target name.
+func AddAlias(local, remote string) error {
+	if _, ok := sanitizeDirName(local); !ok {
+		return fmt.Errorf("invalid local alias name %q: must be a single path segment, not empty, %q or %q", local, ".", "..")
+	}
+	if _, ok := sanitizeDirName(remote); !ok {
+		return fmt.Errorf("invalid remote alias name %q: must be a single path segment, not empty, %q or %q", remote, ".", "..")
+	}
+	aliasToRemote[local] = remote
+	aliasToLocal[remote] = local
+	return nil
+}
+
 // GetLocalDirName maps GitHub repository name to local folder alias.
-func GetLocalDirName(ghRepo string) string {
+// The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
+// User-supplied aliases from --alias take precedence; see AddAlias.
+// The second return value reports whether the result is a safe single path
+// segment; callers MUST check it and skip the repo when false rather than
+// joining an unusable name onto the target directory.
+func GetLocalDirName(ghRepo string) (string, bool) {
+	if local, ok := aliasToLocal[ghRepo]; ok {
+		return sanitizeDirName(local)
+	}
+	var name string
 	switch ghRepo {
 	case ".github":
-		return "github"
+		name = "github"
 	case "careynas.net":
-		return "wiki.robot.house"
+		name = "wiki.robot.house"
 	default:
-		return ghRepo
+		name = ghRepo
 	}
+	return sanitizeDirName(name)
+}
+
+// sanitizeDirName reports whether name is safe to join onto a parent directory
+// as a single path segment, returning it unchanged when it is.
+//
+// It deliberately never rewrites the name. Stripping the offending characters
+// instead would map distinct repos onto one directory (GitHub allows dots, so
+// "evil" and "..evil" are different repos) and — worse — collapse "..", "." and
+// "foo/.." to "", which filepath.Join resolves back to the parent directory
+// itself, handing the whole repos root to os.RemoveAll. Rejection is the only
+// safe failure mode, so ok=false means "refuse", never "use the default".
+func sanitizeDirName(name string) (string, bool) {
+	if name == "" || name == "." || name == ".." {
+		return "", false
+	}
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return "", false
+	}
+	// Clean leaves a valid single segment untouched ("foo..bar" stays as-is) but
+	// rewrites anything with traversal or redundant separators still in it.
+	if filepath.Clean(name) != name || filepath.Base(name) != name {
+		return "", false
+	}
+	return name, true
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
+// The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
+// User-supplied aliases from --alias take precedence; see AddAlias, which
+// validates both halves of every pair so an alias always round-trips with
+// GetLocalDirName. Non-alias inputs are local directory entries, which are
+// single path segments by construction.
 func GetGHRepoName(localDir string) string {
+	if remote, ok := aliasToRemote[localDir]; ok {
+		return remote
+	}
 	switch localDir {
 	case "github":
 		return ".github"
@@ -181,15 +302,13 @@ func GetGHRepoName(localDir string) string {
 
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
 func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
-	cmd := exec.Command("gh", "repo", "list", org, "--limit", "1000", "--json", "name,isArchived,url,sshUrl")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
+	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", fmt.Sprintf("%d", defaultRepoLimit), "--json", "name,isArchived,url,sshUrl")
+	if err != nil {
 		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
 	}
 
 	var repos []GHRepoInfo
-	if err := json.Unmarshal(out.Bytes(), &repos); err != nil {
+	if err := json.Unmarshal(out, &repos); err != nil {
 		return nil, fmt.Errorf("failed to parse gh JSON output: %w", err)
 	}
 
@@ -198,16 +317,14 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
-	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: 100) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org)
-	cmd := exec.Command("gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		return nil, err
+	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org, graphQLRepoLimit)
+	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
+	if err != nil {
+		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
 	}
 
 	var resp GraphQLOrgResponse
-	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, err
 	}
 
@@ -222,11 +339,15 @@ func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
 }
 
 // GetRepoBranchDetails fetches branches, worktrees, and changed file details.
-func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
+func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) BranchWorktreeDetails {
 	var details BranchWorktreeDetails
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Branches
-	cmd := exec.Command("git", "-C", path, "branch", "-a")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-a")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -234,10 +355,7 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 			if trimmed := strings.TrimSpace(line); trimmed != "" {
 				details.Branches = append(details.Branches, trimmed)
 
-				clean := trimmed
-				clean = strings.TrimPrefix(clean, "* ")
-				clean = strings.TrimPrefix(clean, "+ ")
-				clean = strings.TrimSpace(clean)
+				clean := cleanBranchName(trimmed)
 
 				if strings.HasPrefix(clean, "remotes/") {
 					details.RemoteBranches = append(details.RemoteBranches, trimmed)
@@ -248,8 +366,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Worktrees
-	cmd = exec.Command("git", "-C", path, "worktree", "list")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "worktree", "list")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -260,8 +382,12 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 		}
 	}
 
+	if ctx.Err() != nil {
+		return details
+	}
+
 	// Changed files & status
-	cmd = exec.Command("git", "-C", path, "status", "--short")
+	cmd = exec.CommandContext(ctx, "git", "-C", path, "status", "--short")
 	out.Reset()
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -276,12 +402,23 @@ func GetRepoBranchDetails(path, defaultBranch string) BranchWorktreeDetails {
 }
 
 // PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
-func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
+func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) (int, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+
 	// 1. Fetch & prune deleted remote-tracking references from origin
-	_ = exec.Command("git", "-C", path, "fetch", "--prune", "origin").Run()
+	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
+	if err := exec.CommandContext(ctx, "git", "-C", path, "fetch", "--prune", "origin").Run(); err != nil {
+		slog.Warn("git fetch --prune failed", "path", path, "error", err)
+	}
+
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 
 	// 2. Force remove secondary git worktrees
-	cmdWorktree := exec.Command("git", "-C", path, "worktree", "list", "--porcelain")
+	cmdWorktree := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain")
 	var wtOut bytes.Buffer
 	cmdWorktree.Stdout = &wtOut
 	if err := cmdWorktree.Run(); err == nil {
@@ -291,32 +428,35 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 				wtPath := strings.TrimPrefix(line, "worktree ")
 				wtPath = strings.TrimSpace(wtPath)
 				if wtPath != "" && wtPath != path {
-					_ = exec.Command("git", "-C", path, "worktree", "remove", "--force", wtPath).Run()
+					if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
+						slog.Warn("git worktree remove failed", "worktreePath", wtPath, "error", err)
+					}
 				}
 			}
 		}
 	}
-	_ = exec.Command("git", "-C", path, "worktree", "prune").Run()
+	if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "prune").Run(); err != nil {
+		slog.Warn("git worktree prune failed", "path", path, "error", err)
+	}
+
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 
 	// 3. Delete local non-default branches
-	cmd := exec.Command("git", "-C", path, "branch", "--format=%(refname:short)")
+	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "--format=%(refname:short)")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
 		return 0, err
 	}
 
-	currentBranch := GetOriginalBranch(path)
+	currentBranch := GetOriginalBranch(ctx, path)
 	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
-		b = strings.TrimSpace(b)
-		if strings.HasPrefix(b, "+") || strings.HasPrefix(b, "*") {
-			b = strings.TrimPrefix(b, "+")
-			b = strings.TrimPrefix(b, "*")
-			b = strings.TrimSpace(b)
-		}
+		b = cleanBranchName(b)
 		if b != "" && b != defaultBranch && b != currentBranch {
-			delCmd := exec.Command("git", "-C", path, "branch", "-D", b)
+			delCmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-D", b)
 			if delCmd.Run() == nil {
 				deletedCount++
 			}
@@ -327,14 +467,18 @@ func PruneBranchesAndWorktrees(path, defaultBranch string) (int, error) {
 
 // FetchOpenIssuesList retrieves open GitHub issues with a 6-second timeout context.
 func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,url")
-	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultIssueLimit), "--json", "number,title,url")
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return nil, fmt.Errorf("%w: %s", err, stderr)
+		}
 		return nil, err
 	}
 
@@ -345,19 +489,26 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	if issues == nil {
 		issues = []IssueItem{}
 	}
+	for i := range issues {
+		issues[i].Title = jobs.SanitizeTerminal(issues[i].Title)
+	}
 	return issues, nil
 }
 
 // FetchOpenPRsList retrieves open GitHub pull requests with a 6-second timeout context.
 func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
-	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", "50", "--json", "number,title,headRefName,url")
-	var out bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultPRLimit), "--json", "number,title,headRefName,url")
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return nil, fmt.Errorf("%w: %s", err, stderr)
+		}
 		return nil, err
 	}
 
@@ -368,22 +519,30 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 	if prs == nil {
 		prs = []PRItem{}
 	}
+	for i := range prs {
+		prs[i].Title = jobs.SanitizeTerminal(prs[i].Title)
+		prs[i].HeadRefName = jobs.SanitizeTerminal(prs[i].HeadRefName)
+	}
 	return prs, nil
 }
 
 // FetchExistingPRURL checks if an open PR exists on GitHub for the given branch.
-func FetchExistingPRURL(repoPath, branch string) string {
+// An empty result means "no open PR found"; a lookup failure is logged so it is
+// not silently mistaken for that, since callers act on the distinction.
+func FetchExistingPRURL(ctx context.Context, repoPath, branch string) string {
 	if branch == "" || branch == "HEAD" {
 		return ""
 	}
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
 	cmd.Dir = repoPath
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		return strings.TrimSpace(out.String())
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		slog.Warn("gh pr list failed", "path", repoPath, "branch", branch, "error", err, "stderr", strings.TrimSpace(errOut.String()))
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(out.String())
 }
 
 // IsGitRepo checks if a directory is a valid git working tree.
@@ -393,31 +552,57 @@ func IsGitRepo(path string) bool {
 }
 
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
-func GetOriginalBranch(path string) string {
-	cmd := exec.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+func GetOriginalBranch(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return "HEAD"
 	}
 
-	cmd = exec.Command("git", "-C", path, "rev-parse", "--short", "HEAD")
-	out.Reset()
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
+	}
+
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	out, err = runner.Run(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
+	if err == nil && strings.TrimSpace(string(out)) != "" {
+		return strings.TrimSpace(string(out))
 	}
 
 	return "HEAD"
 }
 
-// GetDefaultBranch determines default branch (main/master) for a git repository.
-func GetDefaultBranch(path string) string {
-	cmd := exec.Command("git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
-	var out bytes.Buffer
+// ghDefaultBranch resolves a repo's default branch via `gh repo view`, run with
+// its working directory set to path: gh takes [HOST/]OWNER/REPO or a URL, never
+// a filesystem path, and CommandRunner has no way to set cmd.Dir. It is a
+// package-level var so tests can fake this tier without spawning gh.
+var ghDefaultBranch = func(ctx context.Context, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	cmd.Dir = path
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		ref := strings.TrimSpace(out.String())
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return "", fmt.Errorf("%w: %s", err, stderr)
+		}
+		return "", err
+	}
+	return out.String(), nil
+}
+
+// GetDefaultBranch determines default branch (main/master) for a git repository.
+// ctx allows the caller to abort the lookup, including the networked gh tier.
+func GetDefaultBranch(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
+	if err == nil {
+		ref := strings.TrimSpace(string(out))
 		ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
 		ref = strings.TrimPrefix(ref, "origin/")
 		if ref != "" {
@@ -425,23 +610,22 @@ func GetDefaultBranch(path string) string {
 		}
 	}
 
-	cmd = exec.Command("gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
-	out.Reset()
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil && strings.TrimSpace(out.String()) != "" {
-		return strings.TrimSpace(out.String())
+	if branch, err := ghDefaultBranch(ctx, path); err == nil {
+		if branch = strings.TrimSpace(branch); branch != "" {
+			return branch
+		}
+	} else {
+		slog.Warn("gh repo view failed", "path", path, "error", err)
 	}
 
-	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main")
-	if cmd.Run() == nil {
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
 		return "main"
 	}
-	cmd = exec.Command("git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master")
-	if cmd.Run() == nil {
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
 		return "master"
 	}
 
-	return GetOriginalBranch(path)
+	return GetOriginalBranch(ctx, path)
 }
 
 // SyncProgress receives a snapshot of a repository after each state change
@@ -516,10 +700,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	item.Status = StatusSyncing
 	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)
 
-	origBranch := GetOriginalBranch(item.Path)
+	origBranch := GetOriginalBranch(ctx, item.Path)
 	item.OriginalBranch = origBranch
 	item.CurrentBranch = origBranch
-	defaultBranch := GetDefaultBranch(item.Path)
+	defaultBranch := GetDefaultBranch(ctx, item.Path)
 	item.DefaultBranch = defaultBranch
 
 	if !IsGitRepo(item.Path) {
@@ -559,20 +743,20 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 		}
 
 		item.IsNew = false
-		origBranch = GetOriginalBranch(item.Path)
-		defaultBranch = GetDefaultBranch(item.Path)
+		origBranch = GetOriginalBranch(ctx, item.Path)
+		defaultBranch = GetDefaultBranch(ctx, item.Path)
 		item.OriginalBranch = origBranch
 		item.CurrentBranch = origBranch
 		item.DefaultBranch = defaultBranch
-		item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
+		item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 		s.finish(StatusCloned, "Cloned", "󰄬 Successfully cloned into '%s' (%s).", item.Path, defaultBranch)
 		return
 	}
 
-	item.BranchDetails = GetRepoBranchDetails(item.Path, defaultBranch)
+	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
-		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
+		item.ExistingPRURL = FetchExistingPRURL(ctx, item.Path, origBranch)
 		if item.ExistingPRURL != "" {
 			s.log("󰏫 Existing Open PR found: %s", item.ExistingPRURL)
 		}
@@ -608,7 +792,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 
 		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch)
 
-		_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run()
+		// Best-effort: the stash below is what actually has to succeed.
+		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
+			s.log("󰀪 git add . failed (continuing): %v", err)
+		}
 		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
 		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 		if err := stashCmd.Run(); err != nil {
@@ -663,7 +850,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 
 	s.log(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch)
 
-	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run()
+	// Best-effort: the rebase below still runs against whatever refs are local.
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run(); err != nil {
+		s.log("󰀪 git fetch origin failed (continuing): %v", err)
+	}
 	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
 	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
 	var rebaseOut bytes.Buffer
@@ -675,8 +865,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	} else {
 		// Use a fresh context for the abort so a mid-rebase state isn't left behind
 		// even if the sync itself was cancelled.
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
+		if abortErr := exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run(); abortErr != nil {
+			s.log("󰀪 git rebase --abort failed — repository may be left mid-rebase: %v", abortErr)
+		}
 		abortCancel()
 		s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebase conflict: %s", rebaseOut.String())
 	}
@@ -696,49 +888,83 @@ func SwitchBranch(item *RepoItem, targetBranch string) error {
 }
 
 // CommitPushPRAndSwitchDefault commits unstaged changes, pushes to origin, creates/updates PR, and switches back to default branch.
-func CommitPushPRAndSwitchDefault(item *RepoItem) error {
+func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	branch := item.OriginalBranch
 	if branch == "" || branch == item.DefaultBranch {
 		return fmt.Errorf("cannot raise PR from default branch")
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	item.Logs = append(item.Logs, fmt.Sprintf("󰏫 Committing and pushing branch '%s' to raise/update PR...", branch))
 
-	_ = exec.Command("git", "-C", item.Path, "add", "-A").Run()
+	// add/commit are best-effort: if there's nothing to commit (or the commit
+	// otherwise no-ops), we still want to push whatever's already committed.
+	// Failures are logged rather than swallowed so they aren't invisible.
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git add -A failed (continuing): %v", err))
+	}
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	_ = exec.Command("git", "-C", item.Path, "commit", "-m", commitMsg).Run()
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg).Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git commit failed or had nothing to commit (continuing): %v", err))
+	}
 
-	pushCmd := exec.Command("git", "-C", item.Path, "push", "-u", "origin", branch)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	pushCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "push", "-u", "origin", branch)
+	var pushOut bytes.Buffer
+	pushCmd.Stdout = &pushOut
+	pushCmd.Stderr = &pushOut
 	if err := pushCmd.Run(); err != nil {
-		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
-		return err
+		// git reports rejections, auth failures and hook output on stderr; without
+		// capturing it the caller only ever sees "exit status 1".
+		detail := strings.TrimSpace(pushOut.String())
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v — %s", err, detail))
+		if detail != "" {
+			return fmt.Errorf("git push failed: %w: %s", err, detail)
+		}
+		return fmt.Errorf("git push failed: %w", err)
+	}
+
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	if item.ExistingPRURL == "" {
-		prCmd := exec.Command("gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
+		prCmd := exec.CommandContext(ctx, "gh", "pr", "create", "--fill", "--base", item.DefaultBranch, "--head", branch)
 		prCmd.Dir = item.Path
 		var prOut bytes.Buffer
 		prCmd.Stdout = &prOut
 		prCmd.Stderr = &prOut
-		if err := prCmd.Run(); err == nil {
-			prURL := strings.TrimSpace(prOut.String())
-			item.DraftPRURL = prURL
-			item.ExistingPRURL = prURL
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 PR created: %s", prURL))
-		} else {
-			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create notice: %s", prOut.String()))
+		if err := prCmd.Run(); err != nil {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create failed: %v — %s", err, strings.TrimSpace(prOut.String())))
+			return fmt.Errorf("gh pr create failed: %w: %s", err, strings.TrimSpace(prOut.String()))
 		}
+		prURL := strings.TrimSpace(prOut.String())
+		item.DraftPRURL = prURL
+		item.ExistingPRURL = prURL
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 PR created: %s", prURL))
 	} else {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
 
-	coCmd := exec.Command("git", "-C", item.Path, "checkout", item.DefaultBranch)
-	if err := coCmd.Run(); err == nil {
-		item.CurrentBranch = item.DefaultBranch
-		item.Status = StatusPRCreated
-		item.StatusMsg = "PR Raised"
-		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
+
+	coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", item.DefaultBranch)
+	if err := coCmd.Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch back to default branch '%s': %v", item.DefaultBranch, err))
+		return fmt.Errorf("failed to checkout '%s': %w", item.DefaultBranch, err)
+	}
+	item.CurrentBranch = item.DefaultBranch
+	item.Status = StatusPRCreated
+	item.StatusMsg = "PR Raised"
+	item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
 
 	return nil
 }

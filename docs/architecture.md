@@ -14,7 +14,7 @@ pkg/
   git/git.go              # Git operations, GitHub API (gh CLI wrapper), repo model
   jobs/jobs.go            # GitHub Actions runner & job queue polling, data types
   jobs/jobs_test.go       # Unit tests for filtering, sorting, merging
-  tui/tui.go              # Bubble Tea Model, Update, View, viewport rendering (~2975 lines)
+  tui/tui.go              # Bubble Tea Model, Update, View, viewport rendering
   tui/tui_test.go         # TUI rendering & behavior tests
 ```
 
@@ -50,7 +50,8 @@ pkg/
 - `GHRunnerLabel`, `GHRunnerInfo`, `GHWorkflowRun`, `GHWorkflowRunsResponse`, `GHJobInfo`, `GHJobsResponse`
 
 **Key functions:**
-- `FetchOrgRunners(org, existingRunners, jobQueue)` — queries `/orgs/{org}/actions/runners`, merges with existing data preserving log history, cross-references with job queue
+- `FetchOrgRunners(org)` — queries `/orgs/{org}/actions/runners` and returns runners
+- `MergeRunners(newRunners, existing, jobQueue)` — merges with existing data preserving log history, cross-references with job queue
 - `FetchOrgJobQueue(org, repos)` — iterates over repos, queries `/repos/{org}/{repo}/actions/runs` and `/repos/{org}/{repo}/actions/runs/{id}/jobs`
 - `FetchJobLogs(org, repo, runID, targetGHJobID, targetJobName, maxLines)` — fetches raw log text for a specific job; falls back through 4 matching strategies
 - `FilterAndSortJobQueue(queue)` — removes passed/completed jobs; sorts running first, then groups by run ID, then matrix children
@@ -59,7 +60,7 @@ pkg/
 
 ## Package `pkg/tui` — Bubble Tea UI
 
-**Model struct:** App state — repos, runners, jobQueue, focus state, tab state, spinner, progress bar, viewport, error tracking (`RunnerPermissionDenied`, `RunnerFetchFailed`, `JobQueueFetchFailed`).
+**Model struct:** All app state — repos, runners, jobQueue, focus state, tab state, spinner, progress bar, viewport, error tracking (`RunnerPermissionDenied`, `RunnerFetchFailed`, `JobQueueFetchFailed`).
 
 **Focus model:** Three-column left pane with focusable panels:
 - `FocusRepos` (0) — repository list with status badges
@@ -104,6 +105,6 @@ pkg/
 
 Tests in `pkg/git/git_test.go` test: deep cloning of `RepoItem`, progress snapshot publishing, offline sync execution, cancelled context handling, auto-cloning of uncloned repositories during sync.
 
-Tests in `pkg/jobs/jobs_test.go` test: default constructors, `FilterAndSortJobQueue`, `PollStep`, `mergeRunners` cross-referencing.
+Tests in `pkg/jobs/jobs_test.go` test: default constructors, `FilterAndSortJobQueue`, `PollStep`, `MergeRunners` cross-referencing.
 
 Tests in `pkg/tui/tui_test.go` test: view height constraints, header stickiness, viewport initial offset, `loadJobQueueCmd` fallback, runner rendering (no "Busy" word, hyperlink presence, empty state variants, permission notice), runner permission error detection, table ordering, toast notifications, hyperlink OSC 8 syntax, focused run viewport, Enter/Esc focus toggle.

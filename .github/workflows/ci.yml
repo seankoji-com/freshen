@@ -26,11 +26,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
+
+      - name: Run go vet
+        run: go vet ./...
 
       - name: Run unit tests
         run: go test -v -race ./...
 
       - name: Build binary
-        run: go build -o freshen .
+        # `--always` falls back to the abbreviated commit SHA and never fails,
+        # so no "|| echo" fallback is needed here. VERSION is captured as its
+        # own statement (not inlined into -ldflags) so that if git itself
+        # ever errors here, -e fails the step loudly instead of silently
+        # shipping a binary with an empty -X main.Version=.
+        # Note: if a v-prefixed tag is ever created, main.go's version-print
+        # format already adds its own "v" prefix, which would double up.
+        run: |
+          VERSION="$(git describe --tags --always)"
+          go build -ldflags "-X main.Version=$VERSION" -o freshen .

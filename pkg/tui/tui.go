@@ -42,6 +42,39 @@ const (
 	FocusJobs
 )
 
+// --- Sync and Refresh Intervals ---
+const (
+	repoTickInterval      = 5 * time.Minute
+	runnerJobTickInterval = 10 * time.Second
+	jobQueueTickInterval  = 20 * time.Second
+
+	// pollBackoffCap bounds the exponential backoff applied to the runner and
+	// job-queue polls after consecutive fetch failures, so a tripped API quota
+	// isn't pinned at zero overnight by a fixed-interval poll.
+	pollBackoffCap = 5 * time.Minute
+)
+
+// Fetch-source keys for the per-poller backoff counters. The runner poll and
+// the job-queue poll fail independently, so each tracks its own streak — a
+// healthy fetch on one must not reset the backoff the other has earned.
+const (
+	fetchSourceRunners  = "runners"
+	fetchSourceJobQueue = "jobQueue"
+)
+
+// backoffInterval doubles base once per consecutive failure, capped at
+// pollBackoffCap. With no failures recorded it returns base unchanged.
+func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
+	d := base
+	for i := 0; i < consecutiveErrors && d < pollBackoffCap; i++ {
+		d *= 2
+	}
+	if d > pollBackoffCap {
+		d = pollBackoffCap
+	}
+	return d
+}
+
 // --- NerdFont Glyphs & Color Palette ---
 var (
 	iconLeaf     = "🍃"
@@ -192,13 +225,15 @@ type runnerJobTickMsg time.Time
 type jobQueueTickMsg time.Time
 
 func repoTickCmd() tea.Cmd {
-	return tea.Every(5*time.Minute, func(t time.Time) tea.Msg {
+	return tea.Every(repoTickInterval, func(t time.Time) tea.Msg {
 		return repoTickMsg(t)
 	})
 }
 
-func runnerJobTickCmd() tea.Cmd {
-	return tea.Every(10*time.Second, func(t time.Time) tea.Msg {
+// runnerJobTickCmd schedules the next runner poll after d, which callers widen
+// via backoffInterval once fetches start failing.
+func runnerJobTickCmd(d time.Duration) tea.Cmd {
+	return tea.Every(d, func(t time.Time) tea.Msg {
 		return runnerJobTickMsg(t)
 	})
 }
@@ -207,8 +242,9 @@ func runnerJobTickCmd() tea.Cmd {
 // GitHub has no org-wide workflow-runs endpoint, so each poll costs one API
 // call per tracked repository; at 20s a ~20-repo org stays well inside the
 // 5,000 requests/hour limit, while the runner panel keeps its 10s refresh.
-func jobQueueTickCmd() tea.Cmd {
-	return tea.Every(20*time.Second, func(t time.Time) tea.Msg {
+// d is widened via backoffInterval once fetches start failing.
+func jobQueueTickCmd(d time.Duration) tea.Cmd {
+	return tea.Every(d, func(t time.Time) tea.Msg {
 		return jobQueueTickMsg(t)
 	})
 }
@@ -239,32 +275,52 @@ type loadedPRsMsg struct {
 	err      error
 }
 
+// pushFinishedMsg carries the result of a background commit/push/PR run back
+// to the update goroutine, which is the only writer of m.Repos. The worker
+// mutates a private clone and never touches the live item; repo is that clone,
+// folded onto the live item via applyRepoSnapshot so every field the push
+// wrote (Status, StatusMsg, Logs, DraftPRURL, ExistingPRURL, branch state)
+// survives the handoff.
+type pushFinishedMsg struct {
+	repoName string
+	repo     *git.RepoItem
+	err      error
+}
+
 // --- Bubble Tea Model ---
 
 type Model struct {
-	TargetDir           string
-	TargetOrg           string
-	Repos               []*git.RepoItem
-	Runners             []*jobs.RunnerItem
-	JobQueue            []*jobs.JobItem
-	SelectedIndex       int
-	SelectedRunnerIndex int
-	SelectedJobIndex    int
-	SelectedTagIndex    int
-	ActiveFocus         FocusType
-	ActiveTab           TabType
-	IsSyncing           bool
-	IsOrgSyncing        bool
-	IsJobQueueLoading   bool
-	IsRunnersLoading    bool
-	TotalCount          int
-	ToastMsg            string
-	FocusedRunID        int64 // When non-zero, a specific workflow run is focused
-	ToastPriority          int // higher priority overrides lower; 0 = none, 1 = info, 2 = error
-	ConsecutiveErrors      int
+	TargetDir              string
+	TargetOrg              string
+	Concurrency            int
+	Repos                  []*git.RepoItem
+	Runners                []*jobs.RunnerItem
+	JobQueue               []*jobs.JobItem
+	SelectedIndex          int
+	SelectedRunnerIndex    int
+	SelectedJobIndex       int
+	SelectedTagIndex       int
+	ActiveFocus            FocusType
+	ActiveTab              TabType
+	IsSyncing              bool
+	IsOrgSyncing           bool
+	IsJobQueueLoading      bool
+	IsRunnersLoading       bool
+	TotalCount             int
+	ToastMsg               string
+	FocusedRunID           int64 // When non-zero, a specific workflow run is focused
+	ToastPriority          int   // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	ConsecutiveErrors      map[string]int
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
+
+	// pendingDeletePath holds the Path of the archived repo awaiting a second
+	// 'd' press to confirm deletion; "" means no pending delete. It is keyed
+	// on Path rather than a Repos index because a background refresh can
+	// rebuild and re-sort m.Repos between the two presses, which would leave
+	// an index pointing at a different repo than the one just confirmed.
+	pendingDeletePath string
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -284,7 +340,7 @@ type Model struct {
 // NewModel constructs the TUI model. ctx should be cancelled by the caller
 // (e.g. on quit or an OS signal) to abort in-flight background git
 // operations; bgWG tracks those operations for a bounded shutdown wait.
-func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
+func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(colorSecondary)
@@ -299,12 +355,14 @@ func NewModel(targetDir, targetOrg string, ctx context.Context, cancel context.C
 	return Model{
 		TargetDir:           targetDir,
 		TargetOrg:           targetOrg,
+		Concurrency:         concurrency,
 		Repos:               make([]*git.RepoItem, 0),
 		Runners:             make([]*jobs.RunnerItem, 0),
 		JobQueue:            make([]*jobs.JobItem, 0),
 		SelectedIndex:       0,
 		SelectedRunnerIndex: 0,
 		SelectedJobIndex:    0,
+		pendingDeletePath:   "",
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
@@ -326,8 +384,8 @@ func (m Model) Init() tea.Cmd {
 		m.loadRunnersCmd(),
 		m.loadJobQueueCmd(),
 		repoTickCmd(),
-		runnerJobTickCmd(),
-		jobQueueTickCmd(),
+		runnerJobTickCmd(runnerJobTickInterval),
+		jobQueueTickCmd(jobQueueTickInterval),
 	)
 }
 
@@ -400,8 +458,15 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 
 func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 	return func() tea.Msg {
-		orgRepos, _ := git.FetchOrgRepos(m.TargetOrg)
-		orgCounts, _ := git.FetchOrgRepoCounts(m.TargetOrg)
+		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+		if err != nil {
+			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
+		}
+
+		orgCounts, countsErr := git.FetchOrgRepoCounts(m.TargetOrg)
+		if countsErr != nil {
+			slog.Debug("org repo counts fetch failed", "org", m.TargetOrg, "error", countsErr)
+		}
 
 		entries, err := git.ScanLocalDirectory(m.TargetDir)
 		if err != nil {
@@ -411,7 +476,14 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 		repoMap := make(map[string]*git.RepoItem)
 
 		for _, ghRepo := range orgRepos {
-			localDir := git.GetLocalDirName(ghRepo.Name)
+			localDir, ok := git.GetLocalDirName(ghRepo.Name)
+			if !ok {
+				// An unusable name must never be joined onto TargetDir: the join would
+				// resolve to TargetDir itself, so the item's Path — which delete and
+				// sync act on — would point at the whole repos root.
+				slog.Warn("skipping repo with no safe local directory name", "repo", ghRepo.Name)
+				continue
+			}
 			localPath := filepath.Join(m.TargetDir, localDir)
 
 			localExists := false
@@ -435,8 +507,8 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 			}
 
 			if git.IsGitRepo(localPath) {
-				item.CurrentBranch = git.GetOriginalBranch(localPath)
-				item.DefaultBranch = git.GetDefaultBranch(localPath)
+				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
+				item.DefaultBranch = git.GetDefaultBranch(m.ctx, localPath)
 			}
 
 			if counts, found := orgCounts[ghRepo.Name]; found {
@@ -462,8 +534,8 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 						GHRepoName:    git.GetGHRepoName(name),
 						Path:          path,
 						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch: git.GetOriginalBranch(path),
-						DefaultBranch: git.GetDefaultBranch(path),
+						CurrentBranch: git.GetOriginalBranch(m.ctx, path),
+						DefaultBranch: git.GetDefaultBranch(m.ctx, path),
 						Status:        git.StatusPending,
 						Logs:          make([]string, 0),
 					}
@@ -506,8 +578,32 @@ func (m Model) fetchPRsCmd(repoName, ghRepoName string) tea.Cmd {
 	}
 }
 
+// bgGuard wraps task with bgWG tracking: Add(1) runs immediately (on the
+// caller's goroutine, before any `go` statement), and Done() is deferred
+// inside the returned function so it always fires once task completes,
+// whether that function is invoked inline or launched in a new goroutine.
+// This is the single choke point background git tasks must go through so
+// the bgWG guard can't be skipped at a launch site.
+func (m Model) bgGuard(task func()) func() {
+	if m.bgWG != nil {
+		m.bgWG.Add(1)
+	}
+	return func() {
+		if m.bgWG != nil {
+			defer m.bgWG.Done()
+		}
+		task()
+	}
+}
+
 // syncConcurrency bounds how many repositories are synced at once.
 const syncConcurrency = 4
+
+// syncRepositoryFn abstracts git.SyncRepository behind a package-level func
+// var so tests can control per-repo sync timing and observe the worker
+// pool's concurrency limit and cancellation behavior in startSyncCmd without
+// touching real git repos on disk.
+var syncRepositoryFn = git.SyncRepository
 
 // startSyncCmd syncs the given repositories in the background and streams their
 // state back into the update loop, one message per state change.
@@ -529,34 +625,42 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 		return func() tea.Msg { return syncFinishedMsg{bulk: bulk} }
 	}
 
-	ctx, bgWG := m.ctx, m.bgWG
+	ctx := m.ctx
 	snapshots := make(chan *git.RepoItem, len(work))
-	if bgWG != nil {
-		bgWG.Add(1)
-	}
 
-	go func() {
+	// bgGuard keeps the shutdown accounting at a single choke point: Add(1)
+	// happens here on the update goroutine, Done() once the stream closes.
+	run := m.bgGuard(func() {
 		defer close(snapshots)
-		if bgWG != nil {
-			defer bgWG.Done()
-		}
 
 		var wg sync.WaitGroup
-		sem := make(chan struct{}, syncConcurrency)
+		concurrency := m.Concurrency
+		if concurrency <= 0 {
+			concurrency = syncConcurrency
+		}
+		sem := make(chan struct{}, concurrency)
 
+	producer:
 		for _, r := range work {
 			if ctx.Err() != nil {
-				break
+				break producer
 			}
 
+			// Acquiring must stay cancellable: a wedged worker would
+			// otherwise block this loop forever, so the ctx check above is
+			// never reached again and bgGuard's Done() never fires.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				break producer
+			}
 			wg.Add(1)
-			sem <- struct{}{}
 
 			go func(r *git.RepoItem) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				git.SyncRepository(ctx, r, func(snapshot *git.RepoItem) {
+				syncRepositoryFn(ctx, r, func(snapshot *git.RepoItem) {
 					// Give up on quit rather than block on an undrained channel.
 					select {
 					case snapshots <- snapshot:
@@ -567,7 +671,8 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 		}
 
 		wg.Wait()
-	}()
+	})
+	go run()
 
 	return waitForSyncSnapshot(snapshots, bulk)
 }
@@ -631,6 +736,33 @@ func copyToClipboard(text string) error {
 	return cmd.Run()
 }
 
+// noteFetchFailure records a consecutive runner/job-queue fetch failure and
+// logs the moment the poll cadence first widens past its baseline.
+func (m *Model) noteFetchFailure(source string, base time.Duration) {
+	if m.ConsecutiveErrors == nil {
+		m.ConsecutiveErrors = make(map[string]int)
+	}
+	m.ConsecutiveErrors[source]++
+	streak := m.ConsecutiveErrors[source]
+	if next := backoffInterval(base, streak); next > base {
+		slog.Warn("backing off polls after consecutive fetch failures",
+			"source", source, "consecutiveErrors", streak, "interval", next)
+	}
+}
+
+// noteFetchSuccess clears this source's failure streak, logging the return to
+// the baseline poll cadence when a backoff was in effect. Streaks for other
+// sources are left alone so one healthy endpoint cannot cancel the backoff a
+// different, still-failing endpoint has earned.
+func (m *Model) noteFetchSuccess(source string) {
+	if streak := m.ConsecutiveErrors[source]; streak > 0 {
+		slog.Warn("resuming baseline poll interval after successful fetch",
+			"source", source, "consecutiveErrors", streak)
+	}
+	// delete rather than assign: it is a no-op on a nil map.
+	delete(m.ConsecutiveErrors, source)
+}
+
 // setToast sets a toast message with the given priority. Higher priority toasts
 // (error=2) override lower ones (info=1), and equal priorities replace.
 // Priority 0 clears on next keypress.
@@ -647,280 +779,519 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
 	case tea.KeyMsg:
-		m.setToast("", 0)
-		switch msg.String() {
+		cmd, early := m.handleKeyMsg(msg)
+		if early {
+			return m, cmd
+		}
+		cmds = append(cmds, cmd)
 
-		case "q", "ctrl+c":
-			if m.cancel != nil {
-				m.cancel()
-			}
-			return m, tea.Quit
+	case loadedIssuesMsg:
+		m.handleLoadedIssuesMsg(msg)
 
-		case "enter":
-			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-				job := m.JobQueue[m.SelectedJobIndex]
-				// If already focused on this run, unfocus it
-				if m.FocusedRunID == job.RunID {
-					m.FocusedRunID = 0
-				} else {
-					// Focus this run
-					m.FocusedRunID = job.RunID
-				}
-				m.updateViewport()
-			}
+	case loadedPRsMsg:
+		m.handleLoadedPRsMsg(msg)
 
-		case "esc":
-			if m.FocusedRunID != 0 {
-				m.FocusedRunID = 0
-				m.updateViewport()
-			}
+	case tea.MouseMsg:
+		cmds = append(cmds, m.handleMouseMsg(msg))
 
-		case "w", "W":
-			// Cycle active panel focus: Repos -> Runners -> Jobs
-			m.ActiveFocus = (m.ActiveFocus + 1) % 3
+	case repoTickMsg:
+		return m, m.handleRepoTickMsg()
+
+	case runnerJobTickMsg:
+		return m, m.handleRunnerJobTickMsg()
+
+	case jobQueueTickMsg:
+		return m, m.handleJobQueueTickMsg()
+
+	case loadedRunnersMsg:
+		m.handleLoadedRunnersMsg(msg)
+
+	case loadedJobQueueMsg:
+		cmds = append(cmds, m.handleLoadedJobQueueMsg(msg))
+
+	case loadedJobLogsMsg:
+		m.handleLoadedJobLogsMsg(msg)
+
+	case orgSyncedMsg:
+		cmd, early := m.handleOrgSyncedMsg(msg)
+		if early {
+			return m, cmd
+		}
+		cmds = append(cmds, cmd)
+
+	case repoSyncMsg:
+		cmds = append(cmds, m.handleRepoSyncMsg(msg))
+
+	case syncFinishedMsg:
+		m.handleSyncFinishedMsg(msg)
+
+	case pushFinishedMsg:
+		m.handlePushFinishedMsg(msg)
+
+	case tea.WindowSizeMsg:
+		m.handleWindowSizeMsg(msg)
+	}
+
+	var spinnerCmd tea.Cmd
+	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
+	cmds = append(cmds, spinnerCmd)
+
+	var vpCmd tea.Cmd
+	m.Viewport, vpCmd = m.Viewport.Update(msg)
+	cmds = append(cmds, vpCmd)
+
+	return m, tea.Batch(cmds...)
+}
+
+// handleKeyMsg dispatches a tea.KeyMsg to the per-key handler for msg.String(),
+// mirroring the original inline switch. It returns the resulting command and
+// whether Update() should return immediately with it, bypassing the shared
+// spinner/viewport postlude (true only for the keys that used to `return m, ...`
+// mid-switch: quit, and the repo-tab-cycling right/left/"4" keys).
+func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
+	m.setToast("", 0)
+	if msg.String() != "d" {
+		m.pendingDeletePath = ""
+	}
+
+	switch msg.String() {
+
+	case "q", "ctrl+c":
+		return m.handleKeyQuit()
+
+	case "enter":
+		m.handleKeyEnter()
+
+	case "esc":
+		m.handleKeyEsc()
+
+	case "w", "W":
+		m.handleKeyCyclePanel()
+
+	case "up", "k":
+		return m.handleKeyUp(), false
+
+	case "down", "j":
+		return m.handleKeyDown(), false
+
+	case "tab":
+		return m.handleKeyNextPanel(), false
+
+	case "shift+tab":
+		return m.handleKeyPrevPanel(), false
+
+	case "right", "l":
+		return m.handleKeyRight()
+
+	case "left", "h":
+		return m.handleKeyLeft()
+
+	case "1":
+		m.handleKeyTab1()
+
+	case "2":
+		m.handleKeyTab2()
+
+	case "3":
+		return m.handleKeyTab3()
+
+	case "4":
+		return m.handleKeyTab4()
+
+	case "a", "s":
+		return m.handleKeySyncAll(), false
+
+	case "X":
+		m.handleKeyPrune()
+
+	case "r":
+		return m.handleKeySync(), false
+
+	case "c", "y":
+		m.handleKeyCopy()
+
+	case "b":
+		m.handleKeySwitchBranch()
+
+	case "p":
+		return m.handleKeyPush(), false
+
+	case "d":
+		m.handleKeyDelete()
+	}
+
+	return nil, false
+}
+
+func (m *Model) handleKeyQuit() (tea.Cmd, bool) {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	return tea.Quit, true
+}
+
+func (m *Model) handleKeyEnter() {
+	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		job := m.JobQueue[m.SelectedJobIndex]
+		// If already focused on this run, unfocus it
+		if m.FocusedRunID == job.RunID {
+			m.FocusedRunID = 0
+		} else {
+			// Focus this run
+			m.FocusedRunID = job.RunID
+		}
+		m.updateViewport()
+	}
+}
+
+func (m *Model) handleKeyEsc() {
+	if m.FocusedRunID != 0 {
+		m.FocusedRunID = 0
+		m.updateViewport()
+	}
+}
+
+func (m *Model) handleKeyCyclePanel() {
+	// Cycle active panel focus: Repos -> Runners -> Jobs
+	m.ActiveFocus = (m.ActiveFocus + 1) % 3
+	m.updateViewport()
+}
+
+func (m *Model) handleKeyUp() tea.Cmd {
+	var cmd tea.Cmd
+	switch m.ActiveFocus {
+	case FocusRepos:
+		if m.SelectedIndex > 0 {
+			m.SelectedIndex--
 			m.updateViewport()
-
-		case "up", "k":
-			switch m.ActiveFocus {
-			case FocusRepos:
-				if m.SelectedIndex > 0 {
-					m.SelectedIndex--
-					m.updateViewport()
-				}
-			case FocusRunners:
-				if m.SelectedRunnerIndex > 0 {
-					m.SelectedRunnerIndex--
-					m.updateViewport()
-				} else if len(m.Repos) > 0 {
-					m.ActiveFocus = FocusRepos
-					m.SelectedIndex = len(m.Repos) - 1
-					m.setToast(" Focused Repositories Panel", 1)
-					m.updateViewport()
-				}
-			case FocusJobs:
-				if m.SelectedJobIndex > 0 {
-					m.SelectedJobIndex--
-					m.updateViewport()
-					if m.SelectedJobIndex < len(m.JobQueue) {
-						j := m.JobQueue[m.SelectedJobIndex]
-						if j.Status == jobs.JobRunning {
-							cmds = append(cmds, m.loadJobLogsCmd(j))
-						}
-					}
-				} else {
-					m.ActiveFocus = FocusRunners
-					matching := m.getMatchingRunners()
-					if len(matching) > 0 {
-						m.SelectedRunnerIndex = len(matching) - 1
-					} else {
-						m.SelectedRunnerIndex = 0
-					}
-					m.setToast(" Focused Runners Panel", 1)
-					m.updateViewport()
-				}
-			}
-
-		case "down", "j":
-			switch m.ActiveFocus {
-			case FocusRepos:
-				if m.SelectedIndex < len(m.Repos)-1 {
-					m.SelectedIndex++
-					m.updateViewport()
-				} else {
-					m.ActiveFocus = FocusRunners
-					m.SelectedRunnerIndex = 0
-					m.setToast(" Focused Runners Panel", 1)
-					m.updateViewport()
-				}
-			case FocusRunners:
-				matching := m.getMatchingRunners()
-				if m.SelectedRunnerIndex < len(matching)-1 {
-					m.SelectedRunnerIndex++
-					m.updateViewport()
-				} else {
-					m.ActiveFocus = FocusJobs
-					m.SelectedJobIndex = 0
-					m.setToast(" Focused Jobs Panel", 1)
-					m.updateViewport()
-					if len(m.JobQueue) > 0 {
-						j := m.JobQueue[0]
-						if j.Status == jobs.JobRunning {
-							cmds = append(cmds, m.loadJobLogsCmd(j))
-						}
-					}
-				}
-			case FocusJobs:
-				if m.SelectedJobIndex < len(m.JobQueue)-1 {
-					m.SelectedJobIndex++
-					m.updateViewport()
-					if m.SelectedJobIndex < len(m.JobQueue) {
-						j := m.JobQueue[m.SelectedJobIndex]
-						if j.Status == jobs.JobRunning {
-							cmds = append(cmds, m.loadJobLogsCmd(j))
-						}
-					}
-				}
-			}
-
-		case "tab":
-			m.ActiveFocus = (m.ActiveFocus + 1) % 3
+		}
+	case FocusRunners:
+		if m.SelectedRunnerIndex > 0 {
+			m.SelectedRunnerIndex--
 			m.updateViewport()
-			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		} else if len(m.Repos) > 0 {
+			m.ActiveFocus = FocusRepos
+			m.SelectedIndex = len(m.Repos) - 1
+			m.setToast(" Focused Repositories Panel", 1)
+			m.updateViewport()
+		}
+	case FocusJobs:
+		if m.SelectedJobIndex > 0 {
+			m.SelectedJobIndex--
+			m.updateViewport()
+			if m.SelectedJobIndex < len(m.JobQueue) {
 				j := m.JobQueue[m.SelectedJobIndex]
 				if j.Status == jobs.JobRunning {
-					cmds = append(cmds, m.loadJobLogsCmd(j))
+					cmd = m.loadJobLogsCmd(j)
 				}
 			}
-
-		case "shift+tab":
-			m.ActiveFocus = (m.ActiveFocus + 2) % 3
+		} else {
+			m.ActiveFocus = FocusRunners
+			matching := m.getMatchingRunners()
+			if len(matching) > 0 {
+				m.SelectedRunnerIndex = len(matching) - 1
+			} else {
+				m.SelectedRunnerIndex = 0
+			}
+			m.setToast(" Focused Runners Panel", 1)
 			m.updateViewport()
-			if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		}
+	}
+	return cmd
+}
+
+func (m *Model) handleKeyDown() tea.Cmd {
+	var cmd tea.Cmd
+	switch m.ActiveFocus {
+	case FocusRepos:
+		if m.SelectedIndex < len(m.Repos)-1 {
+			m.SelectedIndex++
+			m.updateViewport()
+		} else {
+			m.ActiveFocus = FocusRunners
+			m.SelectedRunnerIndex = 0
+			m.setToast(" Focused Runners Panel", 1)
+			m.updateViewport()
+		}
+	case FocusRunners:
+		matching := m.getMatchingRunners()
+		if m.SelectedRunnerIndex < len(matching)-1 {
+			m.SelectedRunnerIndex++
+			m.updateViewport()
+		} else {
+			m.ActiveFocus = FocusJobs
+			m.SelectedJobIndex = 0
+			m.setToast(" Focused Jobs Panel", 1)
+			m.updateViewport()
+			if len(m.JobQueue) > 0 {
+				j := m.JobQueue[0]
+				if j.Status == jobs.JobRunning {
+					cmd = m.loadJobLogsCmd(j)
+				}
+			}
+		}
+	case FocusJobs:
+		if m.SelectedJobIndex < len(m.JobQueue)-1 {
+			m.SelectedJobIndex++
+			m.updateViewport()
+			if m.SelectedJobIndex < len(m.JobQueue) {
 				j := m.JobQueue[m.SelectedJobIndex]
 				if j.Status == jobs.JobRunning {
-					cmds = append(cmds, m.loadJobLogsCmd(j))
+					cmd = m.loadJobLogsCmd(j)
 				}
 			}
+		}
+	}
+	return cmd
+}
 
-		case "right", "l":
-			if m.ActiveFocus == FocusRunners {
-				tags := m.getAvailableTags()
-				if len(tags) > 0 {
-					m.SelectedTagIndex = (m.SelectedTagIndex + 1) % len(tags)
-					m.updateViewport()
-				}
-			} else {
-				m.ActiveFocus = FocusRepos
-				m.ActiveTab = (m.ActiveTab + 1) % 4
-				m.updateViewport()
-				return m, m.triggerTabFetch()
-			}
-
-		case "left", "h":
-			if m.ActiveFocus == FocusRunners {
-				tags := m.getAvailableTags()
-				if len(tags) > 0 {
-					m.SelectedTagIndex = (m.SelectedTagIndex - 1 + len(tags)) % len(tags)
-					m.updateViewport()
-				}
-			} else {
-				m.ActiveFocus = FocusRepos
-				m.ActiveTab = (m.ActiveTab + 3) % 4
-				m.updateViewport()
-				return m, m.triggerTabFetch()
-			}
-
-		case "1":
-			m.ActiveFocus = FocusRepos
-			m.ActiveTab = TabLogs
+func (m *Model) handleKeyRight() (tea.Cmd, bool) {
+	if m.ActiveFocus == FocusRunners {
+		tags := m.getAvailableTags()
+		if len(tags) > 0 {
+			m.SelectedTagIndex = (m.SelectedTagIndex + 1) % len(tags)
 			m.updateViewport()
+		}
+	} else {
+		m.ActiveFocus = FocusRepos
+		m.ActiveTab = (m.ActiveTab + 1) % 4
+		m.updateViewport()
+		return m.triggerTabFetch(), true
+	}
+	return nil, false
+}
 
-		case "2":
-			m.ActiveFocus = FocusRepos
-			m.ActiveTab = TabBranches
+func (m *Model) handleKeyLeft() (tea.Cmd, bool) {
+	if m.ActiveFocus == FocusRunners {
+		tags := m.getAvailableTags()
+		if len(tags) > 0 {
+			m.SelectedTagIndex = (m.SelectedTagIndex - 1 + len(tags)) % len(tags)
 			m.updateViewport()
+		}
+	} else {
+		m.ActiveFocus = FocusRepos
+		m.ActiveTab = (m.ActiveTab + 3) % 4
+		m.updateViewport()
+		return m.triggerTabFetch(), true
+	}
+	return nil, false
+}
 
-		case "3":
-			m.ActiveFocus = FocusRepos
-			m.ActiveTab = TabIssues
+func (m *Model) handleKeyTab1() {
+	m.ActiveFocus = FocusRepos
+	m.ActiveTab = TabLogs
+	m.updateViewport()
+}
+
+func (m *Model) handleKeyTab2() {
+	m.ActiveFocus = FocusRepos
+	m.ActiveTab = TabBranches
+	m.updateViewport()
+}
+
+func (m *Model) handleKeyTab3() (tea.Cmd, bool) {
+	m.ActiveFocus = FocusRepos
+	m.ActiveTab = TabIssues
+	m.updateViewport()
+	return m.triggerTabFetch(), true
+}
+
+func (m *Model) handleKeyTab4() (tea.Cmd, bool) {
+	m.ActiveFocus = FocusRepos
+	m.ActiveTab = TabPRs
+	m.updateViewport()
+	return m.triggerTabFetch(), true
+}
+
+// handleKeyNextPanel cycles panel focus forward (Tab), loading logs when the
+// jobs panel gains focus on a running job.
+func (m *Model) handleKeyNextPanel() tea.Cmd {
+	m.ActiveFocus = (m.ActiveFocus + 1) % 3
+	m.updateViewport()
+	return m.triggerLogFetchForFocusedJob()
+}
+
+// handleKeyPrevPanel cycles panel focus backward (Shift+Tab).
+func (m *Model) handleKeyPrevPanel() tea.Cmd {
+	m.ActiveFocus = (m.ActiveFocus + 2) % 3
+	m.updateViewport()
+	return m.triggerLogFetchForFocusedJob()
+}
+
+// triggerLogFetchForFocusedJob returns a log-fetch command when the jobs panel
+// is focused on a running job, and nil otherwise.
+func (m *Model) triggerLogFetchForFocusedJob() tea.Cmd {
+	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		j := m.JobQueue[m.SelectedJobIndex]
+		if j.Status == jobs.JobRunning {
+			return m.loadJobLogsCmd(j)
+		}
+	}
+	return nil
+}
+
+// handleKeySyncAll starts a parallel sync across every loaded repository.
+func (m *Model) handleKeySyncAll() tea.Cmd {
+	if !m.IsSyncing && len(m.Repos) > 0 {
+		m.IsSyncing = true
+		m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
+		cmd := m.startSyncCmd(m.Repos, true)
+		m.updateViewport()
+		return cmd
+	}
+	return nil
+}
+
+func (m *Model) handleKeyPrune() {
+	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+		item := m.Repos[m.SelectedIndex]
+		count, err := git.PruneBranchesAndWorktrees(m.ctx, item.Path, item.DefaultBranch)
+		if err != nil {
+			// Earlier steps (worktree remove --force) may already have run
+			// destructively before this error surfaced, so say so rather than
+			// leaving the operator unable to tell "did nothing" from "half done".
+			slog.Error("prune failed", "repo", item.Name, "path", item.Path, "error", err)
+			item.Logs = append(item.Logs, fmt.Sprintf("⚠ Prune failed (earlier steps may already have removed worktrees): %v", err))
+			m.setToast(fmt.Sprintf(" ⚠ Prune failed for '%s': %v", item.Name, err), 2)
 			m.updateViewport()
-			return m, m.triggerTabFetch()
+			return
+		}
+		item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+		item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
+		m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
+		m.updateViewport()
+	}
+}
 
-		case "4":
-			m.ActiveFocus = FocusRepos
-			m.ActiveTab = TabPRs
+// handleKeySync re-syncs just the selected repository. It returns a command so
+// the sync streams its snapshots back through the update loop rather than
+// mutating the model item from a background goroutine.
+func (m *Model) handleKeySync() tea.Cmd {
+	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+		item := m.Repos[m.SelectedIndex]
+		if !item.IsArchived {
+			cmd := m.startSyncCmd([]*git.RepoItem{item}, false)
 			m.updateViewport()
-			return m, m.triggerTabFetch()
+			return cmd
+		}
+	}
+	return nil
+}
 
-		case "a", "s":
-			if !m.IsSyncing && len(m.Repos) > 0 {
-				m.IsSyncing = true
-				m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
-				cmds = append(cmds, m.startSyncCmd(m.Repos, true))
-				m.updateViewport()
-			}
+func (m *Model) handleKeyCopy() {
+	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+		item := m.Repos[m.SelectedIndex]
+		targetCopy := item.DraftPRURL
+		if targetCopy == "" {
+			targetCopy = item.ExistingPRURL
+		}
+		if targetCopy == "" {
+			targetCopy = item.Path
+		}
 
-		case "X":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				count, err := git.PruneBranchesAndWorktrees(item.Path, item.DefaultBranch)
-				if err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
-					item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
-					m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
-					m.updateViewport()
-				}
-			}
+		if err := copyToClipboard(targetCopy); err != nil {
+			m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+		} else {
+			m.setToast(fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy), 1)
+		}
+	} else if m.ActiveFocus == FocusRunners && len(m.Runners) > 0 && m.SelectedRunnerIndex < len(m.Runners) {
+		r := m.Runners[m.SelectedRunnerIndex]
+		if err := copyToClipboard(r.ID); err != nil {
+			m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+		} else {
+			m.setToast(fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID), 1)
+		}
+	} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		j := m.JobQueue[m.SelectedJobIndex]
+		if err := copyToClipboard(j.ID); err != nil {
+			m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+		} else {
+			m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
+		}
+	}
+}
 
-		case "r":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				if !item.IsArchived {
-					cmds = append(cmds, m.startSyncCmd([]*git.RepoItem{item}, false))
-					m.updateViewport()
-				}
-			}
+func (m *Model) handleKeySwitchBranch() {
+	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+		item := m.Repos[m.SelectedIndex]
+		target := item.OriginalBranch
+		if item.CurrentBranch == item.OriginalBranch {
+			target = item.DefaultBranch
+		}
+		if err := git.SwitchBranch(item, target); err == nil {
+			item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+			item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
+			m.updateViewport()
+		}
+	}
+}
 
-		case "c", "y":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				targetCopy := item.DraftPRURL
-				if targetCopy == "" {
-					targetCopy = item.ExistingPRURL
-				}
-				if targetCopy == "" {
-					targetCopy = item.Path
-				}
+// handleKeyPush commits, pushes, and opens a PR for the selected repository in
+// the background. Like handleKeySync it hands the worker a private clone and
+// routes the result back as a tea.Msg, so only the update goroutine ever
+// writes to an item in m.Repos.
+func (m *Model) handleKeyPush() tea.Cmd {
+	if m.ActiveFocus != FocusRepos || len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+		return nil
+	}
+	item := m.Repos[m.SelectedIndex]
+	if item.IsArchived {
+		return nil
+	}
 
-				if err := copyToClipboard(targetCopy); err == nil {
-					m.setToast(fmt.Sprintf(" %s Copied to clipboard: %s", iconCopy, targetCopy), 1)
-				}
-			} else if m.ActiveFocus == FocusRunners && len(m.Runners) > 0 && m.SelectedRunnerIndex < len(m.Runners) {
-				r := m.Runners[m.SelectedRunnerIndex]
-				if err := copyToClipboard(r.ID); err == nil {
-					m.setToast(fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID), 1)
-				}
-			} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-				j := m.JobQueue[m.SelectedJobIndex]
-				if err := copyToClipboard(j.ID); err == nil {
-					m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
-				}
-			}
+	// Clone here, on the update goroutine, before the worker exists.
+	work := item.Clone()
+	ctx := m.ctx
+	// Buffered so the worker never blocks (and so bgGuard's Done() always
+	// fires) even if the receiving command is dropped at quit.
+	result := make(chan pushFinishedMsg, 1)
 
-		case "b":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				target := item.OriginalBranch
-				if item.CurrentBranch == item.OriginalBranch {
-					target = item.DefaultBranch
-				}
-				if err := git.SwitchBranch(item, target); err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(item.Path, item.DefaultBranch)
-					m.updateViewport()
-				}
-			}
+	run := m.bgGuard(func() {
+		out := pushFinishedMsg{repoName: work.Name, repo: work}
+		if err := git.CommitPushPRAndSwitchDefault(ctx, work); err != nil {
+			out.err = err
+		} else {
+			work.CurrentBranch = git.GetOriginalBranch(ctx, work.Path)
+			work.BranchDetails = git.GetRepoBranchDetails(ctx, work.Path, work.DefaultBranch)
+		}
+		result <- out
+	})
+	go run()
 
-		case "p":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				if !item.IsArchived {
-					go func(r *git.RepoItem) {
-						if err := git.CommitPushPRAndSwitchDefault(r); err == nil {
-							r.CurrentBranch = git.GetOriginalBranch(r.Path)
-							r.BranchDetails = git.GetRepoBranchDetails(r.Path, r.DefaultBranch)
-						}
-					}(item)
-					m.updateViewport()
-				}
-			}
+	m.updateViewport()
+	return func() tea.Msg { return <-result }
+}
 
-		case "d":
-			if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-				item := m.Repos[m.SelectedIndex]
-				if item.IsArchived {
-					_ = git.DeleteLocalRepo(item.Path)
+// handlePushFinishedMsg folds a background push result into the model on the
+// update goroutine, surfacing failures the way handleKeyDelete does for its
+// own destructive action instead of discarding the error.
+func (m *Model) handlePushFinishedMsg(msg pushFinishedMsg) {
+	// Log and toast unconditionally: a background refresh may have rebuilt
+	// m.Repos while the push was in flight, and a failure that no longer
+	// matches a live repo must still leave a trace.
+	if msg.err != nil {
+		slog.Error("push/PR failed", "repo", msg.repoName, "error", msg.err)
+		if msg.repo != nil {
+			msg.repo.Logs = append(msg.repo.Logs, fmt.Sprintf("⚠ Commit/push/PR failed: %v", msg.err))
+		}
+		m.setToast(fmt.Sprintf(" ⚠ Push/PR failed for '%s': %v", msg.repoName, msg.err), 2)
+	} else {
+		m.setToast(fmt.Sprintf(" 󰄬 Pushed '%s' and switched to the default branch.", msg.repoName), 1)
+	}
+	m.applyRepoSnapshot(msg.repo)
+	m.updateViewport()
+}
+
+func (m *Model) handleKeyDelete() {
+	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
+		item := m.Repos[m.SelectedIndex]
+		if item.IsArchived {
+			if m.pendingDeletePath != "" && m.pendingDeletePath == item.Path {
+				m.pendingDeletePath = ""
+				if err := git.DeleteLocalRepo(item.Path); err != nil {
+					m.setToast(fmt.Sprintf(" ⚠ Failed to delete '%s': %v", item.Name, err), 2)
+				} else {
 					deletedName := item.Name
 
 					m.Repos = append(m.Repos[:m.SelectedIndex], m.Repos[m.SelectedIndex+1:]...)
@@ -933,273 +1304,303 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.setToast(fmt.Sprintf(" 🗑️ Deleted archived repo '%s' from disk.", deletedName), 1)
 					m.updateViewport()
 				}
-			}
-		}
-
-	case loadedIssuesMsg:
-		for _, item := range m.Repos {
-			if item.Name == msg.repoName {
-				item.IsLoadingIssues = false
-				item.HasLoadedIssues = true
-				if msg.err == nil && msg.issues != nil {
-					item.IssuesList = msg.issues
-				}
-				break
-			}
-		}
-		m.updateViewport()
-
-	case loadedPRsMsg:
-		for _, item := range m.Repos {
-			if item.Name == msg.repoName {
-				item.IsLoadingPRs = false
-				item.HasLoadedPRs = true
-				if msg.err == nil && msg.prs != nil {
-					item.PRsList = msg.prs
-				}
-				break
-			}
-		}
-		m.updateViewport()
-
-	case tea.MouseMsg:
-		if msg.Button == tea.MouseButtonWheelUp {
-			m.Viewport.LineUp(3)
-		} else if msg.Button == tea.MouseButtonWheelDown {
-			m.Viewport.LineDown(3)
-		} else if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-			// Click in Left Column Panes
-			if msg.X < m.Width/2 {
-				// Use panel heights from View() layout instead of content lengths
-				rightBoxHeight := m.Height - 4
-				if rightBoxHeight < 12 {
-					rightBoxHeight = 12
-				}
-				totalInner := rightBoxHeight - 4
-				if totalInner < 8 {
-					totalInner = 8
-				}
-				runnersBoxHeight := 4
-				repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
-				if repoBoxHeight < 4 {
-					repoBoxHeight = 4
-				}
-
-				// Y=0 is header, Y=1 starts the first panel
-				// Each bordered panel: 1 top border + innerHeight + 1 bottom border = innerHeight + 2
-				repoPaneStart := 1 + 1 // header + top border
-				repoPaneEnd := repoPaneStart + repoBoxHeight
-				runnersPaneStart := repoPaneEnd + 1 // bottom border of repo + top border of runners
-				runnersPaneEnd := runnersPaneStart + runnersBoxHeight
-
-				if msg.Y >= repoPaneStart && msg.Y <= repoPaneEnd {
-					m.ActiveFocus = FocusRepos
-					clickedIdx := msg.Y - repoPaneStart - 1 // -1 for header row
-					if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
-						m.SelectedIndex = clickedIdx
-					}
-					m.updateViewport()
-				} else if msg.Y > repoPaneEnd && msg.Y <= runnersPaneEnd {
-					m.ActiveFocus = FocusRunners
-					clickedIdx := msg.Y - runnersPaneStart
-					if clickedIdx >= 0 && clickedIdx < len(m.Runners) {
-						m.SelectedRunnerIndex = clickedIdx
-					}
-					m.updateViewport()
-				} else if msg.Y > runnersPaneEnd {
-					m.ActiveFocus = FocusJobs
-					jobsPaneStart := runnersPaneEnd + 1
-					clickedIdx := msg.Y - jobsPaneStart - 2
-					if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
-						m.SelectedJobIndex = clickedIdx
-					}
-					m.updateViewport()
-				}
-			}
-			// Click in Right Detail View Pane
-			if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
-				relX := msg.X - (m.Width / 2)
-				if relX >= 0 && relX < 10 {
-					m.ActiveTab = TabLogs
-					m.updateViewport()
-				} else if relX >= 10 && relX < 35 {
-					m.ActiveTab = TabBranches
-					m.updateViewport()
-				} else if relX >= 35 && relX < 47 {
-					m.ActiveTab = TabIssues
-					m.updateViewport()
-					cmds = append(cmds, m.triggerTabFetch())
-				} else if relX >= 47 {
-					m.ActiveTab = TabPRs
-					m.updateViewport()
-					cmds = append(cmds, m.triggerTabFetch())
-				}
-			}
-		}
-
-	case repoTickMsg:
-		return m, tea.Batch(
-			m.loadOrgReposCmd(false),
-			repoTickCmd(),
-		)
-
-	case runnerJobTickMsg:
-		jobs.PollStep(m.Runners, m.JobQueue)
-		m.updateViewport()
-		var cmdsToAdd []tea.Cmd
-		if !m.RunnerPermissionDenied {
-			cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
-		}
-		cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd())
-		// Refresh logs for selected running job
-		if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-			selJob := m.JobQueue[m.SelectedJobIndex]
-			if selJob.Status == jobs.JobRunning {
-				cmdsToAdd = append(cmdsToAdd, m.loadJobLogsCmd(selJob))
-			}
-		}
-		return m, tea.Batch(cmdsToAdd...)
-
-	case jobQueueTickMsg:
-		return m, tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd())
-
-	case loadedRunnersMsg:
-		m.IsRunnersLoading = false
-		if msg.err != nil {
-			m.RunnerFetchFailed = true
-			if isRunnerPermissionError(msg.err) {
-				m.RunnerPermissionDenied = true
-				slog.Debug("runner fetch forbidden (org admin permissions required)", "org", m.TargetOrg, "error", msg.err)
-				if len(m.Runners) == 0 && len(m.JobQueue) > 0 {
-					m.Runners = extractRunnersFromJobQueue(m.JobQueue, m.Runners)
-				}
 			} else {
-				m.ConsecutiveErrors++
-				slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
-				m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+				m.pendingDeletePath = item.Path
+				m.setToast(fmt.Sprintf(" ⚠ Press 'd' again to delete archived repo '%s'.", item.Name), 2)
 			}
-		} else {
-			m.RunnerFetchFailed = false
-			m.RunnerPermissionDenied = false
-			m.ConsecutiveErrors = 0
-			// Always update runners, even if empty
-			merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
-			m.Runners = merged
-
-			m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
-			m.updateViewport()
 		}
+	}
+}
 
-	case loadedJobQueueMsg:
-		m.IsJobQueueLoading = false
-		if msg.err != nil {
-			m.JobQueueFetchFailed = true
-			m.ConsecutiveErrors++
-			slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
-			m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
-			if len(msg.queue) > 0 {
-				m.processJobQueueUpdate(msg.queue)
-				if len(m.Runners) == 0 || m.RunnerPermissionDenied {
-					m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
-				}
-				cmds = append(cmds, m.triggerLogFetchForSelectedJob())
+func (m *Model) handleLoadedIssuesMsg(msg loadedIssuesMsg) {
+	for _, item := range m.Repos {
+		if item.Name == msg.repoName {
+			item.IsLoadingIssues = false
+			item.HasLoadedIssues = true
+			if msg.err == nil && msg.issues != nil {
+				item.IssuesList = msg.issues
 			}
-			m.updateViewport()
+			break
+		}
+	}
+	m.updateViewport()
+}
+
+func (m *Model) handleLoadedPRsMsg(msg loadedPRsMsg) {
+	for _, item := range m.Repos {
+		if item.Name == msg.repoName {
+			item.IsLoadingPRs = false
+			item.HasLoadedPRs = true
+			if msg.err == nil && msg.prs != nil {
+				item.PRsList = msg.prs
+			}
+			break
+		}
+	}
+	m.updateViewport()
+}
+
+func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd {
+	var cmd tea.Cmd
+	if msg.Button == tea.MouseButtonWheelUp {
+		m.Viewport.LineUp(3)
+	} else if msg.Button == tea.MouseButtonWheelDown {
+		m.Viewport.LineDown(3)
+	} else if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		// Click in Left Column Panes
+		if msg.X < m.Width/2 {
+			// Use panel heights from View() layout instead of content lengths
+			rightBoxHeight := m.Height - 4
+			if rightBoxHeight < 12 {
+				rightBoxHeight = 12
+			}
+			totalInner := rightBoxHeight - 4
+			if totalInner < 8 {
+				totalInner = 8
+			}
+			runnersBoxHeight := 4
+			repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
+			if repoBoxHeight < 4 {
+				repoBoxHeight = 4
+			}
+
+			// Y=0 is header, Y=1 starts the first panel
+			// Each bordered panel: 1 top border + innerHeight + 1 bottom border = innerHeight + 2
+			repoPaneStart := 1 + 1 // header + top border
+			repoPaneEnd := repoPaneStart + repoBoxHeight
+			runnersPaneStart := repoPaneEnd + 1 // bottom border of repo + top border of runners
+			runnersPaneEnd := runnersPaneStart + runnersBoxHeight
+
+			if msg.Y >= repoPaneStart && msg.Y <= repoPaneEnd {
+				m.ActiveFocus = FocusRepos
+				clickedIdx := msg.Y - repoPaneStart - 1 // -1 for header row
+				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
+					m.SelectedIndex = clickedIdx
+				}
+				m.updateViewport()
+			} else if msg.Y > repoPaneEnd && msg.Y <= runnersPaneEnd {
+				m.ActiveFocus = FocusRunners
+				clickedIdx := msg.Y - runnersPaneStart
+				if clickedIdx >= 0 && clickedIdx < len(m.Runners) {
+					m.SelectedRunnerIndex = clickedIdx
+				}
+				m.updateViewport()
+			} else if msg.Y > runnersPaneEnd {
+				m.ActiveFocus = FocusJobs
+				jobsPaneStart := runnersPaneEnd + 1
+				clickedIdx := msg.Y - jobsPaneStart - 2
+				if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
+					m.SelectedJobIndex = clickedIdx
+				}
+				m.updateViewport()
+			}
+		}
+		// Click in Right Detail View Pane
+		if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
+			relX := msg.X - (m.Width / 2)
+			if relX >= 0 && relX < 10 {
+				m.ActiveTab = TabLogs
+				m.updateViewport()
+			} else if relX >= 10 && relX < 35 {
+				m.ActiveTab = TabBranches
+				m.updateViewport()
+			} else if relX >= 35 && relX < 47 {
+				m.ActiveTab = TabIssues
+				m.updateViewport()
+				cmd = m.triggerTabFetch()
+			} else if relX >= 47 {
+				m.ActiveTab = TabPRs
+				m.updateViewport()
+				cmd = m.triggerTabFetch()
+			}
+		}
+	}
+	return cmd
+}
+
+func (m Model) handleRepoTickMsg() tea.Cmd {
+	return tea.Batch(
+		m.loadOrgReposCmd(false),
+		repoTickCmd(),
+	)
+}
+
+func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
+	jobs.PollStep(m.Runners, m.JobQueue)
+	m.updateViewport()
+	var cmdsToAdd []tea.Cmd
+	if !m.RunnerPermissionDenied {
+		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
+	}
+	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
+	// Refresh logs for selected running job
+	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
+		selJob := m.JobQueue[m.SelectedJobIndex]
+		if selJob.Status == jobs.JobRunning {
+			cmdsToAdd = append(cmdsToAdd, m.loadJobLogsCmd(selJob))
+		}
+	}
+	return tea.Batch(cmdsToAdd...)
+}
+
+// handleJobQueueTickMsg refreshes the job queue on its own slower cadence,
+// keeping the per-repo API cost off the 10s runner tick.
+func (m *Model) handleJobQueueTickMsg() tea.Cmd {
+	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors[fetchSourceJobQueue])))
+}
+
+func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
+	m.IsRunnersLoading = false
+	if msg.err != nil {
+		m.RunnerFetchFailed = true
+		if isRunnerPermissionError(msg.err) {
+			// Runner listing needs org-admin scope; fall back to inferring
+			// runners from the job queue instead of nagging with toasts.
+			m.RunnerPermissionDenied = true
+			slog.Debug("runner fetch forbidden (org admin permissions required)", "org", m.TargetOrg, "error", msg.err)
+			if len(m.Runners) == 0 && len(m.JobQueue) > 0 {
+				m.Runners = extractRunnersFromJobQueue(m.JobQueue, m.Runners)
+			}
 		} else {
-			m.JobQueueFetchFailed = false
-			m.ConsecutiveErrors = 0
+			m.noteFetchFailure(fetchSourceRunners, runnerJobTickInterval)
+			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+		}
+	} else {
+		m.RunnerFetchFailed = false
+		m.RunnerPermissionDenied = false
+		m.noteFetchSuccess(fetchSourceRunners)
+		// Always update runners, even if empty
+		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
+		m.Runners = merged
+
+		m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
+		m.updateViewport()
+	}
+}
+
+func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
+	m.IsJobQueueLoading = false
+	if msg.err != nil {
+		m.JobQueueFetchFailed = true
+		m.noteFetchFailure(fetchSourceJobQueue, jobQueueTickInterval)
+		slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
+		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
+		var cmd tea.Cmd
+		if len(msg.queue) > 0 {
 			m.processJobQueueUpdate(msg.queue)
 			if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 				m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
 			}
-			cmds = append(cmds, m.triggerLogFetchForSelectedJob())
-			m.updateViewport()
-		}
-
-	case loadedJobLogsMsg:
-		if msg.err != nil {
-			slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
-		}
-		if len(msg.logs) > 0 {
-			for _, j := range m.JobQueue {
-				if j.ID == msg.jobID {
-					j.Logs = msg.logs
-					j.GHJobID = msg.ghJobID
-					break
-				}
-			}
-			m.updateViewport()
-		} else if msg.err != nil {
-			for _, j := range m.JobQueue {
-				if j.ID == msg.jobID {
-					j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
-					break
-				}
-			}
-			m.updateViewport()
-		}
-
-	case orgSyncedMsg:
-		m.IsOrgSyncing = false
-		if len(m.Repos) > 0 && len(msg.repos) > 0 {
-			oldRepoBranches := make(map[string]string)
-			for _, r := range m.Repos {
-				oldRepoBranches[r.Name] = r.CurrentBranch
-			}
-			for _, newR := range msg.repos {
-				if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
-					m.setToast(fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
-				}
-			}
-		}
-		m.Repos = msg.repos
-		sort.Slice(m.Repos, func(i, j int) bool {
-			return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
-		})
-		m.TotalCount = len(m.Repos)
-		if msg.autoSync && len(m.Repos) > 0 {
-			m.IsSyncing = true
-			m.updateViewport()
-			cmds = append(cmds, m.startSyncCmd(m.Repos, true))
-		}
-
-	case repoSyncMsg:
-		m.applyRepoSnapshot(msg.repo)
-		m.updateViewport()
-		cmds = append(cmds, waitForSyncSnapshot(msg.snapshots, msg.bulk))
-
-	case syncFinishedMsg:
-		if msg.bulk {
-			m.IsSyncing = false
+			cmd = m.triggerLogFetchForSelectedJob()
 		}
 		m.updateViewport()
-
-	case tea.WindowSizeMsg:
-		m.Width = msg.Width
-		m.Height = msg.Height
-		m.ProgressBar.Width = msg.Width - 20
-
-		// Mirror the same height budget as View()
-		rightBoxH := msg.Height - 4
-		if rightBoxH < 12 {
-			rightBoxH = 12
-		}
-		halfWidth := msg.Width / 2
-		leftWidth := halfWidth - 1
-		rightWidth := msg.Width - leftWidth - 2
-		m.Viewport.Width = rightWidth - 4
-		m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
+		return cmd
 	}
 
-	var spinnerCmd tea.Cmd
-	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
-	cmds = append(cmds, spinnerCmd)
+	m.JobQueueFetchFailed = false
+	m.noteFetchSuccess(fetchSourceJobQueue)
+	m.processJobQueueUpdate(msg.queue)
+	if len(m.Runners) == 0 || m.RunnerPermissionDenied {
+		m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
+	}
+	cmd := m.triggerLogFetchForSelectedJob()
+	m.updateViewport()
+	return cmd
+}
 
-	var vpCmd tea.Cmd
-	m.Viewport, vpCmd = m.Viewport.Update(msg)
-	cmds = append(cmds, vpCmd)
+func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
+	if msg.err != nil {
+		slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
+	}
+	if len(msg.logs) > 0 {
+		for _, j := range m.JobQueue {
+			if j.ID == msg.jobID {
+				j.Logs = msg.logs
+				j.GHJobID = msg.ghJobID
+				break
+			}
+		}
+		m.updateViewport()
+	} else if msg.err != nil {
+		for _, j := range m.JobQueue {
+			if j.ID == msg.jobID {
+				j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
+				break
+			}
+		}
+		m.updateViewport()
+	}
+}
 
-	return m, tea.Batch(cmds...)
+func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
+	m.IsOrgSyncing = false
+	if msg.err != nil {
+		slog.Error("org repos fetch failed", "org", m.TargetOrg, "error", msg.err)
+		m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+		m.updateViewport()
+		return tea.Batch(), true
+	}
+	if len(m.Repos) > 0 && len(msg.repos) > 0 {
+		oldRepoBranches := make(map[string]string)
+		for _, r := range m.Repos {
+			oldRepoBranches[r.Name] = r.CurrentBranch
+		}
+		for _, newR := range msg.repos {
+			if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
+				m.setToast(fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
+			}
+		}
+	}
+	m.Repos = msg.repos
+	sort.Slice(m.Repos, func(i, j int) bool {
+		return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
+	})
+	m.TotalCount = len(m.Repos)
+	// The list the user confirmed against is gone; make them re-arm rather
+	// than let a stale token delete whatever now sits under the selection.
+	m.pendingDeletePath = ""
+	var cmd tea.Cmd
+	if msg.autoSync && len(m.Repos) > 0 {
+		m.IsSyncing = true
+		m.updateViewport()
+		cmd = m.startSyncCmd(m.Repos, true)
+	}
+	return cmd, false
+}
+
+// handleRepoSyncMsg folds one streamed snapshot into the model and waits for
+// the next one on the same stream.
+func (m *Model) handleRepoSyncMsg(msg repoSyncMsg) tea.Cmd {
+	m.applyRepoSnapshot(msg.repo)
+	m.updateViewport()
+	return waitForSyncSnapshot(msg.snapshots, msg.bulk)
+}
+
+// handleSyncFinishedMsg clears the syncing banner only for the bulk sync; a
+// single-repo re-sync must leave it alone.
+func (m *Model) handleSyncFinishedMsg(msg syncFinishedMsg) {
+	if msg.bulk {
+		m.IsSyncing = false
+	}
+	m.updateViewport()
+}
+
+func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
+	m.Width = msg.Width
+	m.Height = msg.Height
+	m.ProgressBar.Width = msg.Width - 20
+
+	// Mirror the same height budget as View()
+	rightBoxH := msg.Height - 4
+	if rightBoxH < 12 {
+		rightBoxH = 12
+	}
+	halfWidth := msg.Width / 2
+	leftWidth := halfWidth - 1
+	rightWidth := msg.Width - leftWidth - 2
+	m.Viewport.Width = rightWidth - 4
+	m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
 }
 
 // processJobQueueUpdate processes a freshly loaded job queue, comparing to the
@@ -1971,27 +2372,7 @@ func (m Model) View() string {
 		return "Initializing freshen TUI..."
 	}
 
-	// 1. Header Banner
-	shortTargetDir := git.ShortenHomePath(m.TargetDir)
-	leftTitle := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
-		subtitleStyle.Render("GitHub Repository & CI Runner Workflow Manager")
-
-	orgURL := fmt.Sprintf("https://github.com/%s", m.TargetOrg)
-	clickableOrg := Hyperlink(fmt.Sprintf("%s %s", iconGithub, m.TargetOrg), orgURL)
-	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s", shortTargetDir, clickableOrg))
-
-	leftWidthVis := lipgloss.Width(leftTitle)
-	rightWidthVis := lipgloss.Width(shortTargetDir+" | "+m.TargetOrg) + 3
-
-	spacingLen := m.Width - leftWidthVis - rightWidthVis
-	if spacingLen < 1 {
-		spacingLen = 1
-	}
-
-	headerText := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle
-	headerStr := lipgloss.NewStyle().MaxWidth(m.Width).Render(headerText)
-	headerLines := strings.Split(headerStr, "\n")
-	header := headerLines[0] + "\n"
+	header := m.renderHeader()
 
 	// 2. Split Layout Dimensions
 	//
@@ -2058,7 +2439,63 @@ func (m Model) View() string {
 		return lines
 	}
 
-	// ------------------ PANEL 1: REPOSITORIES ------------------
+	repoPane := m.renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight, clipLine, sliceLines)
+	runnersPane := m.renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight, clipLine, sliceLines)
+	jobsPane := m.renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight, clipLine, sliceLines)
+
+	leftColumn := lipgloss.JoinVertical(lipgloss.Left, repoPane, runnersPane, jobsPane)
+
+	// Render Details Viewport (Right)
+	// logBoxStyle has Border (1+1) + Padding (1+1) = 4 chars horizontal overhead.
+	// Passing rightWidth - 4 makes the outer rendered width equal to rightWidth.
+	rightInnerWidth := rightWidth - 4
+	if rightInnerWidth < 20 {
+		rightInnerWidth = 20
+	}
+
+	rightPane := logBoxStyle.
+		Width(rightInnerWidth).
+		Height(rightBoxHeight).
+		Render(m.Viewport.View())
+
+	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
+
+	// 3. Footer Keybindings Help (on its own line below mainView)
+	footer := m.renderFooter()
+
+	// header has trailing \n (1 newline)
+	// mainView has (rightBoxHeight + 2) lines
+	// footer is placed on its own line preceded by \n
+	// strings.Split gives: 1 + (rightBoxHeight + 2) + 1 = rightBoxHeight + 4 = m.Height lines total ✓
+	return header + mainView + "\n" + footer
+}
+
+// renderHeader renders the top title/subtitle banner line.
+func (m Model) renderHeader() string {
+	shortTargetDir := git.ShortenHomePath(m.TargetDir)
+	leftTitle := titleStyle.Render(fmt.Sprintf(" %s FRESHEN ", iconLeaf)) + " " +
+		subtitleStyle.Render("GitHub Repository & CI Runner Workflow Manager")
+
+	orgURL := fmt.Sprintf("https://github.com/%s", m.TargetOrg)
+	clickableOrg := Hyperlink(fmt.Sprintf("%s %s", iconGithub, m.TargetOrg), orgURL)
+	rightSubtitle := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%s |  %s", shortTargetDir, clickableOrg))
+
+	leftWidthVis := lipgloss.Width(leftTitle)
+	rightWidthVis := lipgloss.Width(shortTargetDir+" | "+m.TargetOrg) + 3
+
+	spacingLen := m.Width - leftWidthVis - rightWidthVis
+	if spacingLen < 1 {
+		spacingLen = 1
+	}
+
+	headerText := leftTitle + strings.Repeat(" ", spacingLen) + rightSubtitle
+	headerStr := lipgloss.NewStyle().MaxWidth(m.Width).Render(headerText)
+	headerLines := strings.Split(headerStr, "\n")
+	return headerLines[0] + "\n"
+}
+
+// renderReposPanel renders PANEL 1: REPOSITORIES.
+func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, clipLine func(string) string, sliceLines func([]string, int) []string) string {
 	var repoLines []string
 
 	// Fixed columns & overhead:
@@ -2175,12 +2612,14 @@ func (m Model) View() string {
 	if m.ActiveFocus == FocusRepos {
 		repoStyle = borderFocusedStyle
 	}
-	repoPane := repoStyle.
+	return repoStyle.
 		Width(leftWidth).
 		Height(repoBoxHeight).
 		Render(strings.Join(sliceLines(repoLines, repoBoxHeight), "\n"))
+}
 
-	// ------------------ PANEL 2: REGISTERED RUNNERS (TAG BROWSER) ------------------
+// renderRunnersPanel renders PANEL 2: REGISTERED RUNNERS (TAG BROWSER).
+func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight int, clipLine func(string) string, sliceLines func([]string, int) []string) string {
 	var runnerLines []string
 	tags := m.getAvailableTags()
 	if m.SelectedTagIndex >= len(tags) {
@@ -2259,12 +2698,14 @@ func (m Model) View() string {
 	if m.ActiveFocus == FocusRunners {
 		runnerStyle = borderFocusedStyle
 	}
-	runnersPane := runnerStyle.
+	return runnerStyle.
 		Width(leftWidth).
 		Height(runnersBoxHeight).
 		Render(strings.Join(sliceLines(runnerLines, runnersBoxHeight), "\n"))
+}
 
-	// ------------------ PANEL 3: OVERALL JOB QUEUE ------------------
+// renderJobsPanel renders PANEL 3: OVERALL JOB QUEUE.
+func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, clipLine func(string) string, sliceLines func([]string, int) []string) string {
 	var jobsLines []string
 	runningCount := 0
 	queuedCount := 0
@@ -2439,30 +2880,15 @@ func (m Model) View() string {
 	if m.ActiveFocus == FocusJobs {
 		jobsStyle = borderFocusedStyle
 	}
-	jobsPane := jobsStyle.
+	return jobsStyle.
 		Width(leftWidth).
 		Height(jobsBoxHeight).
 		Render(strings.Join(sliceLines(jobsLines, jobsBoxHeight), "\n"))
+}
 
-	leftColumn := lipgloss.JoinVertical(lipgloss.Left, repoPane, runnersPane, jobsPane)
-
-	// Render Details Viewport (Right)
-	// logBoxStyle has Border (1+1) + Padding (1+1) = 4 chars horizontal overhead.
-	// Passing rightWidth - 4 makes the outer rendered width equal to rightWidth.
-	rightInnerWidth := rightWidth - 4
-	if rightInnerWidth < 20 {
-		rightInnerWidth = 20
-	}
-
-	rightPane := logBoxStyle.
-		Width(rightInnerWidth).
-		Height(rightBoxHeight).
-		Render(m.Viewport.View())
-
-	mainView := lipgloss.JoinHorizontal(lipgloss.Top, leftColumn, " ", rightPane)
-
-	// 3. Footer Keybindings Help (on its own line below mainView)
-	footerText := "[w] Focus  [↑/↓/j/k] Select  [1-4/←/→] Tabs  [a] Sync All  [r] Sync  [b] Branch  [p] Push/PR  [d] Del  [X] Prune  [c] Copy  [q] Quit"
+// renderFooter renders the bottom keybindings help line, or the active toast if set.
+func (m Model) renderFooter() string {
+	footerText := "[w/⇥/⇧⇥] Focus  [↑/↓/j/k] Select  [1-4/←/→] Tabs  [a] Sync All  [r] Sync  [b] Branch  [p] Push/PR  [dd] Del Archived  [X] Prune  [c] Copy  [q] Quit"
 	if m.ToastMsg != "" {
 		msgText := m.ToastMsg
 		if lipgloss.Width(msgText) > m.Width {
@@ -2482,12 +2908,7 @@ func (m Model) View() string {
 	if len(footerLines) > 0 {
 		footer = footerLines[0]
 	}
-
-	// header has trailing \n (1 newline)
-	// mainView has (rightBoxHeight + 2) lines
-	// footer is placed on its own line preceded by \n
-	// strings.Split gives: 1 + (rightBoxHeight + 2) + 1 = rightBoxHeight + 4 = m.Height lines total ✓
-	return header + mainView + "\n" + footer
+	return footer
 }
 
 func (m Model) renderStatusBadge(item *git.RepoItem) string {

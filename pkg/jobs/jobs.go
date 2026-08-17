@@ -68,6 +68,24 @@ type JobItem struct {
 	IsRunHeader bool  // True when this JobItem is a run-level header, not a specific job
 }
 
+// SanitizeTerminal strips control characters from GitHub-sourced free text (titles,
+// branch names, job/run/runner names) before it reaches terminal rendering. This
+// prevents ANSI/OSC escape injection when such text is interpolated into raw escape
+// sequences (e.g. OSC 8 hyperlinks) or otherwise written to the terminal. All bytes
+// below 0x20 except space, plus 0x7F (DEL), are removed; everything else (including
+// UTF-8 multibyte sequences) passes through unchanged.
+func SanitizeTerminal(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r < 0x20 && r != ' ') || r == 0x7F {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 // parseNumericID extracts the integer portion of a job ID string (e.g. "#123" -> 123).
 // Returns 0 if parsing fails, so the sort remains stable (string fallback).
 func parseNumericID(id string) int {
@@ -153,13 +171,23 @@ type GHJobsResponse struct {
 // ghCommandTimeout is the maximum duration for any gh CLI invocation.
 const ghCommandTimeout = 30 * time.Second
 
+// API pagination page sizes
+const (
+	runnersPageSize = 100
+	jobsPageSize    = 50
+)
+
 // runGH is the indirection point for every gh invocation, so tests can supply
 // canned API responses instead of shelling out.
 var runGH = runGHCommand
 
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
 // Returns the stdout bytes. On failure, the error includes stderr content.
-func runGHCommand(args ...string) ([]byte, error) {
+// It is a package variable (rather than a plain func) so tests can substitute
+// a fake implementation instead of shelling out to the real gh CLI.
+var runGHCommand = defaultRunGHCommand
+
+func defaultRunGHCommand(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ghCommandTimeout)
 	defer cancel()
 
@@ -173,20 +201,27 @@ func runGHCommand(args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("gh api call timed out after %s: args=%v", ghCommandTimeout, args)
 	}
 	if err != nil {
-		errStr := strings.TrimSpace(stderr.String())
-		if strings.Contains(errStr, "API rate limit exceeded") {
-			return nil, fmt.Errorf("GitHub API rate limit exceeded")
-		}
-		// Take only the first line of stderr to avoid multiline dumps in UI toasts
-		if firstLine, _, ok := strings.Cut(errStr, "\n"); ok && firstLine != "" {
-			errStr = firstLine
-		}
-		if errStr != "" {
-			return nil, fmt.Errorf("gh api: %s", errStr)
-		}
-		return nil, fmt.Errorf("gh api: %w", err)
+		return nil, classifyGHError(stderr.String(), err)
 	}
 	return stdout.Bytes(), nil
+}
+
+// classifyGHError converts a failed gh invocation's stderr and exec error into
+// the error returned to callers: rate-limit responses are normalized to a
+// stable message, and multiline stderr is trimmed to its first line so UI
+// toasts don't get flooded with dumps.
+func classifyGHError(stderrOut string, execErr error) error {
+	errStr := strings.TrimSpace(stderrOut)
+	if strings.Contains(errStr, "API rate limit exceeded") {
+		return fmt.Errorf("GitHub API rate limit exceeded")
+	}
+	if firstLine, _, ok := strings.Cut(errStr, "\n"); ok && firstLine != "" {
+		errStr = firstLine
+	}
+	if errStr != "" {
+		return fmt.Errorf("gh api: %s", errStr)
+	}
+	return fmt.Errorf("gh api: %w", execErr)
 }
 
 // formatDuration returns a human-readable duration string from seconds.
@@ -226,14 +261,14 @@ func formatQueuedAgo(timestamp string) string {
 func extractPRInfo(run GHWorkflowRun, org, repo string) (prNum int, prTitle string, prURL string) {
 	if len(run.PullRequests) > 0 {
 		prNum = run.PullRequests[0].Number
-		prTitle = run.PullRequests[0].Title
+		prTitle = SanitizeTerminal(run.PullRequests[0].Title)
 		prURL = run.PullRequests[0].URL
 		if prURL == "" && prNum != 0 {
 			prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, repo, prNum)
 		}
 	}
 	if prTitle == "" && run.DisplayTitle != "" {
-		prTitle = run.DisplayTitle
+		prTitle = SanitizeTerminal(run.DisplayTitle)
 	}
 	return
 }
@@ -242,7 +277,7 @@ func extractPRInfo(run GHWorkflowRun, org, repo string) (prNum int, prTitle stri
 func buildJobItemFromJob(j GHJobInfo, run GHWorkflowRun, repo string) *JobItem {
 	js := jobStatusFromGH(j.Status, j.Conclusion)
 
-	displayName := fmt.Sprintf("%s / %s", repo, j.Name)
+	displayName := fmt.Sprintf("%s / %s", repo, SanitizeTerminal(j.Name))
 
 	duration, startedAt, secs := parseDuration(j.StartedAt)
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
@@ -251,10 +286,10 @@ func buildJobItemFromJob(j GHJobInfo, run GHWorkflowRun, repo string) *JobItem {
 		ID:         fmt.Sprintf("#%d", j.ID),
 		Name:       displayName,
 		Repo:       repo,
-		Branch:     run.HeadBranch,
+		Branch:     SanitizeTerminal(run.HeadBranch),
 		Event:      run.Event,
 		Status:     js,
-		RunnerName: j.RunnerName,
+		RunnerName: SanitizeTerminal(j.RunnerName),
 		QueuedAt:   queuedAgo,
 		Duration:   duration,
 		Seconds:    secs,
@@ -279,7 +314,7 @@ func buildJobItemFromRun(run GHWorkflowRun, repo string) *JobItem {
 	if name == "" {
 		name = run.Name
 	}
-	displayName := fmt.Sprintf("%s / %s", repo, name)
+	displayName := fmt.Sprintf("%s / %s", repo, SanitizeTerminal(name))
 
 	duration, startedAt, secs := parseDuration(run.RunStartedAt)
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
@@ -288,10 +323,10 @@ func buildJobItemFromRun(run GHWorkflowRun, repo string) *JobItem {
 		ID:         fmt.Sprintf("#%d", run.ID),
 		Name:       displayName,
 		Repo:       repo,
-		Branch:     run.HeadBranch,
+		Branch:     SanitizeTerminal(run.HeadBranch),
 		Event:      run.Event,
 		Status:     js,
-		RunnerName: run.RunnerName,
+		RunnerName: SanitizeTerminal(run.RunnerName),
 		QueuedAt:   queuedAgo,
 		Duration:   duration,
 		Seconds:    secs,
@@ -334,7 +369,7 @@ func jobStatusFromGH(status, conclusion string) JobStatus {
 
 // FetchOrgRunners queries GitHub API for all registered organization runners.
 func FetchOrgRunners(org string) ([]*RunnerItem, error) {
-	out, err := runGHCommand("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=100", org))
+	out, err := runGH("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=%d", org, runnersPageSize))
 	if err != nil {
 		return nil, err
 	}
@@ -342,6 +377,9 @@ func FetchOrgRunners(org string) ([]*RunnerItem, error) {
 	var resp GHRunnersResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse runners JSON: %w", err)
+	}
+	if len(resp.Runners) == runnersPageSize {
+		slog.Warn("runners result may be truncated at page size", "org", org, "pageSize", runnersPageSize)
 	}
 
 	var parsed []*RunnerItem
@@ -364,7 +402,7 @@ func FetchOrgRunners(org string) ([]*RunnerItem, error) {
 
 		item := &RunnerItem{
 			ID:            fmt.Sprintf("runner-%d", r.ID),
-			Name:          r.Name,
+			Name:          SanitizeTerminal(r.Name),
 			Platform:      platform,
 			Status:        st,
 			CurrentJobID:  "-",
@@ -538,11 +576,16 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
 		var parsedJobsFromRun int
 		jobsOut, jobsErr := runGH(
 			"api",
-			fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, run.ID),
+			fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, run.ID, jobsPageSize),
 		)
 		if jobsErr == nil {
 			var jobsResp GHJobsResponse
-			if err := json.Unmarshal(jobsOut, &jobsResp); err == nil {
+			if err := json.Unmarshal(jobsOut, &jobsResp); err != nil {
+				slog.Warn("failed to parse jobs JSON for run, using fallback", "runID", run.ID, "repo", repo, "error", err)
+			} else if len(jobsResp.Jobs) > 0 {
+				if len(jobsResp.Jobs) == jobsPageSize {
+					slog.Warn("jobs result may be truncated at page size", "runID", run.ID, "repo", repo, "pageSize", jobsPageSize)
+				}
 				for _, j := range jobsResp.Jobs {
 					// Filter out completed success/skipped jobs
 					if j.Status == "completed" && (j.Conclusion == "success" || j.Conclusion == "skipped") {
@@ -579,9 +622,9 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
 // FetchJobLogs fetches the step log output for a specific running workflow job.
 func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
 	// Step 1: get jobs list for this run to find the target job ID
-	out, err := runGHCommand(
+	out, err := runGH(
 		"api",
-		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=50", org, repo, runID),
+		fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, runID, jobsPageSize),
 	)
 	if err != nil {
 		return nil, 0, fmt.Errorf("jobs list: %w", err)
@@ -649,7 +692,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	}
 
 	// Step 2: fetch raw log text
-	logOut, err := runGHCommand(
+	logOut, err := runGH(
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID),
 	)
