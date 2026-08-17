@@ -476,7 +476,14 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 		repoMap := make(map[string]*git.RepoItem)
 
 		for _, ghRepo := range orgRepos {
-			localDir := git.GetLocalDirName(ghRepo.Name)
+			localDir, ok := git.GetLocalDirName(ghRepo.Name)
+			if !ok {
+				// An unusable name must never be joined onto TargetDir: the join would
+				// resolve to TargetDir itself, so the item's Path — which delete and
+				// sync act on — would point at the whole repos root.
+				slog.Warn("skipping repo with no safe local directory name", "repo", ghRepo.Name)
+				continue
+			}
 			localPath := filepath.Join(m.TargetDir, localDir)
 
 			localExists := false

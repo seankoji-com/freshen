@@ -55,6 +55,15 @@ func withScriptedRunner(t *testing.T, responses map[string]cmdResponse) {
 	})
 }
 
+// withFakeGHDefaultBranch swaps the `gh repo view` tier of GetDefaultBranch for
+// the duration of the test and restores the real one on cleanup.
+func withFakeGHDefaultBranch(t *testing.T, fn func(path string) (string, error)) {
+	t.Helper()
+	orig := ghDefaultBranch
+	ghDefaultBranch = func(_ context.Context, path string) (string, error) { return fn(path) }
+	t.Cleanup(func() { ghDefaultBranch = orig })
+}
+
 func TestFetchOrgRepos(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		want := []GHRepoInfo{
@@ -268,8 +277,8 @@ func TestGetDefaultBranch(t *testing.T) {
 	const path = "/repo"
 
 	// The gh repo view tier runs as a direct exec with cmd.Dir set (CommandRunner
-	// cannot set Dir), so it never reaches the scripted runner. path does not exist,
-	// which makes that tier fail deterministically without spawning gh.
+	// cannot set Dir), so it never reaches the scripted runner. Each subtest fakes
+	// it via withFakeGHDefaultBranch instead of relying on gh being absent.
 	symbolicRefKey := cmdKey("git", []string{"-C", path, "symbolic-ref", "refs/remotes/origin/HEAD"})
 	showRefMainKey := cmdKey("git", []string{"-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"})
 	showRefMasterKey := cmdKey("git", []string{"-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"})
@@ -286,12 +295,31 @@ func TestGetDefaultBranch(t *testing.T) {
 		}
 	})
 
+	t.Run("falls back to gh repo view", func(t *testing.T) {
+		withScriptedRunner(t, map[string]cmdResponse{
+			symbolicRefKey: {err: errors.New("fatal: not a symbolic ref")},
+		})
+		var gotPath string
+		withFakeGHDefaultBranch(t, func(p string) (string, error) {
+			gotPath = p
+			return "trunk\n", nil
+		})
+
+		if got := GetDefaultBranch(context.Background(), path); got != "trunk" {
+			t.Errorf("GetDefaultBranch() = %q, want %q", got, "trunk")
+		}
+		if gotPath != path {
+			t.Errorf("gh tier ran in %q, want %q", gotPath, path)
+		}
+	})
+
 	t.Run("falls back to show-ref main", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
 			showRefMainKey:   {},
 			showRefMasterKey: {err: errors.New("no such ref")},
 		})
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "", errors.New("gh unavailable") })
 
 		if got := GetDefaultBranch(context.Background(), path); got != "main" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "main")
@@ -304,6 +332,7 @@ func TestGetDefaultBranch(t *testing.T) {
 			showRefMainKey:   {err: errors.New("no such ref")},
 			showRefMasterKey: {},
 		})
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "", errors.New("gh unavailable") })
 
 		if got := GetDefaultBranch(context.Background(), path); got != "master" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "master")
@@ -318,6 +347,7 @@ func TestGetDefaultBranch(t *testing.T) {
 			symbolicHeadKey:  {err: errors.New("fatal: not on a branch")},
 			revParseKey:      {out: []byte("abc1234\n")},
 		})
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "", errors.New("gh unavailable") })
 
 		if got := GetDefaultBranch(context.Background(), path); got != "abc1234" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "abc1234")
@@ -332,6 +362,7 @@ func TestGetDefaultBranch(t *testing.T) {
 			symbolicHeadKey:  {err: errors.New("fatal: not on a branch")},
 			revParseKey:      {err: errors.New("fatal: bad revision 'HEAD'")},
 		})
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "", errors.New("gh unavailable") })
 
 		if got := GetDefaultBranch(context.Background(), path); got != "HEAD" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "HEAD")
@@ -620,4 +651,96 @@ func TestSyncRepositoryUnclonedRepoWithoutTarget(t *testing.T) {
 	if item.StatusMsg != "Not Found" {
 		t.Errorf("expected StatusMsg 'Not Found', got %q", item.StatusMsg)
 	}
+}
+
+// withAliases installs user-supplied alias pairs for the duration of the test
+// and restores the package alias maps on cleanup.
+func withAliases(t *testing.T, pairs map[string]string) {
+	t.Helper()
+	origRemote, origLocal := aliasToRemote, aliasToLocal
+	aliasToRemote = make(map[string]string)
+	aliasToLocal = make(map[string]string)
+	t.Cleanup(func() { aliasToRemote, aliasToLocal = origRemote, origLocal })
+	for local, remote := range pairs {
+		if err := AddAlias(local, remote); err != nil {
+			t.Fatalf("AddAlias(%q, %q): %v", local, remote, err)
+		}
+	}
+}
+
+func TestGetLocalDirName(t *testing.T) {
+	t.Run("built-in and pass-through names are returned unchanged", func(t *testing.T) {
+		withAliases(t, nil)
+		cases := map[string]string{
+			".github":       "github",
+			"careynas.net":  "wiki.robot.house",
+			"freshen":       "freshen",
+			"foo..bar":      "foo..bar", // dots are legal in repo names, not traversal
+			"..evil":        "..evil",   // must NOT collide with "evil"
+			".dotfiles":     ".dotfiles",
+			"repo.with.dot": "repo.with.dot",
+		}
+		for in, want := range cases {
+			got, ok := GetLocalDirName(in)
+			if !ok {
+				t.Errorf("GetLocalDirName(%q) rejected a safe name", in)
+				continue
+			}
+			if got != want {
+				t.Errorf("GetLocalDirName(%q) = %q, want %q", in, got, want)
+			}
+		}
+	})
+
+	t.Run("rejects names that are not a safe single segment", func(t *testing.T) {
+		withAliases(t, nil)
+		for _, in := range []string{"", ".", "..", "../..", "foo/..", "a/b", `a\b`, "/", "./foo", "foo/"} {
+			got, ok := GetLocalDirName(in)
+			if ok {
+				t.Errorf("GetLocalDirName(%q) = %q, ok=true; want rejected", in, got)
+			}
+			if got != "" {
+				t.Errorf("GetLocalDirName(%q) returned %q on rejection, want empty", in, got)
+			}
+		}
+	})
+}
+
+func TestAddAlias(t *testing.T) {
+	t.Run("valid pair round-trips through both directions", func(t *testing.T) {
+		withAliases(t, map[string]string{"wiki": "careynas.net"})
+
+		local, ok := GetLocalDirName("careynas.net")
+		if !ok || local != "wiki" {
+			t.Fatalf("GetLocalDirName(careynas.net) = %q, %v; want wiki, true", local, ok)
+		}
+		if remote := GetGHRepoName(local); remote != "careynas.net" {
+			t.Errorf("GetGHRepoName(%q) = %q, want careynas.net", local, remote)
+		}
+	})
+
+	t.Run("rejects unsafe halves instead of registering them", func(t *testing.T) {
+		withAliases(t, nil)
+		for _, pair := range [][2]string{
+			{"..", "some-repo"},
+			{".", "some-repo"},
+			{"", "some-repo"},
+			{"../etc", "some-repo"},
+			{"a/b", "some-repo"},
+			{"ok", ".."},
+			{"ok", "a/b"},
+			{"ok", ""},
+		} {
+			if err := AddAlias(pair[0], pair[1]); err == nil {
+				t.Errorf("AddAlias(%q, %q) = nil, want error", pair[0], pair[1])
+			}
+		}
+		if len(aliasToRemote) != 0 || len(aliasToLocal) != 0 {
+			t.Errorf("rejected aliases were registered: %v / %v", aliasToRemote, aliasToLocal)
+		}
+		// A rejected alias must leave the built-in mapping intact, not shadow it.
+		if got, ok := GetLocalDirName("some-repo"); !ok || got != "some-repo" {
+			t.Errorf("GetLocalDirName(some-repo) = %q, %v; want some-repo, true", got, ok)
+		}
+	})
 }

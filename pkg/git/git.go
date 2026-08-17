@@ -218,17 +218,29 @@ var (
 // AddAlias registers a local/remote repo alias pair, overriding the built-in
 // defaults in GetLocalDirName/GetGHRepoName for that pair. Intended to be
 // called during flag parsing, before any concurrent use of this package.
-func AddAlias(local, remote string) {
+// The local half is validated here (it becomes a directory name joined onto the
+// target directory), so a bad --alias is a startup error rather than a runtime
+// path collapse. The remote half is validated the same way because it is used
+// as a clone target name.
+func AddAlias(local, remote string) error {
+	if _, ok := sanitizeDirName(local); !ok {
+		return fmt.Errorf("invalid local alias name %q: must be a single path segment, not empty, %q or %q", local, ".", "..")
+	}
+	if _, ok := sanitizeDirName(remote); !ok {
+		return fmt.Errorf("invalid remote alias name %q: must be a single path segment, not empty, %q or %q", remote, ".", "..")
+	}
 	aliasToRemote[local] = remote
 	aliasToLocal[remote] = local
+	return nil
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
 // The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
 // User-supplied aliases from --alias take precedence; see AddAlias.
-// The result is always sanitised to a single path segment so callers can safely
-// join it onto a parent directory (see sanitizeDirName).
-func GetLocalDirName(ghRepo string) string {
+// The second return value reports whether the result is a safe single path
+// segment; callers MUST check it and skip the repo when false rather than
+// joining an unusable name onto the target directory.
+func GetLocalDirName(ghRepo string) (string, bool) {
 	if local, ok := aliasToLocal[ghRepo]; ok {
 		return sanitizeDirName(local)
 	}
@@ -244,25 +256,36 @@ func GetLocalDirName(ghRepo string) string {
 	return sanitizeDirName(name)
 }
 
-// sanitizeDirName guarantees a directory name stays a single path segment.
-// A name containing a path separator or a ".." segment could escape its parent
-// directory once joined and handed to os.RemoveAll, so such names are flattened
-// to their basename with ".." stripped rather than returned as-is.
-func sanitizeDirName(name string) string {
-	if name != "" && name != "." && !strings.ContainsAny(name, `/\`) && !strings.Contains(name, "..") && filepath.Base(name) == name {
-		return name
+// sanitizeDirName reports whether name is safe to join onto a parent directory
+// as a single path segment, returning it unchanged when it is.
+//
+// It deliberately never rewrites the name. Stripping the offending characters
+// instead would map distinct repos onto one directory (GitHub allows dots, so
+// "evil" and "..evil" are different repos) and — worse — collapse "..", "." and
+// "foo/.." to "", which filepath.Join resolves back to the parent directory
+// itself, handing the whole repos root to os.RemoveAll. Rejection is the only
+// safe failure mode, so ok=false means "refuse", never "use the default".
+func sanitizeDirName(name string) (string, bool) {
+	if name == "" || name == "." || name == ".." {
+		return "", false
 	}
-	safe := filepath.Base(strings.ReplaceAll(name, `\`, "/"))
-	safe = strings.TrimSpace(strings.ReplaceAll(safe, "..", ""))
-	if safe == "." || safe == "/" || safe == string(filepath.Separator) {
-		return ""
+	if strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
+		return "", false
 	}
-	return safe
+	// Clean leaves a valid single segment untouched ("foo..bar" stays as-is) but
+	// rewrites anything with traversal or redundant separators still in it.
+	if filepath.Clean(name) != name || filepath.Base(name) != name {
+		return "", false
+	}
+	return name, true
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
 // The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
-// User-supplied aliases from --alias take precedence; see AddAlias.
+// User-supplied aliases from --alias take precedence; see AddAlias, which
+// validates both halves of every pair so an alias always round-trips with
+// GetLocalDirName. Non-alias inputs are local directory entries, which are
+// single path segments by construction.
 func GetGHRepoName(localDir string) string {
 	if remote, ok := aliasToRemote[localDir]; ok {
 		return remote
@@ -551,6 +574,25 @@ func GetOriginalBranch(ctx context.Context, path string) string {
 	return "HEAD"
 }
 
+// ghDefaultBranch resolves a repo's default branch via `gh repo view`, run with
+// its working directory set to path: gh takes [HOST/]OWNER/REPO or a URL, never
+// a filesystem path, and CommandRunner has no way to set cmd.Dir. It is a
+// package-level var so tests can fake this tier without spawning gh.
+var ghDefaultBranch = func(ctx context.Context, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	cmd.Dir = path
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return "", fmt.Errorf("%w: %s", err, stderr)
+		}
+		return "", err
+	}
+	return out.String(), nil
+}
+
 // GetDefaultBranch determines default branch (main/master) for a git repository.
 // ctx allows the caller to abort the lookup, including the networked gh tier.
 func GetDefaultBranch(ctx context.Context, path string) string {
@@ -568,20 +610,12 @@ func GetDefaultBranch(ctx context.Context, path string) string {
 		}
 	}
 
-	// gh repo view takes [HOST/]OWNER/REPO or a URL — never a filesystem path — so
-	// the repo is resolved from the working directory instead. CommandRunner has no
-	// way to set cmd.Dir, so this one tier bypasses the runner seam deliberately.
-	ghCmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
-	ghCmd.Dir = path
-	var ghOut, ghErr bytes.Buffer
-	ghCmd.Stdout = &ghOut
-	ghCmd.Stderr = &ghErr
-	if err := ghCmd.Run(); err == nil {
-		if branch := strings.TrimSpace(ghOut.String()); branch != "" {
+	if branch, err := ghDefaultBranch(ctx, path); err == nil {
+		if branch = strings.TrimSpace(branch); branch != "" {
 			return branch
 		}
 	} else {
-		slog.Warn("gh repo view failed", "path", path, "error", err, "stderr", strings.TrimSpace(ghErr.String()))
+		slog.Warn("gh repo view failed", "path", path, "error", err)
 	}
 
 	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
@@ -882,9 +916,18 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	}
 
 	pushCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "push", "-u", "origin", branch)
+	var pushOut bytes.Buffer
+	pushCmd.Stdout = &pushOut
+	pushCmd.Stderr = &pushOut
 	if err := pushCmd.Run(); err != nil {
-		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v", err))
-		return err
+		// git reports rejections, auth failures and hook output on stderr; without
+		// capturing it the caller only ever sees "exit status 1".
+		detail := strings.TrimSpace(pushOut.String())
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 git push error: %v — %s", err, detail))
+		if detail != "" {
+			return fmt.Errorf("git push failed: %w: %s", err, detail)
+		}
+		return fmt.Errorf("git push failed: %w", err)
 	}
 
 	if ctx.Err() != nil {

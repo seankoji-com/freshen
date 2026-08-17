@@ -39,7 +39,9 @@ func (a *aliasFlags) Set(value string) error {
 	if !ok || local == "" || remote == "" {
 		return fmt.Errorf("invalid --alias value %q, expected local=remote", value)
 	}
-	git.AddAlias(local, remote)
+	if err := git.AddAlias(local, remote); err != nil {
+		return fmt.Errorf("invalid --alias value %q: %w", value, err)
+	}
 	*a = append(*a, value)
 	return nil
 }
@@ -233,7 +235,13 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
 
 	// Delete archived repos & clone missing active repos
 	for _, ghRepo := range orgRepos {
-		localDir := git.GetLocalDirName(ghRepo.Name)
+		localDir, ok := git.GetLocalDirName(ghRepo.Name)
+		if !ok {
+			// An unusable name must never be joined onto targetDir: the join would
+			// resolve to targetDir itself and hand the whole repos root to RemoveAll.
+			fmt.Printf("Warning: skipping repo '%s': no safe local directory name\n", ghRepo.Name)
+			continue
+		}
 		localPath := filepath.Join(targetDir, localDir)
 
 		if ghRepo.IsArchived {
