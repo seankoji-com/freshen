@@ -648,8 +648,8 @@ func TestHandleLoadedRunnersMsg(t *testing.T) {
 		if !m.RunnerFetchFailed {
 			t.Errorf("expected RunnerFetchFailed true on error")
 		}
-		if m.ConsecutiveErrors != 1 {
-			t.Errorf("expected ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors)
+		if m.ConsecutiveErrors[fetchSourceRunners] != 1 {
+			t.Errorf("expected runners ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors[fetchSourceRunners])
 		}
 		if m.ToastPriority != 2 {
 			t.Errorf("expected error-priority toast (2), got %d", m.ToastPriority)
@@ -662,14 +662,19 @@ func TestHandleLoadedRunnersMsg(t *testing.T) {
 	t.Run("success clears failure flag and merges runners", func(t *testing.T) {
 		m := newTestModel("/tmp/test", "test-org")
 		m.RunnerFetchFailed = true
-		m.ConsecutiveErrors = 3
+		m.ConsecutiveErrors = map[string]int{fetchSourceRunners: 3, fetchSourceJobQueue: 4}
 		m.handleLoadedRunnersMsg(loadedRunnersMsg{runners: []*jobs.RunnerItem{{ID: "r1", Name: "runner-1"}}})
 
 		if m.RunnerFetchFailed {
 			t.Errorf("expected RunnerFetchFailed to clear on success")
 		}
-		if m.ConsecutiveErrors != 0 {
-			t.Errorf("expected ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors)
+		if m.ConsecutiveErrors[fetchSourceRunners] != 0 {
+			t.Errorf("expected runners ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors[fetchSourceRunners])
+		}
+		// A healthy runner fetch must not cancel the job-queue poller's own
+		// backoff — the counters are tracked per source.
+		if m.ConsecutiveErrors[fetchSourceJobQueue] != 4 {
+			t.Errorf("expected jobQueue ConsecutiveErrors untouched at 4, got %d", m.ConsecutiveErrors[fetchSourceJobQueue])
 		}
 		if len(m.Runners) != 1 {
 			t.Errorf("expected 1 runner merged in, got %d", len(m.Runners))
@@ -703,8 +708,11 @@ func TestHandleLoadedJobQueueMsg(t *testing.T) {
 		if !m.JobQueueFetchFailed {
 			t.Errorf("expected JobQueueFetchFailed true on error")
 		}
-		if m.ConsecutiveErrors != 1 {
-			t.Errorf("expected ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors)
+		if m.ConsecutiveErrors[fetchSourceJobQueue] != 1 {
+			t.Errorf("expected jobQueue ConsecutiveErrors == 1, got %d", m.ConsecutiveErrors[fetchSourceJobQueue])
+		}
+		if m.ConsecutiveErrors[fetchSourceRunners] != 0 {
+			t.Errorf("expected runners ConsecutiveErrors untouched at 0, got %d", m.ConsecutiveErrors[fetchSourceRunners])
 		}
 		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Job queue may be incomplete") {
 			t.Errorf("expected error toast about the incomplete job queue, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
@@ -737,14 +745,17 @@ func TestHandleLoadedJobQueueMsg(t *testing.T) {
 	t.Run("success resets failure state", func(t *testing.T) {
 		m := newTestModel("/tmp/test", "test-org")
 		m.JobQueueFetchFailed = true
-		m.ConsecutiveErrors = 5
+		m.ConsecutiveErrors = map[string]int{fetchSourceJobQueue: 5, fetchSourceRunners: 2}
 		m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: nil})
 
 		if m.JobQueueFetchFailed {
 			t.Errorf("expected JobQueueFetchFailed to clear on success")
 		}
-		if m.ConsecutiveErrors != 0 {
-			t.Errorf("expected ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors)
+		if m.ConsecutiveErrors[fetchSourceJobQueue] != 0 {
+			t.Errorf("expected jobQueue ConsecutiveErrors reset to 0, got %d", m.ConsecutiveErrors[fetchSourceJobQueue])
+		}
+		if m.ConsecutiveErrors[fetchSourceRunners] != 2 {
+			t.Errorf("expected runners ConsecutiveErrors untouched at 2, got %d", m.ConsecutiveErrors[fetchSourceRunners])
 		}
 	})
 }
@@ -1000,8 +1011,8 @@ func TestLoadedRunnersMsgPermissionDenied(t *testing.T) {
 	if updated.ToastMsg != "" {
 		t.Errorf("expected no error toast on runner permission denied, got %q", updated.ToastMsg)
 	}
-	if updated.ConsecutiveErrors != 0 {
-		t.Errorf("expected ConsecutiveErrors to be 0 for permission denied, got %d", updated.ConsecutiveErrors)
+	if updated.ConsecutiveErrors[fetchSourceRunners] != 0 {
+		t.Errorf("expected runners ConsecutiveErrors to be 0 for permission denied, got %d", updated.ConsecutiveErrors[fetchSourceRunners])
 	}
 	if len(updated.Runners) != 1 || updated.Runners[0].Name != "actions-worker-1" {
 		t.Errorf("expected runner to be extracted from active job queue on permission denied, got %+v", updated.Runners)

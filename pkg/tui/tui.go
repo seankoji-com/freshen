@@ -54,6 +54,14 @@ const (
 	pollBackoffCap = 5 * time.Minute
 )
 
+// Fetch-source keys for the per-poller backoff counters. The runner poll and
+// the job-queue poll fail independently, so each tracks its own streak — a
+// healthy fetch on one must not reset the backoff the other has earned.
+const (
+	fetchSourceRunners  = "runners"
+	fetchSourceJobQueue = "jobQueue"
+)
+
 // backoffInterval doubles base once per consecutive failure, capped at
 // pollBackoffCap. With no failures recorded it returns base unchanged.
 func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
@@ -269,12 +277,14 @@ type loadedPRsMsg struct {
 
 // pushFinishedMsg carries the result of a background commit/push/PR run back
 // to the update goroutine, which is the only writer of m.Repos. The worker
-// computes these fields on a private clone and never touches the live item.
+// mutates a private clone and never touches the live item; repo is that clone,
+// folded onto the live item via applyRepoSnapshot so every field the push
+// wrote (Status, StatusMsg, Logs, DraftPRURL, ExistingPRURL, branch state)
+// survives the handoff.
 type pushFinishedMsg struct {
-	repoName      string
-	currentBranch string
-	branchDetails git.BranchWorktreeDetails
-	err           error
+	repoName string
+	repo     *git.RepoItem
+	err      error
 }
 
 // --- Bubble Tea Model ---
@@ -300,7 +310,7 @@ type Model struct {
 	ToastMsg               string
 	FocusedRunID           int64 // When non-zero, a specific workflow run is focused
 	ToastPriority          int   // higher priority overrides lower; 0 = none, 1 = info, 2 = error
-	ConsecutiveErrors      int
+	ConsecutiveErrors      map[string]int
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
@@ -722,21 +732,28 @@ func copyToClipboard(text string) error {
 // noteFetchFailure records a consecutive runner/job-queue fetch failure and
 // logs the moment the poll cadence first widens past its baseline.
 func (m *Model) noteFetchFailure(source string, base time.Duration) {
-	m.ConsecutiveErrors++
-	if next := backoffInterval(base, m.ConsecutiveErrors); next > base {
+	if m.ConsecutiveErrors == nil {
+		m.ConsecutiveErrors = make(map[string]int)
+	}
+	m.ConsecutiveErrors[source]++
+	streak := m.ConsecutiveErrors[source]
+	if next := backoffInterval(base, streak); next > base {
 		slog.Warn("backing off polls after consecutive fetch failures",
-			"source", source, "consecutiveErrors", m.ConsecutiveErrors, "interval", next)
+			"source", source, "consecutiveErrors", streak, "interval", next)
 	}
 }
 
-// noteFetchSuccess clears the failure streak, logging the return to the
-// baseline poll cadence when a backoff was in effect.
+// noteFetchSuccess clears this source's failure streak, logging the return to
+// the baseline poll cadence when a backoff was in effect. Streaks for other
+// sources are left alone so one healthy endpoint cannot cancel the backoff a
+// different, still-failing endpoint has earned.
 func (m *Model) noteFetchSuccess(source string) {
-	if m.ConsecutiveErrors > 0 {
+	if streak := m.ConsecutiveErrors[source]; streak > 0 {
 		slog.Warn("resuming baseline poll interval after successful fetch",
-			"source", source, "consecutiveErrors", m.ConsecutiveErrors)
+			"source", source, "consecutiveErrors", streak)
 	}
-	m.ConsecutiveErrors = 0
+	// delete rather than assign: it is a no-op on a nil map.
+	delete(m.ConsecutiveErrors, source)
 }
 
 // setToast sets a toast message with the given priority. Higher priority toasts
@@ -1224,12 +1241,12 @@ func (m *Model) handleKeyPush() tea.Cmd {
 	result := make(chan pushFinishedMsg, 1)
 
 	run := m.bgGuard(func() {
-		out := pushFinishedMsg{repoName: work.Name}
+		out := pushFinishedMsg{repoName: work.Name, repo: work}
 		if err := git.CommitPushPRAndSwitchDefault(ctx, work); err != nil {
 			out.err = err
 		} else {
-			out.currentBranch = git.GetOriginalBranch(ctx, work.Path)
-			out.branchDetails = git.GetRepoBranchDetails(ctx, work.Path, work.DefaultBranch)
+			work.CurrentBranch = git.GetOriginalBranch(ctx, work.Path)
+			work.BranchDetails = git.GetRepoBranchDetails(ctx, work.Path, work.DefaultBranch)
 		}
 		result <- out
 	})
@@ -1243,21 +1260,19 @@ func (m *Model) handleKeyPush() tea.Cmd {
 // update goroutine, surfacing failures the way handleKeyDelete does for its
 // own destructive action instead of discarding the error.
 func (m *Model) handlePushFinishedMsg(msg pushFinishedMsg) {
-	for _, item := range m.Repos {
-		if item.Name != msg.repoName {
-			continue
+	// Log and toast unconditionally: a background refresh may have rebuilt
+	// m.Repos while the push was in flight, and a failure that no longer
+	// matches a live repo must still leave a trace.
+	if msg.err != nil {
+		slog.Error("push/PR failed", "repo", msg.repoName, "error", msg.err)
+		if msg.repo != nil {
+			msg.repo.Logs = append(msg.repo.Logs, fmt.Sprintf("⚠ Commit/push/PR failed: %v", msg.err))
 		}
-		if msg.err != nil {
-			slog.Error("push/PR failed", "repo", item.Name, "error", msg.err)
-			item.Logs = append(item.Logs, fmt.Sprintf("⚠ Commit/push/PR failed: %v", msg.err))
-			m.setToast(fmt.Sprintf(" ⚠ Push/PR failed for '%s': %v", item.Name, msg.err), 2)
-		} else {
-			item.CurrentBranch = msg.currentBranch
-			item.BranchDetails = msg.branchDetails
-			m.setToast(fmt.Sprintf(" 󰄬 Pushed '%s' and switched to the default branch.", item.Name), 1)
-		}
-		break
+		m.setToast(fmt.Sprintf(" ⚠ Push/PR failed for '%s': %v", msg.repoName, msg.err), 2)
+	} else {
+		m.setToast(fmt.Sprintf(" 󰄬 Pushed '%s' and switched to the default branch.", msg.repoName), 1)
 	}
+	m.applyRepoSnapshot(msg.repo)
 	m.updateViewport()
 }
 
@@ -1410,7 +1425,7 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 	if !m.RunnerPermissionDenied {
 		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
 	}
-	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors)))
+	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
 	// Refresh logs for selected running job
 	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 		selJob := m.JobQueue[m.SelectedJobIndex]
@@ -1424,7 +1439,7 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 // handleJobQueueTickMsg refreshes the job queue on its own slower cadence,
 // keeping the per-repo API cost off the 10s runner tick.
 func (m *Model) handleJobQueueTickMsg() tea.Cmd {
-	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors)))
+	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors[fetchSourceJobQueue])))
 }
 
 func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
@@ -1440,14 +1455,14 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 				m.Runners = extractRunnersFromJobQueue(m.JobQueue, m.Runners)
 			}
 		} else {
-			m.noteFetchFailure("runners", runnerJobTickInterval)
+			m.noteFetchFailure(fetchSourceRunners, runnerJobTickInterval)
 			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
 			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
 		}
 	} else {
 		m.RunnerFetchFailed = false
 		m.RunnerPermissionDenied = false
-		m.noteFetchSuccess("runners")
+		m.noteFetchSuccess(fetchSourceRunners)
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
 		m.Runners = merged
@@ -1461,7 +1476,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	m.IsJobQueueLoading = false
 	if msg.err != nil {
 		m.JobQueueFetchFailed = true
-		m.noteFetchFailure("jobQueue", jobQueueTickInterval)
+		m.noteFetchFailure(fetchSourceJobQueue, jobQueueTickInterval)
 		slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
 		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
 		var cmd tea.Cmd
@@ -1477,7 +1492,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	}
 
 	m.JobQueueFetchFailed = false
-	m.noteFetchSuccess("jobQueue")
+	m.noteFetchSuccess(fetchSourceJobQueue)
 	m.processJobQueueUpdate(msg.queue)
 	if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 		m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
