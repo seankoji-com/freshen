@@ -37,7 +37,12 @@ jobs:
 
       - name: Build binary
         # `--always` falls back to the abbreviated commit SHA and never fails,
-        # so no "|| echo" fallback is needed here.
+        # so no "|| echo" fallback is needed here. VERSION is captured as its
+        # own statement (not inlined into -ldflags) so that if git itself
+        # ever errors here, -e fails the step loudly instead of silently
+        # shipping a binary with an empty -X main.Version=.
         # Note: if a v-prefixed tag is ever created, main.go's version-print
         # format already adds its own "v" prefix, which would double up.
-        run: go build -ldflags "-X main.Version=$(git describe --tags --always)" -o freshen .
+        run: |
+          VERSION="$(git describe --tags --always)"
+          go build -ldflags "-X main.Version=$VERSION" -o freshen .

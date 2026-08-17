@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -45,7 +46,8 @@ func (a *aliasFlags) Set(value string) error {
 
 // validatePrerequisites checks that freshen has access to required tools.
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
-// The gh auth check is skipped if versionFlag is true (version printing needs nothing).
+// Both the git-on-PATH check and the gh auth check are skipped if versionFlag
+// is true (version printing needs nothing).
 func validatePrerequisites(versionFlag bool) {
 	// Skip all checks if printing version (it needs nothing)
 	if versionFlag {
@@ -66,6 +68,10 @@ func validatePrerequisites(versionFlag bool) {
 	cmd := exec.CommandContext(ctx, "gh", "auth", "status")
 	err = cmd.Run()
 	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "freshen timed out checking GitHub CLI auth status (network issue?). Check your connection and try again.")
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "freshen requires an authenticated GitHub CLI. Run: gh auth login.")
 		os.Exit(1)
 	}

@@ -55,10 +55,10 @@ If you prefer to run commands directly:
 
 ```bash
 # Build
-go build -o freshen main.go
+go build -o freshen .
 
 # Test
-go test ./...
+go test -race ./...
 
 # Static analysis
 go vet ./...
