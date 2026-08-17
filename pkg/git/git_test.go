@@ -267,8 +267,10 @@ func TestBranchWorktreeDetailsGetRemoteBranches(t *testing.T) {
 func TestGetDefaultBranch(t *testing.T) {
 	const path = "/repo"
 
+	// The gh repo view tier runs as a direct exec with cmd.Dir set (CommandRunner
+	// cannot set Dir), so it never reaches the scripted runner. path does not exist,
+	// which makes that tier fail deterministically without spawning gh.
 	symbolicRefKey := cmdKey("git", []string{"-C", path, "symbolic-ref", "refs/remotes/origin/HEAD"})
-	ghViewKey := cmdKey("gh", []string{"repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"})
 	showRefMainKey := cmdKey("git", []string{"-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"})
 	showRefMasterKey := cmdKey("git", []string{"-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"})
 	symbolicHeadKey := cmdKey("git", []string{"-C", path, "symbolic-ref", "--short", "HEAD"})
@@ -279,31 +281,19 @@ func TestGetDefaultBranch(t *testing.T) {
 			symbolicRefKey: {out: []byte("refs/remotes/origin/develop\n")},
 		})
 
-		if got := GetDefaultBranch(path); got != "develop" {
+		if got := GetDefaultBranch(context.Background(), path); got != "develop" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "develop")
-		}
-	})
-
-	t.Run("falls back to gh repo view", func(t *testing.T) {
-		withScriptedRunner(t, map[string]cmdResponse{
-			symbolicRefKey: {err: errors.New("fatal: not a symbolic ref")},
-			ghViewKey:      {out: []byte("trunk\n")},
-		})
-
-		if got := GetDefaultBranch(path); got != "trunk" {
-			t.Errorf("GetDefaultBranch() = %q, want %q", got, "trunk")
 		}
 	})
 
 	t.Run("falls back to show-ref main", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
-			ghViewKey:        {err: errors.New("gh: not found")},
 			showRefMainKey:   {},
 			showRefMasterKey: {err: errors.New("no such ref")},
 		})
 
-		if got := GetDefaultBranch(path); got != "main" {
+		if got := GetDefaultBranch(context.Background(), path); got != "main" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "main")
 		}
 	})
@@ -311,12 +301,11 @@ func TestGetDefaultBranch(t *testing.T) {
 	t.Run("falls back to show-ref master", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
-			ghViewKey:        {err: errors.New("gh: not found")},
 			showRefMainKey:   {err: errors.New("no such ref")},
 			showRefMasterKey: {},
 		})
 
-		if got := GetDefaultBranch(path); got != "master" {
+		if got := GetDefaultBranch(context.Background(), path); got != "master" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "master")
 		}
 	})
@@ -324,14 +313,13 @@ func TestGetDefaultBranch(t *testing.T) {
 	t.Run("falls back to GetOriginalBranch when everything else fails", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
-			ghViewKey:        {err: errors.New("gh: not found")},
 			showRefMainKey:   {err: errors.New("no such ref")},
 			showRefMasterKey: {err: errors.New("no such ref")},
 			symbolicHeadKey:  {err: errors.New("fatal: not on a branch")},
 			revParseKey:      {out: []byte("abc1234\n")},
 		})
 
-		if got := GetDefaultBranch(path); got != "abc1234" {
+		if got := GetDefaultBranch(context.Background(), path); got != "abc1234" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "abc1234")
 		}
 	})
@@ -339,14 +327,13 @@ func TestGetDefaultBranch(t *testing.T) {
 	t.Run("returns HEAD when every lookup fails", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
-			ghViewKey:        {err: errors.New("gh: not found")},
 			showRefMainKey:   {err: errors.New("no such ref")},
 			showRefMasterKey: {err: errors.New("no such ref")},
 			symbolicHeadKey:  {err: errors.New("fatal: not on a branch")},
 			revParseKey:      {err: errors.New("fatal: bad revision 'HEAD'")},
 		})
 
-		if got := GetDefaultBranch(path); got != "HEAD" {
+		if got := GetDefaultBranch(context.Background(), path); got != "HEAD" {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "HEAD")
 		}
 	})

@@ -456,7 +456,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 			if git.IsGitRepo(localPath) {
 				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
-				item.DefaultBranch = git.GetDefaultBranch(localPath)
+				item.DefaultBranch = git.GetDefaultBranch(m.ctx, localPath)
 			}
 
 			if counts, found := orgCounts[ghRepo.Name]; found {
@@ -483,7 +483,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 						Path:          path,
 						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
 						CurrentBranch: git.GetOriginalBranch(m.ctx, path),
-						DefaultBranch: git.GetDefaultBranch(path),
+						DefaultBranch: git.GetDefaultBranch(m.ctx, path),
 						Status:        git.StatusPending,
 						Logs:          make([]string, 0),
 					}

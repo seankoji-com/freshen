@@ -208,15 +208,35 @@ func ShortenHomePath(path string) string {
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
 // The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
+// The result is always sanitised to a single path segment so callers can safely
+// join it onto a parent directory (see sanitizeDirName).
 func GetLocalDirName(ghRepo string) string {
+	var name string
 	switch ghRepo {
 	case ".github":
-		return "github"
+		name = "github"
 	case "careynas.net":
-		return "wiki.robot.house"
+		name = "wiki.robot.house"
 	default:
-		return ghRepo
+		name = ghRepo
 	}
+	return sanitizeDirName(name)
+}
+
+// sanitizeDirName guarantees a directory name stays a single path segment.
+// A name containing a path separator or a ".." segment could escape its parent
+// directory once joined and handed to os.RemoveAll, so such names are flattened
+// to their basename with ".." stripped rather than returned as-is.
+func sanitizeDirName(name string) string {
+	if name != "" && name != "." && !strings.ContainsAny(name, `/\`) && !strings.Contains(name, "..") && filepath.Base(name) == name {
+		return name
+	}
+	safe := filepath.Base(strings.ReplaceAll(name, `\`, "/"))
+	safe = strings.TrimSpace(strings.ReplaceAll(safe, "..", ""))
+	if safe == "." || safe == "/" || safe == string(filepath.Separator) {
+		return ""
+	}
+	return safe
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
@@ -404,9 +424,13 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
 	cmd := exec.CommandContext(ctx, "gh", "issue", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultIssueLimit), "--json", "number,title,url")
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return nil, fmt.Errorf("%w: %s", err, stderr)
+		}
 		return nil, err
 	}
 
@@ -430,9 +454,13 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 
 	target := fmt.Sprintf("%s/%s", org, ghRepo)
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--repo", target, "--state", "open", "--limit", fmt.Sprintf("%d", defaultPRLimit), "--json", "number,title,headRefName,url")
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
+	cmd.Stderr = &errOut
 	if err := cmd.Run(); err != nil {
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			return nil, fmt.Errorf("%w: %s", err, stderr)
+		}
 		return nil, err
 	}
 
@@ -451,18 +479,22 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 }
 
 // FetchExistingPRURL checks if an open PR exists on GitHub for the given branch.
-func FetchExistingPRURL(repoPath, branch string) string {
+// An empty result means "no open PR found"; a lookup failure is logged so it is
+// not silently mistaken for that, since callers act on the distinction.
+func FetchExistingPRURL(ctx context.Context, repoPath, branch string) string {
 	if branch == "" || branch == "HEAD" {
 		return ""
 	}
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
 	cmd.Dir = repoPath
-	var out bytes.Buffer
+	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		return strings.TrimSpace(out.String())
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		slog.Warn("gh pr list failed", "path", repoPath, "branch", branch, "error", err, "stderr", strings.TrimSpace(errOut.String()))
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(out.String())
 }
 
 // IsGitRepo checks if a directory is a valid git working tree.
@@ -495,8 +527,13 @@ func GetOriginalBranch(ctx context.Context, path string) string {
 }
 
 // GetDefaultBranch determines default branch (main/master) for a git repository.
-func GetDefaultBranch(path string) string {
-	out, err := runner.Run(context.Background(), "git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
+// ctx allows the caller to abort the lookup, including the networked gh tier.
+func GetDefaultBranch(ctx context.Context, path string) string {
+	if ctx.Err() != nil {
+		return "HEAD"
+	}
+
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
 		ref := strings.TrimSpace(string(out))
 		ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
@@ -506,19 +543,30 @@ func GetDefaultBranch(path string) string {
 		}
 	}
 
-	out, err = runner.Run(context.Background(), "gh", "repo", "view", path, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
-	if err == nil && strings.TrimSpace(string(out)) != "" {
-		return strings.TrimSpace(string(out))
+	// gh repo view takes [HOST/]OWNER/REPO or a URL — never a filesystem path — so
+	// the repo is resolved from the working directory instead. CommandRunner has no
+	// way to set cmd.Dir, so this one tier bypasses the runner seam deliberately.
+	ghCmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+	ghCmd.Dir = path
+	var ghOut, ghErr bytes.Buffer
+	ghCmd.Stdout = &ghOut
+	ghCmd.Stderr = &ghErr
+	if err := ghCmd.Run(); err == nil {
+		if branch := strings.TrimSpace(ghOut.String()); branch != "" {
+			return branch
+		}
+	} else {
+		slog.Warn("gh repo view failed", "path", path, "error", err, "stderr", strings.TrimSpace(ghErr.String()))
 	}
 
-	if _, err := runner.Run(context.Background(), "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
 		return "main"
 	}
-	if _, err := runner.Run(context.Background(), "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
 		return "master"
 	}
 
-	return GetOriginalBranch(context.Background(), path)
+	return GetOriginalBranch(ctx, path)
 }
 
 // SyncProgress receives a snapshot of a repository after each state change
@@ -596,7 +644,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	origBranch := GetOriginalBranch(ctx, item.Path)
 	item.OriginalBranch = origBranch
 	item.CurrentBranch = origBranch
-	defaultBranch := GetDefaultBranch(item.Path)
+	defaultBranch := GetDefaultBranch(ctx, item.Path)
 	item.DefaultBranch = defaultBranch
 
 	if !IsGitRepo(item.Path) {
@@ -637,7 +685,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 
 		item.IsNew = false
 		origBranch = GetOriginalBranch(ctx, item.Path)
-		defaultBranch = GetDefaultBranch(item.Path)
+		defaultBranch = GetDefaultBranch(ctx, item.Path)
 		item.OriginalBranch = origBranch
 		item.CurrentBranch = origBranch
 		item.DefaultBranch = defaultBranch
@@ -649,7 +697,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
-		item.ExistingPRURL = FetchExistingPRURL(item.Path, origBranch)
+		item.ExistingPRURL = FetchExistingPRURL(ctx, item.Path, origBranch)
 		if item.ExistingPRURL != "" {
 			s.log("󰏫 Existing Open PR found: %s", item.ExistingPRURL)
 		}
@@ -685,7 +733,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 
 		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch)
 
-		_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run()
+		// Best-effort: the stash below is what actually has to succeed.
+		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
+			s.log("󰀪 git add . failed (continuing): %v", err)
+		}
 		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
 		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 		if err := stashCmd.Run(); err != nil {
@@ -740,7 +791,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 
 	s.log(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch)
 
-	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run()
+	// Best-effort: the rebase below still runs against whatever refs are local.
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "fetch", "origin").Run(); err != nil {
+		s.log("󰀪 git fetch origin failed (continuing): %v", err)
+	}
 	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
 	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
 	var rebaseOut bytes.Buffer
@@ -753,7 +807,9 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 		// Use a fresh context for the abort so a mid-rebase state isn't left behind
 		// even if the sync itself was cancelled.
 		abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
-		_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run()
+		if abortErr := exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run(); abortErr != nil {
+			s.log("󰀪 git rebase --abort failed — repository may be left mid-rebase: %v", abortErr)
+		}
 		abortCancel()
 		s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebase conflict: %s", rebaseOut.String())
 	}
@@ -787,9 +843,14 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 
 	// add/commit are best-effort: if there's nothing to commit (or the commit
 	// otherwise no-ops), we still want to push whatever's already committed.
-	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").Run()
+	// Failures are logged rather than swallowed so they aren't invisible.
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git add -A failed (continuing): %v", err))
+	}
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	_ = exec.CommandContext(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg).Run()
+	if err := exec.CommandContext(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg).Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git commit failed or had nothing to commit (continuing): %v", err))
+	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -811,14 +872,14 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 		var prOut bytes.Buffer
 		prCmd.Stdout = &prOut
 		prCmd.Stderr = &prOut
-		if err := prCmd.Run(); err == nil {
-			prURL := strings.TrimSpace(prOut.String())
-			item.DraftPRURL = prURL
-			item.ExistingPRURL = prURL
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 PR created: %s", prURL))
-		} else {
-			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create notice: %s", prOut.String()))
+		if err := prCmd.Run(); err != nil {
+			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create failed: %v — %s", err, strings.TrimSpace(prOut.String())))
+			return fmt.Errorf("gh pr create failed: %w: %s", err, strings.TrimSpace(prOut.String()))
 		}
+		prURL := strings.TrimSpace(prOut.String())
+		item.DraftPRURL = prURL
+		item.ExistingPRURL = prURL
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 PR created: %s", prURL))
 	} else {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed commits to existing PR: %s", item.ExistingPRURL))
 	}
@@ -828,12 +889,14 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	}
 
 	coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", item.DefaultBranch)
-	if err := coCmd.Run(); err == nil {
-		item.CurrentBranch = item.DefaultBranch
-		item.Status = StatusPRCreated
-		item.StatusMsg = "PR Raised"
-		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
+	if err := coCmd.Run(); err != nil {
+		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch back to default branch '%s': %v", item.DefaultBranch, err))
+		return fmt.Errorf("failed to checkout '%s': %w", item.DefaultBranch, err)
 	}
+	item.CurrentBranch = item.DefaultBranch
+	item.Status = StatusPRCreated
+	item.StatusMsg = "PR Raised"
+	item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Switched back to default branch '%s'.", item.DefaultBranch))
 
 	return nil
 }
