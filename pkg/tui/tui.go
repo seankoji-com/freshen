@@ -46,7 +46,26 @@ const (
 const (
 	repoTickInterval      = 5 * time.Minute
 	runnerJobTickInterval = 10 * time.Second
+	jobQueueTickInterval  = 20 * time.Second
+
+	// pollBackoffCap bounds the exponential backoff applied to the runner and
+	// job-queue polls after consecutive fetch failures, so a tripped API quota
+	// isn't pinned at zero overnight by a fixed-interval poll.
+	pollBackoffCap = 5 * time.Minute
 )
+
+// backoffInterval doubles base once per consecutive failure, capped at
+// pollBackoffCap. With no failures recorded it returns base unchanged.
+func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
+	d := base
+	for i := 0; i < consecutiveErrors && d < pollBackoffCap; i++ {
+		d *= 2
+	}
+	if d > pollBackoffCap {
+		d = pollBackoffCap
+	}
+	return d
+}
 
 // --- NerdFont Glyphs & Color Palette ---
 var (
@@ -203,8 +222,10 @@ func repoTickCmd() tea.Cmd {
 	})
 }
 
-func runnerJobTickCmd() tea.Cmd {
-	return tea.Every(runnerJobTickInterval, func(t time.Time) tea.Msg {
+// runnerJobTickCmd schedules the next runner poll after d, which callers widen
+// via backoffInterval once fetches start failing.
+func runnerJobTickCmd(d time.Duration) tea.Cmd {
+	return tea.Every(d, func(t time.Time) tea.Msg {
 		return runnerJobTickMsg(t)
 	})
 }
@@ -213,8 +234,9 @@ func runnerJobTickCmd() tea.Cmd {
 // GitHub has no org-wide workflow-runs endpoint, so each poll costs one API
 // call per tracked repository; at 20s a ~20-repo org stays well inside the
 // 5,000 requests/hour limit, while the runner panel keeps its 10s refresh.
-func jobQueueTickCmd() tea.Cmd {
-	return tea.Every(20*time.Second, func(t time.Time) tea.Msg {
+// d is widened via backoffInterval once fetches start failing.
+func jobQueueTickCmd(d time.Duration) tea.Cmd {
+	return tea.Every(d, func(t time.Time) tea.Msg {
 		return jobQueueTickMsg(t)
 	})
 }
@@ -245,6 +267,16 @@ type loadedPRsMsg struct {
 	err      error
 }
 
+// pushFinishedMsg carries the result of a background commit/push/PR run back
+// to the update goroutine, which is the only writer of m.Repos. The worker
+// computes these fields on a private clone and never touches the live item.
+type pushFinishedMsg struct {
+	repoName      string
+	currentBranch string
+	branchDetails git.BranchWorktreeDetails
+	err           error
+}
+
 // --- Bubble Tea Model ---
 
 type Model struct {
@@ -273,9 +305,12 @@ type Model struct {
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
 
-	// pendingDeleteIndex holds the Repos index awaiting a second 'd' press
-	// to confirm deletion of an archived repo; -1 means no pending delete.
-	pendingDeleteIndex int
+	// pendingDeletePath holds the Path of the archived repo awaiting a second
+	// 'd' press to confirm deletion; "" means no pending delete. It is keyed
+	// on Path rather than a Repos index because a background refresh can
+	// rebuild and re-sort m.Repos between the two presses, which would leave
+	// an index pointing at a different repo than the one just confirmed.
+	pendingDeletePath string
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -317,7 +352,7 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		SelectedIndex:       0,
 		SelectedRunnerIndex: 0,
 		SelectedJobIndex:    0,
-		pendingDeleteIndex:  -1,
+		pendingDeletePath:   "",
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
@@ -339,8 +374,8 @@ func (m Model) Init() tea.Cmd {
 		m.loadRunnersCmd(),
 		m.loadJobQueueCmd(),
 		repoTickCmd(),
-		runnerJobTickCmd(),
-		jobQueueTickCmd(),
+		runnerJobTickCmd(runnerJobTickInterval),
+		jobQueueTickCmd(jobQueueTickInterval),
 	)
 }
 
@@ -588,13 +623,21 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 		}
 		sem := make(chan struct{}, concurrency)
 
+	producer:
 		for _, r := range work {
 			if ctx.Err() != nil {
-				break
+				break producer
 			}
 
+			// Acquiring must stay cancellable: a wedged worker would
+			// otherwise block this loop forever, so the ctx check above is
+			// never reached again and bgGuard's Done() never fires.
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				break producer
+			}
 			wg.Add(1)
-			sem <- struct{}{}
 
 			go func(r *git.RepoItem) {
 				defer wg.Done()
@@ -676,6 +719,26 @@ func copyToClipboard(text string) error {
 	return cmd.Run()
 }
 
+// noteFetchFailure records a consecutive runner/job-queue fetch failure and
+// logs the moment the poll cadence first widens past its baseline.
+func (m *Model) noteFetchFailure(source string, base time.Duration) {
+	m.ConsecutiveErrors++
+	if next := backoffInterval(base, m.ConsecutiveErrors); next > base {
+		slog.Warn("backing off polls after consecutive fetch failures",
+			"source", source, "consecutiveErrors", m.ConsecutiveErrors, "interval", next)
+	}
+}
+
+// noteFetchSuccess clears the failure streak, logging the return to the
+// baseline poll cadence when a backoff was in effect.
+func (m *Model) noteFetchSuccess(source string) {
+	if m.ConsecutiveErrors > 0 {
+		slog.Warn("resuming baseline poll interval after successful fetch",
+			"source", source, "consecutiveErrors", m.ConsecutiveErrors)
+	}
+	m.ConsecutiveErrors = 0
+}
+
 // setToast sets a toast message with the given priority. Higher priority toasts
 // (error=2) override lower ones (info=1), and equal priorities replace.
 // Priority 0 clears on next keypress.
@@ -738,6 +801,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case syncFinishedMsg:
 		m.handleSyncFinishedMsg(msg)
 
+	case pushFinishedMsg:
+		m.handlePushFinishedMsg(msg)
+
 	case tea.WindowSizeMsg:
 		m.handleWindowSizeMsg(msg)
 	}
@@ -761,7 +827,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 	m.setToast("", 0)
 	if msg.String() != "d" {
-		m.pendingDeleteIndex = -1
+		m.pendingDeletePath = ""
 	}
 
 	switch msg.String() {
@@ -824,7 +890,7 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
 		m.handleKeySwitchBranch()
 
 	case "p":
-		m.handleKeyPush()
+		return m.handleKeyPush(), false
 
 	case "d":
 		m.handleKeyDelete()
@@ -1056,13 +1122,21 @@ func (m *Model) handleKeyPrune() {
 	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 		item := m.Repos[m.SelectedIndex]
 		count, err := git.PruneBranchesAndWorktrees(m.ctx, item.Path, item.DefaultBranch)
-		if err == nil {
-			item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
-			item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
-			item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
-			m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
+		if err != nil {
+			// Earlier steps (worktree remove --force) may already have run
+			// destructively before this error surfaced, so say so rather than
+			// leaving the operator unable to tell "did nothing" from "half done".
+			slog.Error("prune failed", "repo", item.Name, "path", item.Path, "error", err)
+			item.Logs = append(item.Logs, fmt.Sprintf("⚠ Prune failed (earlier steps may already have removed worktrees): %v", err))
+			m.setToast(fmt.Sprintf(" ⚠ Prune failed for '%s': %v", item.Name, err), 2)
 			m.updateViewport()
+			return
 		}
+		item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
+		item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
+		item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pruned remote tracking branches (git fetch --prune), force removed worktrees, and deleted %d non-default local branches.", count))
+		m.setToast(fmt.Sprintf(" 󰄬 Fetched & pruned remote refs, removed worktrees & deleted %d branches!", count), 1)
+		m.updateViewport()
 	}
 }
 
@@ -1129,27 +1203,70 @@ func (m *Model) handleKeySwitchBranch() {
 	}
 }
 
-func (m *Model) handleKeyPush() {
-	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
-		item := m.Repos[m.SelectedIndex]
-		if !item.IsArchived {
-			go m.bgGuard(func() {
-				if err := git.CommitPushPRAndSwitchDefault(m.ctx, item); err == nil {
-					item.CurrentBranch = git.GetOriginalBranch(m.ctx, item.Path)
-					item.BranchDetails = git.GetRepoBranchDetails(m.ctx, item.Path, item.DefaultBranch)
-				}
-			})()
-			m.updateViewport()
-		}
+// handleKeyPush commits, pushes, and opens a PR for the selected repository in
+// the background. Like handleKeySync it hands the worker a private clone and
+// routes the result back as a tea.Msg, so only the update goroutine ever
+// writes to an item in m.Repos.
+func (m *Model) handleKeyPush() tea.Cmd {
+	if m.ActiveFocus != FocusRepos || len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+		return nil
 	}
+	item := m.Repos[m.SelectedIndex]
+	if item.IsArchived {
+		return nil
+	}
+
+	// Clone here, on the update goroutine, before the worker exists.
+	work := item.Clone()
+	ctx := m.ctx
+	// Buffered so the worker never blocks (and so bgGuard's Done() always
+	// fires) even if the receiving command is dropped at quit.
+	result := make(chan pushFinishedMsg, 1)
+
+	run := m.bgGuard(func() {
+		out := pushFinishedMsg{repoName: work.Name}
+		if err := git.CommitPushPRAndSwitchDefault(ctx, work); err != nil {
+			out.err = err
+		} else {
+			out.currentBranch = git.GetOriginalBranch(ctx, work.Path)
+			out.branchDetails = git.GetRepoBranchDetails(ctx, work.Path, work.DefaultBranch)
+		}
+		result <- out
+	})
+	go run()
+
+	m.updateViewport()
+	return func() tea.Msg { return <-result }
+}
+
+// handlePushFinishedMsg folds a background push result into the model on the
+// update goroutine, surfacing failures the way handleKeyDelete does for its
+// own destructive action instead of discarding the error.
+func (m *Model) handlePushFinishedMsg(msg pushFinishedMsg) {
+	for _, item := range m.Repos {
+		if item.Name != msg.repoName {
+			continue
+		}
+		if msg.err != nil {
+			slog.Error("push/PR failed", "repo", item.Name, "error", msg.err)
+			item.Logs = append(item.Logs, fmt.Sprintf("⚠ Commit/push/PR failed: %v", msg.err))
+			m.setToast(fmt.Sprintf(" ⚠ Push/PR failed for '%s': %v", item.Name, msg.err), 2)
+		} else {
+			item.CurrentBranch = msg.currentBranch
+			item.BranchDetails = msg.branchDetails
+			m.setToast(fmt.Sprintf(" 󰄬 Pushed '%s' and switched to the default branch.", item.Name), 1)
+		}
+		break
+	}
+	m.updateViewport()
 }
 
 func (m *Model) handleKeyDelete() {
 	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 		item := m.Repos[m.SelectedIndex]
 		if item.IsArchived {
-			if m.pendingDeleteIndex == m.SelectedIndex {
-				m.pendingDeleteIndex = -1
+			if m.pendingDeletePath != "" && m.pendingDeletePath == item.Path {
+				m.pendingDeletePath = ""
 				if err := git.DeleteLocalRepo(item.Path); err != nil {
 					m.setToast(fmt.Sprintf(" ⚠ Failed to delete '%s': %v", item.Name, err), 2)
 				} else {
@@ -1166,7 +1283,7 @@ func (m *Model) handleKeyDelete() {
 					m.updateViewport()
 				}
 			} else {
-				m.pendingDeleteIndex = m.SelectedIndex
+				m.pendingDeletePath = item.Path
 				m.setToast(fmt.Sprintf(" ⚠ Press 'd' again to delete archived repo '%s'.", item.Name), 2)
 			}
 		}
@@ -1293,7 +1410,7 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 	if !m.RunnerPermissionDenied {
 		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
 	}
-	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd())
+	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors)))
 	// Refresh logs for selected running job
 	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
 		selJob := m.JobQueue[m.SelectedJobIndex]
@@ -1307,7 +1424,7 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 // handleJobQueueTickMsg refreshes the job queue on its own slower cadence,
 // keeping the per-repo API cost off the 10s runner tick.
 func (m *Model) handleJobQueueTickMsg() tea.Cmd {
-	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd())
+	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors)))
 }
 
 func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
@@ -1323,14 +1440,14 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 				m.Runners = extractRunnersFromJobQueue(m.JobQueue, m.Runners)
 			}
 		} else {
-			m.ConsecutiveErrors++
+			m.noteFetchFailure("runners", runnerJobTickInterval)
 			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
 			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
 		}
 	} else {
 		m.RunnerFetchFailed = false
 		m.RunnerPermissionDenied = false
-		m.ConsecutiveErrors = 0
+		m.noteFetchSuccess("runners")
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
 		m.Runners = merged
@@ -1344,7 +1461,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	m.IsJobQueueLoading = false
 	if msg.err != nil {
 		m.JobQueueFetchFailed = true
-		m.ConsecutiveErrors++
+		m.noteFetchFailure("jobQueue", jobQueueTickInterval)
 		slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
 		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
 		var cmd tea.Cmd
@@ -1360,7 +1477,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	}
 
 	m.JobQueueFetchFailed = false
-	m.ConsecutiveErrors = 0
+	m.noteFetchSuccess("jobQueue")
 	m.processJobQueueUpdate(msg.queue)
 	if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 		m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
@@ -1418,6 +1535,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 		return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
 	})
 	m.TotalCount = len(m.Repos)
+	// The list the user confirmed against is gone; make them re-arm rather
+	// than let a stale token delete whatever now sits under the selection.
+	m.pendingDeletePath = ""
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true

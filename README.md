@@ -51,6 +51,7 @@ Launch the TUI interface:
 | <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> | Cycle forward/back (repo tabs, runner tag filter, or panel focus, depending on context) |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move selection within the focused panel |
 | <kbd>j</kbd> / <kbd>k</kbd> | Scroll the detail viewport (right pane) down/up |
+| <kbd>a</kbd> / <kbd>s</kbd> | Sync All — start a parallel sync across every loaded non-archived repository |
 | <kbd>c</kbd> / <kbd>y</kbd> | Copy the selected item's path/PR URL/ID to clipboard |
 | <kbd>q</kbd> or <kbd>Ctrl+C</kbd> | Quit application |
 
