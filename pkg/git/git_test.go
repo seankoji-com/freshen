@@ -143,6 +143,11 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 			if name != "gh" || len(args) < 2 || args[0] != "api" || args[1] != "graphql" {
 				t.Fatalf("unexpected command: %s %v", name, args)
 			}
+			for _, arg := range args {
+				if strings.HasPrefix(arg, "query=") && strings.Contains(arg, "myorg") {
+					t.Fatalf("owner was interpolated into GraphQL query: %s", arg)
+				}
+			}
 			return []byte(fixture), nil
 		})
 
@@ -416,6 +421,18 @@ func TestDeleteLocalRepo(t *testing.T) {
 		outside := t.TempDir()
 		if err := DeleteLocalRepo(workspace, outside); err == nil {
 			t.Fatal("DeleteLocalRepo() error = nil, want containment error")
+		}
+	})
+
+	t.Run("rejects a symlink escape", func(t *testing.T) {
+		workspace := t.TempDir()
+		outside := t.TempDir()
+		link := filepath.Join(workspace, "linked-repo")
+		if err := os.Symlink(outside, link); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if err := DeleteLocalRepo(workspace, link); err == nil {
+			t.Fatal("DeleteLocalRepo() accepted a symlink outside the workspace")
 		}
 	})
 

@@ -29,9 +29,6 @@ All other Go dependencies are transitive (ansi, term, cellbuf, etc.) and pulled 
 
 ## Local scripts
 
-- `scripts/hunk-validate.py` — not part of the main build; validation utility
-- `scripts/persona-review-post.sh` — not part of the main build; review helper
-
 ## No external services
 
 The app is entirely local — it shells out to `git` and `gh` but has no server, database, or network service of its own. No environment variables required beyond `$HOME` (for default repo directory) and standard `gh` auth.

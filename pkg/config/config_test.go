@@ -19,7 +19,7 @@ func TestSaveLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Workspace != want.Workspace || got.Owner != want.Owner || got.Concurrency != want.Concurrency {
+	if got.Workspace != want.Workspace || got.Owner != want.Owner || got.Concurrency != want.Concurrency || len(got.Aliases) != 1 || got.Aliases[0] != "local=remote" {
 		t.Fatalf("Load() = %#v", got)
 	}
 	if _, err := os.Stat(filepath.Join(configHome, "freshen", "config.json")); err != nil {

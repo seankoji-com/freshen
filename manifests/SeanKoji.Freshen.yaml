@@ -5,7 +5,7 @@ PackageName: freshen
 Publisher: Sean Koji
 PublisherUrl: https://github.com/seankoji-com
 PackageUrl: https://github.com/seankoji-com/freshen
-License: MIT
+License: Apache-2.0
 LicenseUrl: https://github.com/seankoji-com/freshen/blob/main/LICENSE
 ShortDescription: High-performance interactive TUI dashboard for multi-repo git management and sync
 Moniker: freshen
