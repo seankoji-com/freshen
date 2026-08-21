@@ -1250,6 +1250,9 @@ func TestMultiResolutionRendering(t *testing.T) {
 		view := m.View()
 		lines := strings.Split(view, "\n")
 		if len(lines) > res.h {
+			for i, l := range lines {
+				t.Logf("[%d] (w=%d) %q", i, lipgloss.Width(l), l)
+			}
 			t.Errorf("Resolution %dx%d: rendered %d lines exceeding max height %d", res.w, res.h, len(lines), res.h)
 		}
 		for i, line := range lines {
@@ -1349,6 +1352,115 @@ func TestRepoTableNoLineWrappingAndAlignment(t *testing.T) {
 		}
 		if !foundDotfilesWithCounts {
 			t.Errorf("Width %d: .dotfiles row with counts not found in view", w)
+		}
+	}
+}
+
+func TestExactUserScreenshotLayout(t *testing.T) {
+	widths := []int{80, 100, 120, 140, 160}
+	for _, w := range widths {
+		m := newTestModel("/Users/seankoji/repos", "seankoji-com")
+		m.Width = w
+		m.Height = 35
+		m.ActiveFocus = FocusRepos
+		m.IsOrgSyncing = false
+		m.SelectedIndex = 0
+		m.Repos = []*git.RepoItem{
+			{Name: ".dotfiles", CurrentBranch: "fix/allow-zen-cleanup", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 7, HasLoadedCounts: true},
+			{Name: "carey-family", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "carey-finance", CurrentBranch: "master", Status: git.StatusPending, OpenPRsCount: 4, OpenIssuesCount: 12, HasLoadedCounts: true},
+			{Name: "careynas.net", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 2, OpenIssuesCount: 1, HasLoadedCounts: true},
+			{Name: "claude-plugins", CurrentBranch: "master", Status: git.StatusPending, OpenPRsCount: 2, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "crabbie", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "croo2", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "freshen", CurrentBranch: "feat/complete-oss-readiness", Status: git.StatusPending, OpenPRsCount: 1, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "frugalbar", CurrentBranch: "", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "github", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 1, HasLoadedCounts: true},
+			{Name: "gnrl", CurrentBranch: "master", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "homebrew-tap", CurrentBranch: "", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "kayo-watch", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 0, HasLoadedCounts: true},
+			{Name: "kumon-automation", CurrentBranch: "main", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 4, HasLoadedCounts: true},
+			{Name: "mecha-madhu", CurrentBranch: "master", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 3, HasLoadedCounts: true},
+		}
+
+		view := m.View()
+		lines := strings.Split(view, "\n")
+
+		if len(lines) > m.Height {
+			t.Errorf("Width %d: line count %d exceeds height %d", w, len(lines), m.Height)
+		}
+
+		for i, line := range lines {
+			lineWidth := lipgloss.Width(line)
+			if lineWidth > w {
+				t.Errorf("Width %d Line %d: rendered width %d exceeds window width %d: %q", w, i, lineWidth, w, line)
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "7" || trimmed == "12" || trimmed == "4" || trimmed == "1" || trimmed == "3" {
+				t.Errorf("Width %d Line %d: detected orphan wrapped number %q in view:\n%s", w, i, trimmed, view)
+			}
+		}
+
+		// Verify row 0 contains both the branch and the issue count 7 on the same line
+		foundDotfiles := false
+		for _, line := range lines {
+			if strings.Contains(line, ".dotf") {
+				foundDotfiles = true
+				if !strings.Contains(line, "7") {
+					t.Errorf("Width %d: .dotfiles row missing issue count 7 on the same line: %q", w, line)
+				}
+			}
+		}
+		if !foundDotfiles {
+			t.Errorf("Width %d: .dotfiles row not found in view", w)
+		}
+	}
+}
+
+func TestInteractiveLayoutTransitions(t *testing.T) {
+	m := newTestModel("/Users/seankoji/repos", "seankoji-com")
+	m.Width = 100
+	m.Height = 30
+	m.IsOrgSyncing = false
+	m.Repos = []*git.RepoItem{
+		{Name: ".dotfiles", CurrentBranch: "fix/allow-zen-cleanup", Status: git.StatusPending, OpenPRsCount: 0, OpenIssuesCount: 7, HasLoadedCounts: true},
+		{Name: "carey-finance", CurrentBranch: "master", Status: git.StatusPending, OpenPRsCount: 4, OpenIssuesCount: 12, HasLoadedCounts: true},
+	}
+	m.Runners = []*jobs.RunnerItem{
+		{ID: "r1", Name: "alpha-runner", Status: jobs.RunnerRunning, Tags: []string{"self-hosted"}},
+	}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#10", Name: "freshen / test", Status: jobs.JobRunning, RunnerName: "alpha-runner"},
+	}
+
+	keys := []string{"j", "j", "w", "w", "w", "tab", "shift+tab", "1", "2", "3", "4", "right", "left", "k"}
+	for _, k := range keys {
+		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		m = newM.(Model)
+
+		view := m.View()
+		lines := strings.Split(view, "\n")
+		if len(lines) > m.Height {
+			t.Errorf("After key %q: total lines %d exceeds terminal height %d", k, len(lines), m.Height)
+		}
+		for i, line := range lines {
+			if lipgloss.Width(line) > m.Width {
+				t.Errorf("After key %q Line %d: width %d exceeds %d", k, i, lipgloss.Width(line), m.Width)
+			}
+		}
+	}
+
+	// Window resize event
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = newM.(Model)
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > m.Height {
+		t.Errorf("After resize: total lines %d exceeds terminal height %d", len(lines), m.Height)
+	}
+	for i, line := range lines {
+		if lipgloss.Width(line) > m.Width {
+			t.Errorf("After resize Line %d: width %d exceeds %d", i, lipgloss.Width(line), m.Width)
 		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
@@ -186,7 +187,7 @@ var (
 	cellNameStyle       = lipgloss.NewStyle().Width(20)
 	cellBranchStyle     = lipgloss.NewStyle().Width(20)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
-	cellIssuesStyle     = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
+	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
 
 	// Pre-compiled regex for highlightLogLine (package level to avoid re-compiling on every call)
 	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
@@ -1620,6 +1621,7 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	rightWidth := msg.Width - leftWidth - 2
 	m.Viewport.Width = rightWidth - 4
 	m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
+	m.updateViewport()
 }
 
 // processJobQueueUpdate processes a freshly loaded job queue, comparing to the
@@ -2448,7 +2450,8 @@ func (m Model) View() string {
 
 	// clipLine clips a rendered line to the inner pane width, preventing terminal wrapping
 	clipLine := func(line string) string {
-		return lipgloss.NewStyle().MaxWidth(paneInnerWidth).Render(line)
+		firstLine := strings.Split(line, "\n")[0]
+		return ansi.Truncate(firstLine, paneInnerWidth, "")
 	}
 	// sliceLines clips a slice to at most n lines (prevents .Height(N) from overflowing)
 	sliceLines := func(lines []string, n int) []string {
@@ -2466,14 +2469,14 @@ func (m Model) View() string {
 
 	// Render Details Viewport (Right)
 	// logBoxStyle has Border (1+1) + Padding (1+1) = 4 chars horizontal overhead.
-	// Passing rightWidth - 4 makes the outer rendered width equal to rightWidth.
+	// Width(rightWidth - 2) gives content width (rightWidth - 4) and outer width rightWidth.
 	rightInnerWidth := rightWidth - 4
 	if rightInnerWidth < 20 {
 		rightInnerWidth = 20
 	}
 
 	rightPane := logBoxStyle.
-		Width(rightInnerWidth).
+		Width(rightWidth - 2).
 		Height(rightBoxHeight).
 		Render(m.Viewport.View())
 
@@ -2519,22 +2522,22 @@ func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, cl
 
 	// Fixed columns & overhead:
 	// Row prefix: 2 chars ("> " or "  ")
-	// Status icon: 2 chars ("✓ ")
+	// Status icon: 2 chars ("• " or "󰄬 ")
 	// Spaces: 3 chars (between name/branch, branch/prs, prs/issues)
 	// PRs column: 4 chars
-	// ISS column: 4 chars
-	// Total overhead = 2 + 2 + 3 + 4 + 4 = 15 chars
-	availRepoW := paneInnerWidth - 15
-	if availRepoW < 16 {
-		availRepoW = 16
+	// ISSUES column: 6 chars
+	// Total overhead = 2 + 2 + 3 + 4 + 6 = 17 chars
+	availRepoW := paneInnerWidth - 17
+	if availRepoW < 14 {
+		availRepoW = 14
 	}
 	repoNameW := (availRepoW * 45) / 100
-	if repoNameW < 8 {
-		repoNameW = 8
+	if repoNameW < 7 {
+		repoNameW = 7
 	}
 	branchW := availRepoW - repoNameW
-	if branchW < 8 {
-		branchW = 8
+	if branchW < 7 {
+		branchW = 7
 	}
 
 	dynCellNameStyle := lipgloss.NewStyle().Width(repoNameW)
@@ -2542,10 +2545,10 @@ func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, cl
 
 	repoHeader := fmt.Sprintf("  %s%s %s %s %s",
 		cellStatusIconStyle.Render(""),
-		dynCellNameStyle.Bold(true).Foreground(colorPrimary).Render("REPOSITORY"),
-		dynCellBranchStyle.Bold(true).Foreground(colorPrimary).Render("BRANCH"),
+		dynCellNameStyle.Bold(true).Foreground(colorPrimary).Render(truncateString("REPOSITORY", repoNameW)),
+		dynCellBranchStyle.Bold(true).Foreground(colorPrimary).Render(truncateString("BRANCH", branchW)),
 		cellPRsStyle.Bold(true).Foreground(colorPrimary).Render("PRs"),
-		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISS"),
+		cellIssuesStyle.Bold(true).Foreground(colorPrimary).Render("ISSUES"),
 	)
 	repoLines = append(repoLines, clipLine(repoHeader))
 	repoLines = append(repoLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
@@ -2571,8 +2574,24 @@ func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, cl
 
 		for i := startIdx; i < endIdx; i++ {
 			item := m.Repos[i]
-			statusIconStr := cellStatusIconStyle.Render(m.renderStatusBadge(item))
-			nameCell := dynCellNameStyle.Render(truncateString(item.Name, repoNameW))
+			isSelected := m.ActiveFocus == FocusRepos && i == m.SelectedIndex
+
+			nameStyle := dynCellNameStyle
+			branchBaseStyle := dynCellBranchStyle
+			prsStyle := cellPRsStyle
+			issuesStyle := cellIssuesStyle
+			statusIconStyle := cellStatusIconStyle
+
+			if isSelected {
+				nameStyle = nameStyle.Background(lipgloss.Color("#313244"))
+				branchBaseStyle = branchBaseStyle.Background(lipgloss.Color("#313244"))
+				prsStyle = prsStyle.Background(lipgloss.Color("#313244"))
+				issuesStyle = issuesStyle.Background(lipgloss.Color("#313244"))
+				statusIconStyle = statusIconStyle.Background(lipgloss.Color("#313244"))
+			}
+
+			statusIconStr := statusIconStyle.Render(m.renderStatusBadge(item))
+			nameCell := nameStyle.Render(truncateString(item.Name, repoNameW))
 
 			branchStr := item.CurrentBranch
 			if branchStr == "" {
@@ -2597,29 +2616,33 @@ func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, cl
 				branchStyle = lipgloss.NewStyle().Foreground(colorGreen).Bold(true)
 			}
 
-			branchCell := dynCellBranchStyle.Render(branchStyle.Render(displayText))
+			if isSelected {
+				branchStyle = branchStyle.Background(lipgloss.Color("#313244"))
+			}
+
+			branchCell := branchBaseStyle.Render(branchStyle.Render(displayText))
 
 			var prsCell string
 			if !item.HasLoadedCounts && !item.HasLoadedPRs {
-				prsCell = cellPRsStyle.Foreground(colorMuted).Render("?")
+				prsCell = prsStyle.Foreground(colorMuted).Render("?")
 			} else if item.OpenPRsCount > 0 {
-				prsCell = cellPRsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
+				prsCell = prsStyle.Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d", item.OpenPRsCount))
 			} else {
-				prsCell = cellPRsStyle.Foreground(colorMuted).Render("—")
+				prsCell = prsStyle.Foreground(colorMuted).Render("—")
 			}
 
 			var issuesCell string
 			if !item.HasLoadedCounts && !item.HasLoadedIssues {
-				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("?")
+				issuesCell = issuesStyle.Foreground(colorMuted).Render("?")
 			} else if item.OpenIssuesCount > 0 {
-				issuesCell = cellIssuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
+				issuesCell = issuesStyle.Foreground(colorBlue).Bold(true).Render(fmt.Sprintf("%d", item.OpenIssuesCount))
 			} else {
-				issuesCell = cellIssuesStyle.Foreground(colorMuted).Render("—")
+				issuesCell = issuesStyle.Foreground(colorMuted).Render("—")
 			}
 
 			line := fmt.Sprintf("%s%s %s %s %s", statusIconStr, nameCell, branchCell, prsCell, issuesCell)
 
-			if m.ActiveFocus == FocusRepos && i == m.SelectedIndex {
+			if isSelected {
 				repoLines = append(repoLines, clipLine(selectedRowStyle.Render("> "+line)))
 			} else {
 				repoLines = append(repoLines, clipLine(normalRowStyle.Render("  "+line)))
@@ -2632,7 +2655,7 @@ func (m Model) renderReposPanel(leftWidth, paneInnerWidth, repoBoxHeight int, cl
 		repoStyle = borderFocusedStyle
 	}
 	return repoStyle.
-		Width(leftWidth).
+		Width(leftWidth - 2).
 		Height(repoBoxHeight).
 		Render(strings.Join(sliceLines(repoLines, repoBoxHeight), "\n"))
 }
@@ -2718,7 +2741,7 @@ func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight in
 		runnerStyle = borderFocusedStyle
 	}
 	return runnerStyle.
-		Width(leftWidth).
+		Width(leftWidth - 2).
 		Height(runnersBoxHeight).
 		Render(strings.Join(sliceLines(runnerLines, runnersBoxHeight), "\n"))
 }
@@ -2744,8 +2767,8 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 		jobHeaderSpinner = " " + m.Spinner.View()
 	}
 	jobHeader := fmt.Sprintf(" %s %s%s%s", iconQueue, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("OVERALL JOB QUEUE"), jobHeaderSpinner, lipgloss.NewStyle().Foreground(colorSecondary).Render(countsStr))
-	jobsLines = append(jobsLines, jobHeader)
-	jobsLines = append(jobsLines, lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth)))
+	jobsLines = append(jobsLines, clipLine(jobHeader))
+	jobsLines = append(jobsLines, clipLine(lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", paneInnerWidth))))
 
 	if len(m.JobQueue) == 0 {
 		if m.IsJobQueueLoading || m.IsOrgSyncing {
@@ -2900,7 +2923,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 		jobsStyle = borderFocusedStyle
 	}
 	return jobsStyle.
-		Width(leftWidth).
+		Width(leftWidth - 2).
 		Height(jobsBoxHeight).
 		Render(strings.Join(sliceLines(jobsLines, jobsBoxHeight), "\n"))
 }
@@ -2921,13 +2944,7 @@ func (m Model) renderFooter() string {
 	} else if lipgloss.Width(footerText) > m.Width {
 		footerText = truncateString(footerText, m.Width)
 	}
-
-	footer := lipgloss.NewStyle().Foreground(colorMuted).MaxWidth(m.Width).Render(footerText)
-	footerLines := strings.Split(footer, "\n")
-	if len(footerLines) > 0 {
-		footer = footerLines[0]
-	}
-	return footer
+	return footerText
 }
 
 func (m Model) renderStatusBadge(item *git.RepoItem) string {
@@ -2968,13 +2985,14 @@ func isRunnerPermissionError(err error) bool {
 }
 
 func truncateString(str string, maxLen int) string {
-	if len(str) <= maxLen {
+	runes := []rune(str)
+	if len(runes) <= maxLen {
 		return str
 	}
 	if maxLen <= 3 {
-		return str[:maxLen]
+		return string(runes[:maxLen])
 	}
-	return str[:maxLen-3] + "..."
+	return string(runes[:maxLen-3]) + "..."
 }
 
 func parseJobHierarchy(fullName, repo string) (runName, jobName string) {
