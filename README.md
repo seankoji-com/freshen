@@ -26,7 +26,9 @@
 
 ## 🚀 Installation & Distribution
 
-### Homebrew (Recommended)
+### macOS & Linux (Homebrew / Linuxbrew)
+
+Install via the official [seankoji-com Homebrew tap](https://github.com/seankoji-com/homebrew-tap):
 
 ```bash
 brew install seankoji-com/tap/freshen
@@ -34,9 +36,23 @@ brew install seankoji-com/tap/freshen
 
 *(Or tap first: `brew tap seankoji-com/tap && brew install freshen`)*
 
-### Direct Download & Build from Source
+### Windows (winget)
 
-Prebuilt cross-platform binaries (macOS & Linux, ARM64 & AMD64) are available on [GitHub Releases](https://github.com/seankoji-com/freshen/releases).
+Install via the Windows Package Manager:
+
+```powershell
+# Install from repository manifest
+winget install --manifest manifests/SeanKoji.Freshen.yaml
+
+# Or once indexed in winget-pkgs
+winget install SeanKoji.Freshen
+```
+
+### Prebuilt Binaries & Direct Download
+
+Prebuilt release archives for **macOS (ARM64 / Intel)**, **Linux (ARM64 / x86_64)**, and **Windows (ARM64 / x64)** are published on [GitHub Releases](https://github.com/seankoji-com/freshen/releases).
+
+### Build from Source
 
 ```bash
 git clone https://github.com/seankoji-com/freshen.git
