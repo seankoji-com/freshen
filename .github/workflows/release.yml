@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.1.0)'
+        description: 'Tag to release (e.g. v0.1.1)'
         required: true
-        default: 'v0.1.0'
+        default: 'v0.1.1'
 
 permissions:
   contents: write
@@ -44,7 +44,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build binaries
+      - name: Install zip
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Build Unix archives (macOS and Linux)
         run: |
           mkdir -p dist
           VERSION="${{ steps.version.outputs.version }}"
@@ -65,8 +68,25 @@ jobs:
             tar -czvf "$TARBALL" -C "dist" "freshen_${VERSION}_${GOOS}_${GOARCH}"
           done
 
+      - name: Build Windows archives
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          WIN_ARCHS=("amd64" "arm64")
+
+          for ARCH in "${WIN_ARCHS[@]}"; do
+            OUTPUT_DIR="dist/freshen_${VERSION}_windows_${ARCH}"
+            mkdir -p "$OUTPUT_DIR"
+            
+            GOOS=windows GOARCH=$ARCH go build -ldflags "-X main.Version=${VERSION}" -o "${OUTPUT_DIR}/freshen.exe" .
+            cp LICENSE README.md "$OUTPUT_DIR/"
+            
+            (cd dist && zip -r "freshen_${VERSION}_windows_${ARCH}.zip" "freshen_${VERSION}_windows_${ARCH}")
+          done
+
+      - name: Generate Checksums
+        run: |
           cd dist
-          shasum -a 256 *.tar.gz > checksums.txt
+          shasum -a 256 *.tar.gz *.zip > checksums.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -75,6 +95,7 @@ jobs:
           name: ${{ steps.version.outputs.tag }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/checksums.txt
           draft: false
           prerelease: false
