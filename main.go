@@ -47,6 +47,26 @@ func (a *aliasFlags) Set(value string) error {
 	return nil
 }
 
+func applyConfigAliases(aliases []string) error {
+	for _, alias := range aliases {
+		local, remote, ok := strings.Cut(alias, "=")
+		if !ok {
+			return fmt.Errorf("invalid alias %q, expected local=remote", alias)
+		}
+		if err := git.AddAlias(local, remote); err != nil {
+			return fmt.Errorf("invalid alias %q: %w", alias, err)
+		}
+	}
+	return nil
+}
+
+func configConcurrency(value int) int {
+	if value > 0 {
+		return value
+	}
+	return 4
+}
+
 // validatePrerequisites checks that freshen has access to required tools.
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
 // Both the git-on-PATH check and the gh auth check are skipped if versionFlag
@@ -105,6 +125,10 @@ func main() {
 	if cfg.Workspace != "" {
 		defaultReposDir = cfg.Workspace
 	}
+	if err := applyConfigAliases(cfg.Aliases); err != nil {
+		fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+		os.Exit(1)
+	}
 	defaultOwner := cfg.Owner
 	if value := os.Getenv("FRESHEN_OWNER"); value != "" {
 		defaultOwner = value
@@ -116,7 +140,7 @@ func main() {
 	flag.StringVar(&dirFlag, "dir", defaultReposDir, "Target directory containing repository subfolders")
 	flag.StringVar(&ownerFlag, "owner", defaultOwner, "Optional GitHub user or organization")
 	flag.StringVar(&orgFlag, "org", "", "Deprecated alias for --owner")
-	flag.IntVar(&concurrencyFlag, "concurrency", 4, "Number of concurrent repository sync operations")
+	flag.IntVar(&concurrencyFlag, "concurrency", configConcurrency(cfg.Concurrency), "Number of concurrent repository sync operations")
 	flag.BoolVar(&nonInteractiveFlag, "non-interactive", false, "Run in non-interactive terminal batch mode")
 	flag.BoolVar(&nonInteractiveFlag, "y", false, "Run in non-interactive terminal batch mode (shorthand)")
 	flag.BoolVar(&versionFlag, "version", false, "Show freshen version")

@@ -143,6 +143,14 @@ Workspace-only mode requires `git` and never calls GitHub. GitHub features requi
 
 Release binaries are published for macOS, Linux, and Windows with `checksums.txt`. Homebrew/Linuxbrew and winget manifests are generated from tagged releases; their upstream publication may require a maintainer submission. Verify checksums before installing binaries manually.
 
+To publish a release, push a version tag such as `v1.0.0`. The release workflow
+builds the supported OS and architecture combinations, uploads archives and
+checksums to GitHub Releases, and updates the configured Homebrew tap when the
+repository token has write access to that tap. Winget publication is a separate
+upstream submission: update the version, URLs, installer hashes, and license in
+`manifests/SeanKoji.Freshen.yaml`, validate it with `winget validate`, then open
+the corresponding pull request in `microsoft/winget-pkgs`.
+
 ---
 
 ## 🛠️ Built With
