@@ -1,5 +1,9 @@
 # freshen 🍃
 
+<p align="center">
+  <img src="docs/assets/freshen-screenshot.png" alt="freshen Terminal UI Screenshot" width="720">
+</p>
+
 **freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
 
 > **Contributing?** See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, build/test commands, and the CI-critical `scripts/` directory.
@@ -20,10 +24,40 @@
 
 ---
 
-## 🚀 Installation & Building
+## 🚀 Installation & Distribution
+
+### macOS & Linux (Homebrew / Linuxbrew)
+
+Install via the official [seankoji-com Homebrew tap](https://github.com/seankoji-com/homebrew-tap):
 
 ```bash
-go install github.com/seankoji-com/freshen@latest
+brew install seankoji-com/tap/freshen
+```
+
+*(Or tap first: `brew tap seankoji-com/tap && brew install freshen`)*
+
+### Windows (winget)
+
+Install via the Windows Package Manager:
+
+```powershell
+# Install from repository manifest
+winget install --manifest manifests/SeanKoji.Freshen.yaml
+
+# Or once indexed in winget-pkgs
+winget install SeanKoji.Freshen
+```
+
+### Prebuilt Binaries & Direct Download
+
+Prebuilt release archives for **macOS (ARM64 / Intel)**, **Linux (ARM64 / x86_64)**, and **Windows (ARM64 / x64)** are published on [GitHub Releases](https://github.com/seankoji-com/freshen/releases).
+
+### Build from Source
+
+```bash
+git clone https://github.com/seankoji-com/freshen.git
+cd freshen
+go build -o freshen main.go
 ```
 
 ---
@@ -84,7 +118,7 @@ freshen -dir ~/repos -owner octocat
 freshen -y
 
 # Display version
-./freshen -v
+freshen -v
 ```
 
 ### Logs

@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.9.0.schema.json
+PackageIdentifier: SeanKoji.Freshen
+PackageVersion: 0.1.1
+PackageName: freshen
+Publisher: Sean Koji
+PublisherUrl: https://github.com/seankoji-com
+PackageUrl: https://github.com/seankoji-com/freshen
+License: MIT
+LicenseUrl: https://github.com/seankoji-com/freshen/blob/main/LICENSE
+ShortDescription: High-performance interactive TUI dashboard for multi-repo git management and sync
+Moniker: freshen
+Tags:
+  - git
+  - tui
+  - cli
+InstallerType: zip
+NestedInstallerType: portable
+Installers:
+  - Architecture: x64
+    NestedInstallerFiles:
+      - RelativeFilePath: freshen_0.1.1_windows_amd64/freshen.exe
+        PortableCommandAlias: freshen
+    InstallerUrl: https://github.com/seankoji-com/freshen/releases/download/v0.1.1/freshen_0.1.1_windows_amd64.zip
+    InstallerSha256: 8a5e4413653c575b06a114ade3b51a74a736e226d30d8415f7b5c9d66ef17354
+  - Architecture: arm64
+    NestedInstallerFiles:
+      - RelativeFilePath: freshen_0.1.1_windows_arm64/freshen.exe
+        PortableCommandAlias: freshen
+    InstallerUrl: https://github.com/seankoji-com/freshen/releases/download/v0.1.1/freshen_0.1.1_windows_arm64.zip
+    InstallerSha256: 20327c2f886062e0b1a469c7c7d397efbc46745b886a3fe47bb1ee880755eed9
+ManifestType: singleton
+ManifestVersion: 1.9.0
