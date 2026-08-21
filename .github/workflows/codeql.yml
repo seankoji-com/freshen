@@ -1,8 +1,5 @@
 name: CodeQL analysis
 
-# CodeQL runs on GitHub-hosted runners and uploads findings to code scanning.
-# Go uses autobuild because CodeQL requires a build for this language.
-
 on:
   push:
     branches: [main, master]
@@ -16,6 +13,7 @@ on:
 permissions:
   contents: read
   actions: read
+  security-events: write
 
 jobs:
   analyze:
