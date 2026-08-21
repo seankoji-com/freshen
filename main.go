@@ -36,9 +36,9 @@ type aliasFlags []string
 func (a *aliasFlags) String() string { return strings.Join(*a, ",") }
 
 func (a *aliasFlags) Set(value string) error {
-	local, remote, ok := strings.Cut(value, "=")
-	if !ok || local == "" || remote == "" {
-		return fmt.Errorf("invalid --alias value %q, expected local=remote", value)
+	local, remote, err := parseAlias(value)
+	if err != nil {
+		return fmt.Errorf("invalid --alias value %q: %w", value, err)
 	}
 	if err := git.AddAlias(local, remote); err != nil {
 		return fmt.Errorf("invalid --alias value %q: %w", value, err)
@@ -47,11 +47,21 @@ func (a *aliasFlags) Set(value string) error {
 	return nil
 }
 
+func parseAlias(value string) (string, string, error) {
+	local, remote, ok := strings.Cut(value, "=")
+	local = strings.TrimSpace(local)
+	remote = strings.TrimSpace(remote)
+	if !ok || local == "" || remote == "" {
+		return "", "", fmt.Errorf("expected local=remote")
+	}
+	return local, remote, nil
+}
+
 func applyConfigAliases(aliases []string) error {
 	for _, alias := range aliases {
-		local, remote, ok := strings.Cut(alias, "=")
-		if !ok {
-			return fmt.Errorf("invalid alias %q, expected local=remote", alias)
+		local, remote, err := parseAlias(alias)
+		if err != nil {
+			return fmt.Errorf("invalid alias %q: %w", alias, err)
 		}
 		if err := git.AddAlias(local, remote); err != nil {
 			return fmt.Errorf("invalid alias %q: %w", alias, err)
@@ -125,10 +135,6 @@ func main() {
 	if cfg.Workspace != "" {
 		defaultReposDir = cfg.Workspace
 	}
-	if err := applyConfigAliases(cfg.Aliases); err != nil {
-		fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
-		os.Exit(1)
-	}
 	defaultOwner := cfg.Owner
 	if value := os.Getenv("FRESHEN_OWNER"); value != "" {
 		defaultOwner = value
@@ -153,6 +159,10 @@ func main() {
 	if versionFlag {
 		fmt.Printf("freshen v%s\n", Version)
 		os.Exit(0)
+	}
+	if err := applyConfigAliases(cfg.Aliases); err != nil {
+		fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+		os.Exit(1)
 	}
 	if orgFlag != "" {
 		ownerFlag = orgFlag

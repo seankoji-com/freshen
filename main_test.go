@@ -16,13 +16,15 @@ func TestConfigConcurrency(t *testing.T) {
 }
 
 func TestApplyConfigAliases(t *testing.T) {
-	if err := applyConfigAliases([]string{"config-local=config-remote"}); err != nil {
+	if err := applyConfigAliases([]string{" config-local = config-remote "}); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := git.GetLocalDirName("config-remote"); !ok || got != "config-local" {
 		t.Fatalf("GetLocalDirName(config-remote) = %q, %v", got, ok)
 	}
-	if err := applyConfigAliases([]string{"bad alias"}); err == nil {
-		t.Fatal("applyConfigAliases accepted an invalid alias")
+	for _, alias := range []string{"bad alias", "=remote", "local="} {
+		if err := applyConfigAliases([]string{alias}); err == nil {
+			t.Fatalf("applyConfigAliases accepted invalid alias %q", alias)
+		}
 	}
 }

@@ -146,7 +146,10 @@ Release binaries are published for macOS, Linux, and Windows with `checksums.txt
 To publish a release, push a version tag such as `v1.0.0`. The release workflow
 builds the supported OS and architecture combinations, uploads archives and
 checksums to GitHub Releases, and updates the configured Homebrew tap when the
-repository token has write access to that tap. Winget publication is a separate
+repository token has write access to that tap. Configure a dedicated
+`HOMEBREW_TAP_GITHUB_TOKEN` repository secret with write access to
+`seankoji-com/homebrew-tap`; the default `GITHUB_TOKEN` cannot write to that
+separate repository. Winget publication is a separate
 upstream submission: update the version, URLs, installer hashes, and license in
 `manifests/SeanKoji.Freshen.yaml`, validate it with `winget validate`, then open
 the corresponding pull request in `microsoft/winget-pkgs`.
