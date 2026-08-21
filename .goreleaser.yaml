@@ -1,0 +1,18 @@
+version: 2
+builds:
+  - main: .
+    binary: freshen
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+archives:
+  - format_overrides:
+      - goos: windows
+        format: zip
+checksum:
+  name_template: checksums.txt
+brews:
+  - repository:
+      owner: seankoji-com
+      name: homebrew-tap
+    homepage: https://github.com/seankoji-com/freshen
+    description: TUI for refreshing sibling Git repositories

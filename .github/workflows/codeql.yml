@@ -53,29 +53,5 @@ jobs:
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v4
         with:
-          # Do not upload to code scanning (needs paid Code Security on private
-          # repos). SARIF is written to `output` and archived below instead.
-          upload: never
-          output: sarif-results
+          upload: true
           category: "/language:${{ matrix.language }}"
-
-      - name: Upload SARIF artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: codeql-sarif-${{ matrix.language }}
-          path: sarif-results
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: Findings summary
-        shell: bash
-        run: |
-          sarif="$(find sarif-results -name '*.sarif' -print -quit 2>/dev/null)"
-          if [ -n "$sarif" ]; then
-            total="$(jq '[.runs[].results[]] | length' "$sarif" 2>/dev/null || echo 0)"
-            echo "### CodeQL findings (${{ matrix.language }}): ${total}" >> "$GITHUB_STEP_SUMMARY"
-            jq -r '[.runs[].results[] | .level] | group_by(.) | map("\(.[0]): \(length)") | join(", ")' "$sarif" 2>/dev/null | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
-            echo "- SARIF artifact: codeql-sarif-${{ matrix.language }}" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### CodeQL (${{ matrix.language }}): no SARIF produced" >> "$GITHUB_STEP_SUMMARY"
-          fi

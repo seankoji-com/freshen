@@ -149,9 +149,9 @@ func (d BranchWorktreeDetails) GetRemoteBranches() []string {
 	return remote
 }
 
-type GraphQLOrgResponse struct {
+type GraphQLOwnerResponse struct {
 	Data struct {
-		Organization struct {
+		RepositoryOwner struct {
 			Repositories struct {
 				Nodes []struct {
 					Name   string `json:"name"`
@@ -163,7 +163,7 @@ type GraphQLOrgResponse struct {
 					} `json:"pullRequests"`
 				} `json:"nodes"`
 			} `json:"repositories"`
-		} `json:"organization"`
+		} `json:"repositoryOwner"`
 	} `json:"data"`
 }
 
@@ -317,19 +317,19 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
 func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
-	query := fmt.Sprintf(`query { organization(login: "%s") { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, org, graphQLRepoLimit)
-	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
+	query := fmt.Sprintf(`query($login: String!) { repositoryOwner(login: $login) { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, graphQLRepoLimit)
+	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query), "-F", fmt.Sprintf("login=%s", org))
 	if err != nil {
 		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
 	}
 
-	var resp GraphQLOrgResponse
+	var resp GraphQLOwnerResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
 		return nil, err
 	}
 
 	result := make(map[string]RepoCounts)
-	for _, node := range resp.Data.Organization.Repositories.Nodes {
+	for _, node := range resp.Data.RepositoryOwner.Repositories.Nodes {
 		result[node.Name] = RepoCounts{
 			Issues: node.Issues.TotalCount,
 			PRs:    node.PullRequests.TotalCount,
@@ -976,8 +976,43 @@ func CloneRepo(org, ghRepoName, targetPath string) error {
 }
 
 // DeleteLocalRepo removes the local directory for an archived repository.
-func DeleteLocalRepo(path string) error {
+func DeleteLocalRepo(workspace, path string) error {
+	if err := ValidateWorkspacePath(workspace, path); err != nil {
+		return err
+	}
 	return os.RemoveAll(path)
+}
+
+// ValidateWorkspacePath rejects paths outside workspace, including existing symlinks.
+func ValidateWorkspacePath(workspace, path string) error {
+	root, err := filepath.Abs(workspace)
+	if err != nil {
+		return err
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve workspace: %w", err)
+	}
+	target, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	} else if os.IsNotExist(err) {
+		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(target))
+		if parentErr != nil {
+			return fmt.Errorf("resolve target parent: %w", parentErr)
+		}
+		target = filepath.Join(parent, filepath.Base(target))
+	} else {
+		return fmt.Errorf("resolve target: %w", err)
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("refusing path outside workspace: %s", path)
+	}
+	return nil
 }
 
 // ScanLocalDirectory returns names of all direct subdirectories in target path.

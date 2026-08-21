@@ -4,7 +4,7 @@
   <img src="docs/assets/freshen-screenshot.png" alt="freshen Terminal UI Screenshot" width="720">
 </p>
 
-**freshen** is a high-performance, interactive TUI (Terminal User Interface) application built with [Go](https://go.dev) and [Bubble Tea](https://github.com/charmbracelet/bubbletea) to manage, synchronize, stash, pull, and clean up multi-repository setups across GitHub organizations.
+**freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
 
 > **Contributing?** See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, build/test commands, and the CI-critical `scripts/` directory.
 
@@ -14,7 +14,7 @@
 
 - **Concurrent Parallel Syncing**: Syncs 20+ repositories simultaneously in seconds using Go worker pools.
 - **Split-Pane TUI Dashboard**: Real-time status indicators on the left, live git/gh execution logs and PR links on the right.
-- **GitHub Organization Sync (`seankoji-com`)**: Automatically clones missing active org repositories and highlights archived repositories.
+- **Optional GitHub owner sync**: Automatically clones missing active repositories and highlights archived repositories.
 - **Alias Mappings**: Hardcoded mapping support for custom repo folder names (e.g. `.github` ➔ `github`, `careynas.net` ➔ `wiki.robot.house`).
 - **GitHub Actions Monitoring**: Live-polled runner and job-queue panels showing self-hosted runner status and in-flight/queued CI jobs, with per-job log streaming.
 - **Interactive Controls**:
@@ -111,14 +111,14 @@ Launch the TUI interface:
 ### Command Line Options
 
 ```bash
-# Specify custom target directory and GitHub org
-./freshen -dir ~/repos -org seankoji-com
+# Specify a workspace and GitHub user or organization
+freshen -dir ~/repos -owner octocat
 
-# Non-interactive CLI batch mode
-./freshen -y
+# Non-interactive sync; archived repositories are never deleted by default
+freshen -y
 
 # Display version
-./freshen -v
+freshen -v
 ```
 
 ### Logs
@@ -130,6 +130,18 @@ tail -f ~/Library/Caches/freshen/freshen.log
 ```
 
 Batch mode (`-y`) leaves logging on stderr.
+
+### First run, configuration, and GitHub access
+
+On first interactive launch, freshen asks for a sibling-repository workspace and an optional GitHub owner. Configuration is stored as `freshen/config.json` in the platform config directory; it contains no credentials. Flags override config, then `FRESHEN_OWNER` (or legacy `FRESHEN_ORG`) can supply an owner.
+
+Workspace-only mode requires `git` and never calls GitHub. GitHub features require an authenticated [GitHub CLI](https://cli.github.com/) (`gh auth login`) or `GH_TOKEN`. Use a token with access to the target repositories; organization runner visibility may require organization-admin or runner permissions.
+
+`d d` deletes an archived repository and `X` force-removes secondary worktrees and non-default branches. Review the selected workspace carefully. Batch deletion requires `--delete-archived`.
+
+### Releases
+
+Release binaries are published for macOS, Linux, and Windows with `checksums.txt`. Homebrew/Linuxbrew and winget manifests are generated from tagged releases; their upstream publication may require a maintainer submission. Verify checksums before installing binaries manually.
 
 ---
 
