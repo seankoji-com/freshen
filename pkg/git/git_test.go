@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -450,6 +451,9 @@ func TestDeleteLocalRepo(t *testing.T) {
 	t.Run("permission denied propagates as an error", func(t *testing.T) {
 		if os.Geteuid() == 0 {
 			t.Skip("running as root: permission checks are bypassed")
+		}
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows does not enforce directory-unlink permissions via Chmod")
 		}
 
 		dir := t.TempDir()
