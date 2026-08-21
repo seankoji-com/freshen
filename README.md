@@ -24,16 +24,24 @@
 
 ---
 
-## 🚀 Installation & Building
+## 🚀 Installation & Distribution
+
+### Homebrew (Recommended)
 
 ```bash
-cd ~/repos/freshen
+brew install seankoji-com/tap/freshen
+```
 
-# Build the binary
+*(Or tap first: `brew tap seankoji-com/tap && brew install freshen`)*
+
+### Direct Download & Build from Source
+
+Prebuilt cross-platform binaries (macOS & Linux, ARM64 & AMD64) are available on [GitHub Releases](https://github.com/seankoji-com/freshen/releases).
+
+```bash
+git clone https://github.com/seankoji-com/freshen.git
+cd freshen
 go build -o freshen main.go
-
-# (Optional) Install system-wide
-go install .
 ```
 
 ---
