@@ -17,6 +17,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/seankoji-com/freshen/pkg/config"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/tui"
 )
@@ -50,7 +51,7 @@ func (a *aliasFlags) Set(value string) error {
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
 // Both the git-on-PATH check and the gh auth check are skipped if versionFlag
 // is true (version printing needs nothing).
-func validatePrerequisites(versionFlag bool) {
+func validatePrerequisites(versionFlag, needsGitHub bool) {
 	// Skip all checks if printing version (it needs nothing)
 	if versionFlag {
 		return
@@ -63,6 +64,9 @@ func validatePrerequisites(versionFlag bool) {
 		os.Exit(1)
 	}
 
+	if !needsGitHub {
+		return
+	}
 	// Check for authenticated GitHub CLI, bounded so a hung network doesn't
 	// block indefinitely before any logging is configured.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -83,36 +87,64 @@ func main() {
 	var (
 		dirFlag            string
 		orgFlag            string
+		ownerFlag          string
 		concurrencyFlag    int
 		nonInteractiveFlag bool
 		versionFlag        bool
+		deleteArchivedFlag bool
 		aliasFlag          aliasFlags
 	)
 
 	homeDir, _ := os.UserHomeDir()
 	defaultReposDir := filepath.Join(homeDir, "repos")
-	defaultOrg := os.Getenv("FRESHEN_ORG")
-	if defaultOrg == "" {
-		defaultOrg = "seankoji-com"
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.Workspace != "" {
+		defaultReposDir = cfg.Workspace
+	}
+	defaultOwner := cfg.Owner
+	if value := os.Getenv("FRESHEN_OWNER"); value != "" {
+		defaultOwner = value
+	}
+	if value := os.Getenv("FRESHEN_ORG"); value != "" {
+		defaultOwner = value
 	}
 
 	flag.StringVar(&dirFlag, "dir", defaultReposDir, "Target directory containing repository subfolders")
-	flag.StringVar(&orgFlag, "org", defaultOrg, "Target GitHub Organization")
+	flag.StringVar(&ownerFlag, "owner", defaultOwner, "Optional GitHub user or organization")
+	flag.StringVar(&orgFlag, "org", "", "Deprecated alias for --owner")
 	flag.IntVar(&concurrencyFlag, "concurrency", 4, "Number of concurrent repository sync operations")
 	flag.BoolVar(&nonInteractiveFlag, "non-interactive", false, "Run in non-interactive terminal batch mode")
 	flag.BoolVar(&nonInteractiveFlag, "y", false, "Run in non-interactive terminal batch mode (shorthand)")
 	flag.BoolVar(&versionFlag, "version", false, "Show freshen version")
 	flag.BoolVar(&versionFlag, "v", false, "Show freshen version (shorthand)")
+	flag.BoolVar(&deleteArchivedFlag, "delete-archived", false, "Allow archived repository deletion in non-interactive mode")
 	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
 	flag.Parse()
-
-	validatePrerequisites(versionFlag)
 
 	if versionFlag {
 		fmt.Printf("freshen v%s\n", Version)
 		os.Exit(0)
 	}
+	if orgFlag != "" {
+		ownerFlag = orgFlag
+	}
+	if cfg.Workspace == "" && !nonInteractiveFlag && dirFlag == defaultReposDir {
+		cfg, err = runFirstSetup(defaultReposDir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+			os.Exit(1)
+		}
+		if ownerFlag == "" {
+			ownerFlag = cfg.Owner
+		}
+		defaultReposDir = cfg.Workspace
+	}
+	validatePrerequisites(false, ownerFlag != "")
 
 	targetDir := dirFlag
 	if targetDir == "" {
@@ -131,7 +163,7 @@ func main() {
 	defer stop()
 
 	if nonInteractiveFlag {
-		runNonInteractive(ctx, targetDir, orgFlag)
+		runNonInteractive(ctx, targetDir, ownerFlag, deleteArchivedFlag)
 		return
 	}
 
@@ -143,7 +175,7 @@ func main() {
 
 	var bgWG sync.WaitGroup
 	p := tea.NewProgram(
-		tui.NewModel(targetDir, orgFlag, concurrencyFlag, ctx, stop, &bgWG),
+		tui.NewModel(targetDir, ownerFlag, concurrencyFlag, ctx, stop, &bgWG),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
@@ -220,15 +252,22 @@ func waitForBackgroundWork(wg *sync.WaitGroup) {
 	}
 }
 
-func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
+func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteArchived bool) {
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("                   FRESHEN REPOSITORY WORKFLOW                        \n")
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("Target Directory: %s\n", targetDir)
-	fmt.Printf("Target Org:       %s\n\n", targetOrg)
+	fmt.Printf("GitHub Owner:     %s\n\n", targetOrg)
+	if targetOrg == "" {
+		fmt.Println("No GitHub owner configured; processing local repositories only.")
+	}
 
 	// Fetch org repos
-	orgRepos, err := git.FetchOrgRepos(targetOrg)
+	var orgRepos []git.GHRepoInfo
+	var err error
+	if targetOrg != "" {
+		orgRepos, err = git.FetchOrgRepos(targetOrg)
+	}
 	if err != nil {
 		fmt.Printf("Warning: failed to query GitHub org: %v\n", err)
 	}
@@ -244,10 +283,10 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string) {
 		}
 		localPath := filepath.Join(targetDir, localDir)
 
-		if ghRepo.IsArchived {
+		if ghRepo.IsArchived && deleteArchived {
 			if _, statErr := os.Stat(localPath); statErr == nil {
 				fmt.Printf("↳ Deleting local directory for archived repo '%s'...\n", localDir)
-				_ = git.DeleteLocalRepo(localPath)
+				_ = git.DeleteLocalRepo(targetDir, localPath)
 			}
 		} else {
 			if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {

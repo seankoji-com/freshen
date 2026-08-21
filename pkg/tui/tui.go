@@ -378,6 +378,9 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.TargetOrg == "" {
+		return tea.Batch(m.Spinner.Tick, m.loadOrgReposCmd(true), repoTickCmd())
+	}
 	return tea.Batch(
 		m.Spinner.Tick,
 		m.loadOrgReposCmd(true),
@@ -458,6 +461,20 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 
 func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 	return func() tea.Msg {
+		if m.TargetOrg == "" {
+			entries, err := git.ScanLocalDirectory(m.TargetDir)
+			if err != nil {
+				return orgSyncedMsg{err: err, autoSync: autoSync}
+			}
+			repos := make([]*git.RepoItem, 0, len(entries))
+			for _, name := range entries {
+				path := filepath.Join(m.TargetDir, name)
+				if git.IsGitRepo(path) {
+					repos = append(repos, &git.RepoItem{Name: name, Path: path, Status: git.StatusPending, Logs: []string{}})
+				}
+			}
+			return orgSyncedMsg{repos: repos, autoSync: false}
+		}
 		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
 		if err != nil {
 			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
@@ -728,8 +745,10 @@ func copyToClipboard(text string) error {
 			cmd = exec.Command("wl-copy")
 		} else if _, err := exec.LookPath("xclip"); err == nil {
 			cmd = exec.Command("xclip", "-selection", "clipboard")
-		} else {
+		} else if _, err := exec.LookPath("xsel"); err == nil {
 			cmd = exec.Command("xsel", "--clipboard", "--input")
+		} else {
+			return fmt.Errorf("no clipboard command found (install wl-clipboard, xclip, or xsel)")
 		}
 	}
 	cmd.Stdin = strings.NewReader(text)
@@ -1289,7 +1308,7 @@ func (m *Model) handleKeyDelete() {
 		if item.IsArchived {
 			if m.pendingDeletePath != "" && m.pendingDeletePath == item.Path {
 				m.pendingDeletePath = ""
-				if err := git.DeleteLocalRepo(item.Path); err != nil {
+				if err := git.DeleteLocalRepo(m.TargetDir, item.Path); err != nil {
 					m.setToast(fmt.Sprintf(" ⚠ Failed to delete '%s': %v", item.Name, err), 2)
 				} else {
 					deletedName := item.Name
