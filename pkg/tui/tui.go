@@ -367,8 +367,11 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
-		IsJobQueueLoading:   true,
-		IsRunnersLoading:    true,
+		// Runners and the job queue are only fetched when a GitHub owner is
+		// configured (see Init) — without one, these flags would never be
+		// cleared and their panels would show "Fetching..." forever.
+		IsJobQueueLoading: targetOrg != "",
+		IsRunnersLoading:  targetOrg != "",
 		Spinner:             s,
 		ProgressBar:         p,
 		Viewport:            vp,
@@ -1583,9 +1586,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true
-		m.updateViewport()
 		cmd = m.startSyncCmd(m.Repos, true)
 	}
+	m.updateViewport()
 	return cmd, false
 }
 

@@ -173,10 +173,22 @@ func main() {
 			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
 			os.Exit(1)
 		}
-		if ownerFlag == "" {
-			ownerFlag = cfg.Owner
-		}
 		defaultReposDir = cfg.Workspace
+	}
+	if ownerFlag == "" && !nonInteractiveFlag {
+		owner, err := runOwnerPrompt()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+			os.Exit(1)
+		}
+		if owner != "" {
+			ownerFlag = owner
+			cfg.Owner = owner
+			if err := config.Save(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+				os.Exit(1)
+			}
+		}
 	}
 	validatePrerequisites(false, ownerFlag != "")
 

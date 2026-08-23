@@ -24,9 +24,7 @@ func newSetupModel(defaultDir string) setupModel {
 	workspace.Placeholder = defaultDir
 	workspace.SetValue(defaultDir)
 	workspace.Focus()
-	owner := textinput.New()
-	owner.Placeholder = "Optional GitHub user or organization"
-	return setupModel{inputs: []textinput.Model{workspace, owner}}
+	return setupModel{inputs: []textinput.Model{workspace}}
 }
 
 func (m setupModel) Init() tea.Cmd { return textinput.Blink }
@@ -62,7 +60,7 @@ func (m setupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m setupModel) View() string {
-	return lipgloss.NewStyle().Padding(1, 2).Render("Freshen first-run setup\n\nWorkspace (sibling repositories):\n" + m.inputs[0].View() + "\n\nGitHub owner (optional; enables sync and Actions):\n" + m.inputs[1].View() + "\n\nEnter to save • Tab to switch • Esc to cancel")
+	return lipgloss.NewStyle().Padding(1, 2).Render("Freshen first-run setup\n\nWorkspace (sibling repositories):\n" + m.inputs[0].View() + "\n\nEnter to save • Esc to cancel")
 }
 
 func runFirstSetup(defaultDir string) (config.Config, error) {
@@ -81,6 +79,57 @@ func runFirstSetup(defaultDir string) (config.Config, error) {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return config.Config{}, err
 	}
-	c := config.Config{Workspace: workspace, Owner: strings.TrimSpace(m.inputs[1].Value()), Concurrency: 4}
+	c := config.Config{Workspace: workspace, Concurrency: 4}
 	return c, config.Save(c)
+}
+
+// ownerPromptModel asks for the GitHub owner on any boot where none is
+// configured. Unlike the workspace, an owner is never assumed or defaulted:
+// declining (Esc or blank Enter) just runs this session in local-only mode
+// without persisting anything, so the prompt reappears next launch.
+type ownerPromptModel struct {
+	input textinput.Model
+	done  bool
+	quit  bool
+}
+
+func newOwnerPromptModel() ownerPromptModel {
+	owner := textinput.New()
+	owner.Placeholder = "e.g. your-username or your-org"
+	owner.Focus()
+	return ownerPromptModel{input: owner}
+}
+
+func (m ownerPromptModel) Init() tea.Cmd { return textinput.Blink }
+func (m ownerPromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if key, ok := msg.(tea.KeyMsg); ok {
+		switch key.String() {
+		case "ctrl+c", "esc":
+			m.quit = true
+			return m, tea.Quit
+		case "enter":
+			m.done = true
+			return m, tea.Quit
+		}
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+func (m ownerPromptModel) View() string {
+	return lipgloss.NewStyle().Padding(1, 2).Render("No GitHub owner configured\n\nGitHub user or organization (enables sync, PRs/issues, Actions):\n" + m.input.View() + "\n\nEnter to continue • Esc to skip for this run")
+}
+
+// runOwnerPrompt asks for a GitHub owner and returns the trimmed value the
+// user entered, or "" if they skipped (Esc, Ctrl+C, or a blank Enter).
+func runOwnerPrompt() (string, error) {
+	p, err := tea.NewProgram(newOwnerPromptModel()).Run()
+	if err != nil {
+		return "", err
+	}
+	m := p.(ownerPromptModel)
+	if m.quit || !m.done {
+		return "", nil
+	}
+	return strings.TrimSpace(m.input.Value()), nil
 }
