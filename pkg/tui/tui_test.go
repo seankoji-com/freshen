@@ -624,7 +624,7 @@ func TestStartSyncCmdSkipsArchivedAndClones(t *testing.T) {
 
 	// Every candidate is archived, so the stream finishes immediately without
 	// starting a worker.
-	msg := m.startSyncCmd(m.Repos, true)()
+	msg := m.startSyncCmd(m.Repos, true, false)()
 	finished, ok := msg.(syncFinishedMsg)
 	if !ok || !finished.bulk {
 		t.Fatalf("expected a bulk syncFinishedMsg, got %#v", msg)
@@ -826,12 +826,12 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		}
 	})
 
-	t.Run("success with autoSync starts a parallel sync", func(t *testing.T) {
+	t.Run("success with autoSync starts a parallel sync restricted to safe actions", func(t *testing.T) {
 		orig := syncRepositoryFn
 		defer func() { syncRepositoryFn = orig }()
-		called := make(chan struct{}, 1)
-		syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
-			called <- struct{}{}
+		called := make(chan bool, 1) // carries the safeOnly arg it was invoked with
+		syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
+			called <- safeOnly
 		}
 
 		m := newTestModel("/tmp/test", "test-org")
@@ -848,7 +848,10 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		}
 
 		select {
-		case <-called:
+		case safeOnly := <-called:
+			if !safeOnly {
+				t.Error("the passive startup sync must call git.SyncRepository with safeOnly=true, so it never auto-switches or auto-rebases a feature branch")
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("expected syncRepositoryFn to be invoked for the loaded repo")
 		}
@@ -875,7 +878,7 @@ func TestStartSyncCmdSemaphoreCapsConcurrency(t *testing.T) {
 	const repoCount = 5 // one more than the concurrency limit (4)
 	started := make(chan struct{}, repoCount)
 	release := make(chan struct{})
-	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
 		started <- struct{}{}
 		<-release
 	}
@@ -887,7 +890,7 @@ func TestStartSyncCmdSemaphoreCapsConcurrency(t *testing.T) {
 	}
 	m.Repos = repos
 
-	cmd := m.startSyncCmd(m.Repos, true)
+	cmd := m.startSyncCmd(m.Repos, true, false)
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 
@@ -940,7 +943,7 @@ func TestStartSyncCmdContextCancellationStopsPendingWork(t *testing.T) {
 	const repoCount = 6 // more than the concurrency limit (4), so repos remain pending
 	started := make(chan struct{}, repoCount)
 	release := make(chan struct{}, repoCount)
-	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
 		started <- struct{}{}
 		<-release
 	}
@@ -952,7 +955,7 @@ func TestStartSyncCmdContextCancellationStopsPendingWork(t *testing.T) {
 	}
 	m.Repos = repos
 
-	cmd := m.startSyncCmd(m.Repos, true)
+	cmd := m.startSyncCmd(m.Repos, true, false)
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 

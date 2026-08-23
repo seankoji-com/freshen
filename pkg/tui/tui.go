@@ -92,6 +92,7 @@ var (
 	iconSwitch   = "󰁨"
 	iconTrash    = "🗑️"
 	iconPending  = "•"
+	iconSkipped  = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
 	iconCopy     = "󰅍"
 	iconWorktree = "󰉓"
 	iconRunner   = "🏃"
@@ -158,6 +159,9 @@ var (
 	badgeArchived = lipgloss.NewStyle().
 			Foreground(colorMuted).
 			Strikethrough(true)
+
+	badgeSkipped = lipgloss.NewStyle().
+			Foreground(colorMuted)
 
 	selectedRowStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("#313244")).
@@ -634,7 +638,7 @@ var syncRepositoryFn = git.SyncRepository
 // publishes owned snapshots. Only Update — which Bubble Tea runs on a single
 // goroutine — writes to m.Repos, so the render path never reads a struct while
 // a sync is writing to it.
-func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
+func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool, safeOnly bool) tea.Cmd {
 	// Clone here, on the update goroutine, before any worker exists.
 	work := make([]*git.RepoItem, 0, len(items))
 	for _, item := range items {
@@ -688,7 +692,7 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 					case snapshots <- snapshot:
 					case <-ctx.Done():
 					}
-				})
+				}, safeOnly)
 			}(r)
 		}
 
@@ -1159,7 +1163,7 @@ func (m *Model) handleKeySyncAll() tea.Cmd {
 	if !m.IsSyncing && len(m.Repos) > 0 {
 		m.IsSyncing = true
 		m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
-		cmd := m.startSyncCmd(m.Repos, true)
+		cmd := m.startSyncCmd(m.Repos, true, false)
 		m.updateViewport()
 		return cmd
 	}
@@ -1195,7 +1199,7 @@ func (m *Model) handleKeySync() tea.Cmd {
 	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 		item := m.Repos[m.SelectedIndex]
 		if !item.IsArchived {
-			cmd := m.startSyncCmd([]*git.RepoItem{item}, false)
+			cmd := m.startSyncCmd([]*git.RepoItem{item}, false, false)
 			m.updateViewport()
 			return cmd
 		}
@@ -1606,7 +1610,11 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true
-		cmd = m.startSyncCmd(m.Repos, true)
+		// safeOnly=true: this is the passive startup sync, not something the
+		// user directly asked for — never auto-switch a feature branch or
+		// auto-rebase it. [a] Sync All and [r] Sync are explicit commands
+		// and keep the full behavior (see startSyncCmd call sites above).
+		cmd = m.startSyncCmd(m.Repos, true, true)
 	}
 	m.updateViewport()
 	return cmd, false
@@ -2988,6 +2996,8 @@ func (m Model) renderStatusBadge(item *git.RepoItem) string {
 		return badgeError.Render(iconError)
 	case git.StatusArchived:
 		return badgeArchived.Render(iconTrash)
+	case git.StatusSkipped:
+		return badgeSkipped.Render(iconSkipped)
 	case git.StatusSyncing:
 		return m.Spinner.View()
 	default:

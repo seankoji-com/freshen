@@ -367,7 +367,9 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 			Logs:       make([]string, 0),
 		}
 
-		git.SyncRepository(ctx, item, nil)
+		// Explicit batch mode (--non-interactive/-y): keep today's full
+		// behavior, same as [a]/[r] in the interactive TUI.
+		git.SyncRepository(ctx, item, nil, false)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)

@@ -586,7 +586,7 @@ func TestSyncRepositoryPublishesOwnedSnapshots(t *testing.T) {
 
 	SyncRepository(context.Background(), item, func(snapshot *RepoItem) {
 		snapshots <- snapshot
-	})
+	}, false)
 	close(snapshots)
 
 	if seen := <-readerDone; seen < 2 {
@@ -604,7 +604,7 @@ func TestSyncRepositoryPublishesOwnedSnapshots(t *testing.T) {
 func TestSyncRepositoryWithoutProgress(t *testing.T) {
 	item := &RepoItem{Name: "probe", Path: newTestRepo(t), Logs: []string{}}
 
-	SyncRepository(context.Background(), item, nil)
+	SyncRepository(context.Background(), item, nil, false)
 
 	if len(item.Logs) == 0 {
 		t.Error("expected sync logs on the item")
@@ -622,7 +622,7 @@ func TestSyncRepositoryRespectsCancelledContext(t *testing.T) {
 	cancel()
 
 	published := 0
-	SyncRepository(ctx, item, func(*RepoItem) { published++ })
+	SyncRepository(ctx, item, func(*RepoItem) { published++ }, false)
 
 	if published != 0 || len(item.Logs) != 0 {
 		t.Errorf("cancelled sync did work anyway: %d snapshots, %d logs", published, len(item.Logs))
@@ -640,7 +640,7 @@ func TestSyncRepositoryClonesUnclonedRepo(t *testing.T) {
 		Logs: []string{},
 	}
 
-	SyncRepository(context.Background(), item, nil)
+	SyncRepository(context.Background(), item, nil, false)
 
 	if item.Status != StatusCloned {
 		t.Fatalf("expected status CLONED, got %s (logs: %v)", item.Status, item.Logs)
@@ -672,13 +672,60 @@ func TestSyncRepositoryUnclonedRepoWithoutTarget(t *testing.T) {
 		Logs: []string{},
 	}
 
-	SyncRepository(context.Background(), item, nil)
+	SyncRepository(context.Background(), item, nil, false)
 
 	if item.Status != StatusError {
 		t.Fatalf("expected status ERROR when no target URL/name, got %s", item.Status)
 	}
 	if item.StatusMsg != "Not Found" {
 		t.Errorf("expected StatusMsg 'Not Found', got %q", item.StatusMsg)
+	}
+}
+
+// safeOnly must never touch what's checked out: a feature-branch repo is
+// left exactly as it found it — no checkout, no stash, no rebase — whether
+// it's clean or dirty.
+func TestSyncRepositorySafeOnlySkipsFeatureBranch(t *testing.T) {
+	dir := newTestRepo(t)
+	checkout := exec.Command("git", "-C", dir, "checkout", "-b", "feature/x")
+	if out, err := checkout.CombinedOutput(); err != nil {
+		t.Skipf("git checkout unavailable in this environment: %v (%s)", err, out)
+	}
+	dirtyFile := filepath.Join(dir, "dirty.txt")
+	if err := os.WriteFile(dirtyFile, []byte("uncommitted"), 0o644); err != nil {
+		t.Fatalf("failed to write dirty file: %v", err)
+	}
+
+	item := &RepoItem{Name: "probe", Path: dir, Logs: []string{}}
+	SyncRepository(context.Background(), item, nil, true)
+
+	if item.Status != StatusSkipped {
+		t.Fatalf("expected StatusSkipped for a feature-branch repo under safeOnly, got %s (msg: %s)", item.Status, item.StatusMsg)
+	}
+	if item.CurrentBranch != "feature/x" {
+		t.Errorf("safeOnly must not switch branches; expected 'feature/x', got %q", item.CurrentBranch)
+	}
+	if _, err := os.Stat(dirtyFile); err != nil {
+		t.Errorf("expected the dirty file to remain in the working tree untouched, stat failed: %v", err)
+	}
+}
+
+// safeOnly's restriction only applies to feature branches — a repo already
+// on its default branch must still sync exactly as before, stash included.
+func TestSyncRepositorySafeOnlyStillSyncsDefaultBranch(t *testing.T) {
+	dir := newTestRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "dirty.txt"), []byte("uncommitted"), 0o644); err != nil {
+		t.Fatalf("failed to write dirty file: %v", err)
+	}
+
+	item := &RepoItem{Name: "probe", Path: dir, Logs: []string{}}
+	SyncRepository(context.Background(), item, nil, true)
+
+	if item.Status == StatusSkipped {
+		t.Fatalf("safeOnly must still sync a repo already on its default branch, got StatusSkipped (msg: %s)", item.StatusMsg)
+	}
+	if item.CurrentBranch != item.DefaultBranch {
+		t.Errorf("expected to remain on the default branch, got %q (default %q)", item.CurrentBranch, item.DefaultBranch)
 	}
 }
 
