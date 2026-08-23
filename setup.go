@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -88,16 +91,17 @@ func runFirstSetup(defaultDir string) (config.Config, error) {
 // declining (Esc or blank Enter) just runs this session in local-only mode
 // without persisting anything, so the prompt reappears next launch.
 type ownerPromptModel struct {
-	input textinput.Model
-	done  bool
-	quit  bool
+	input  textinput.Model
+	errMsg string
+	done   bool
+	quit   bool
 }
 
-func newOwnerPromptModel() ownerPromptModel {
+func newOwnerPromptModel(errMsg string) ownerPromptModel {
 	owner := textinput.New()
 	owner.Placeholder = "e.g. your-username or your-org"
 	owner.Focus()
-	return ownerPromptModel{input: owner}
+	return ownerPromptModel{input: owner, errMsg: errMsg}
 }
 
 func (m ownerPromptModel) Init() tea.Cmd { return textinput.Blink }
@@ -117,13 +121,18 @@ func (m ownerPromptModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 func (m ownerPromptModel) View() string {
-	return lipgloss.NewStyle().Padding(1, 2).Render("No GitHub owner configured\n\nGitHub user or organization (enables sync, PRs/issues, Actions):\n" + m.input.View() + "\n\nEnter to continue • Esc to skip for this run")
+	body := "No GitHub owner configured\n\nGitHub user or organization (enables sync, PRs/issues, Actions):\n" + m.input.View()
+	if m.errMsg != "" {
+		body = "No GitHub owner configured\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(m.errMsg) + "\n\nGitHub user or organization (enables sync, PRs/issues, Actions):\n" + m.input.View()
+	}
+	return lipgloss.NewStyle().Padding(1, 2).Render(body + "\n\nEnter to continue • Esc to skip for this run")
 }
 
 // runOwnerPrompt asks for a GitHub owner and returns the trimmed value the
-// user entered, or "" if they skipped (Esc, Ctrl+C, or a blank Enter).
-func runOwnerPrompt() (string, error) {
-	p, err := tea.NewProgram(newOwnerPromptModel()).Run()
+// user entered, or "" if they skipped (Esc, Ctrl+C, or a blank Enter). errMsg,
+// if non-empty, is shown above the input (e.g. after a prior attempt wasn't found).
+func runOwnerPrompt(errMsg string) (string, error) {
+	p, err := tea.NewProgram(newOwnerPromptModel(errMsg)).Run()
 	if err != nil {
 		return "", err
 	}
@@ -132,4 +141,13 @@ func runOwnerPrompt() (string, error) {
 		return "", nil
 	}
 	return strings.TrimSpace(m.input.Value()), nil
+}
+
+// ownerExists reports whether owner is a real GitHub user or organization
+// login, so a mistyped owner from the prompt is never persisted to config.
+func ownerExists(owner string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "api", fmt.Sprintf("users/%s", owner), "--silent")
+	return cmd.Run() == nil
 }

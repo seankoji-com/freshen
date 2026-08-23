@@ -176,18 +176,27 @@ func main() {
 		defaultReposDir = cfg.Workspace
 	}
 	if ownerFlag == "" && !nonInteractiveFlag {
-		owner, err := runOwnerPrompt()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
-			os.Exit(1)
-		}
-		if owner != "" {
+		promptErr := ""
+		for {
+			owner, err := runOwnerPrompt(promptErr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+				os.Exit(1)
+			}
+			if owner == "" {
+				break
+			}
+			if !ownerExists(owner) {
+				promptErr = fmt.Sprintf("%q wasn't found as a GitHub user or organization.", owner)
+				continue
+			}
 			ownerFlag = owner
 			cfg.Owner = owner
 			if err := config.Save(cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
 				os.Exit(1)
 			}
+			break
 		}
 	}
 	validatePrerequisites(false, ownerFlag != "")
