@@ -181,7 +181,7 @@ func runsJSON(base int64) string {
 	return fmt.Sprintf(`{"total_count":3,"workflow_runs":[
 	  {"id":%d,"name":"CI","display_title":"fix things","status":"in_progress","event":"pull_request","head_branch":"topic","created_at":"2026-08-16T10:00:00Z","run_started_at":"2026-08-16T10:00:05Z","pull_requests":[{"number":7,"title":"Fix things","html_url":"https://example.invalid/pull/7"}]},
 	  {"id":%d,"name":"CI","display_title":"queued one","status":"queued","event":"push","head_branch":"main","created_at":"2026-08-16T10:01:00Z"},
-	  {"id":%d,"name":"CI","display_title":"done","status":"completed","event":"push","head_branch":"main","created_at":"2026-08-16T09:00:00Z"}
+	  {"id":%d,"name":"CI","display_title":"done","status":"completed","event":"push","head_branch":"main","created_at":"2026-08-16T09:00:00Z","run_started_at":"2026-08-16T09:00:05Z","completed_at":"2026-08-16T09:05:05Z"}
 	]}`, base+1, base+2, base+3)
 }
 
@@ -221,7 +221,7 @@ func repoQueueHandler(bases map[string]int64) func(string) ([]byte, error) {
 func TestFetchOrgJobQueuePerRepo(t *testing.T) {
 	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000, "beta": 2000}))
 
-	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "beta"})
+	queue, _, err := FetchOrgJobQueue("acme", []string{"alpha", "beta"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestFetchOrgJobQueuePerRepo(t *testing.T) {
 func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
 	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000}))
 
-	queue, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"})
+	queue, _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"})
 	if err != nil {
 		t.Fatalf("partial failure should not surface an error: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
 
 	// A sweep where every repo fails is a real error.
 	stubGH(t, repoQueueHandler(nil))
-	if _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"}); err == nil {
+	if _, _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"}); err == nil {
 		t.Fatal("expected an error when every repository fails")
 	}
 
@@ -272,7 +272,7 @@ func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
 	stubGH(t, func(string) ([]byte, error) {
 		return nil, fmt.Errorf("GitHub API rate limit exceeded")
 	})
-	if _, err := FetchOrgJobQueue("acme", []string{"alpha"}); err == nil || !strings.Contains(err.Error(), "rate limit") {
+	if _, _, err := FetchOrgJobQueue("acme", []string{"alpha"}); err == nil || !strings.Contains(err.Error(), "rate limit") {
 		t.Fatalf("expected a rate limit error, got %v", err)
 	}
 }
@@ -282,9 +282,32 @@ func TestFetchOrgJobQueueNoRepos(t *testing.T) {
 		t.Errorf("no repos means no API calls, but %q was requested", path)
 		return nil, nil
 	})
-	queue, err := FetchOrgJobQueue("acme", nil)
+	queue, _, err := FetchOrgJobQueue("acme", nil)
 	if err != nil || len(queue) != 0 {
 		t.Fatalf("expected an empty queue and no error, got %d items, err %v", len(queue), err)
+	}
+}
+
+// FetchOrgJobQueue must surface completed-run durations from the same
+// unfiltered runs page it already fetches, keyed by workflow name, without
+// any extra API calls — the fixture's "done" run in runsJSON carries the
+// timestamps this depends on.
+func TestFetchOrgJobQueueHistoricalDurations(t *testing.T) {
+	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000, "beta": 2000}))
+
+	_, history, err := FetchOrgJobQueue("acme", []string{"alpha", "beta"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	samples := history["CI"]
+	if len(samples) != 2 {
+		t.Fatalf("expected 2 historical samples (one completed run per repo) for workflow %q, got %d: %v", "CI", len(samples), samples)
+	}
+	for _, d := range samples {
+		if d != 5*time.Minute {
+			t.Errorf("expected each sample to be the fixture's 5m completed-run duration, got %s", d)
+		}
 	}
 }
 
