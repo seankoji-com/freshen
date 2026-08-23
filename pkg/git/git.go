@@ -67,6 +67,9 @@ const (
 	StatusCloned          RepoStatus = "CLONED"
 	StatusArchived        RepoStatus = "ARCHIVED"
 	StatusError           RepoStatus = "ERROR"
+	// StatusSkipped marks a repo a safe-only sync left untouched because it
+	// wasn't on its default branch — see SyncRepository's safeOnly param.
+	StatusSkipped RepoStatus = "SKIPPED"
 )
 
 type GHRepoInfo struct {
@@ -691,7 +694,13 @@ func (s *syncSession) publish() {
 // item is mutated in place. When emit is non-nil it receives an owned snapshot
 // after every state change, which is how the TUI follows progress without
 // reading the struct this function is writing to.
-func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
+//
+// safeOnly restricts the sync to actions that never touch what branch is
+// checked out: a plain pull on the default branch, or (if dirty) add+stash+
+// pull+stash-apply. If the repo is on a feature branch, safeOnly skips it
+// entirely rather than auto-switching to default or auto-rebasing — those
+// stay available via an explicit, single-repo sync (safeOnly=false).
+func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safeOnly bool) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -823,6 +832,11 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress) {
 		} else {
 			s.finish(StatusError, "Conflict", "󰅙 Conflict occurred while applying stash!")
 		}
+		return
+	}
+
+	if safeOnly {
+		s.finish(StatusSkipped, "Skipped", "󰒲 On feature branch '%s'; run [r] Sync to update manually.", origBranch)
 		return
 	}
 
