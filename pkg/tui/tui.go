@@ -873,7 +873,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // spinner/viewport postlude (true only for the keys that used to `return m, ...`
 // mid-switch: quit, and the repo-tab-cycling right/left/"4" keys).
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
-	m.setToast("", 0)
+	// Unconditional: setToast("", 0) would no-op here once any priority-1+
+	// toast has ever fired, since its own priority gate blocks a lower
+	// priority from clearing a higher one.
+	m.ToastMsg = ""
+	m.ToastPriority = 0
 	if msg.String() != "d" {
 		m.pendingDeletePath = ""
 	}
