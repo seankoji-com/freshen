@@ -1420,9 +1420,22 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd {
 			} else if msg.Y > runnersPaneEnd {
 				m.ActiveFocus = FocusJobs
 				jobsPaneStart := runnersPaneEnd + 1
-				clickedIdx := msg.Y - jobsPaneStart - 2
-				if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
-					m.SelectedJobIndex = clickedIdx
+				jobsBoxHeight := totalInner - repoBoxHeight - runnersBoxHeight
+				if jobsBoxHeight < 3 {
+					jobsBoxHeight = 3
+				}
+				maxJobRows := jobsBoxHeight - 2
+				if maxJobRows < 1 {
+					maxJobRows = 1
+				}
+				// Mirror renderJobsPanel's row layout exactly: a run header
+				// adds a line with no JobQueue entry of its own, so a click's
+				// Y position must be resolved against the same expanded row
+				// list rather than a flat offset into m.JobQueue.
+				visibleRows := jobQueueVisibleWindow(buildJobQueueRows(m.JobQueue), m.SelectedJobIndex, maxJobRows)
+				clickedLine := msg.Y - jobsPaneStart - 2
+				if clickedLine >= 0 && clickedLine < len(visibleRows) && !visibleRows[clickedLine].header {
+					m.SelectedJobIndex = visibleRows[clickedLine].itemIndex
 				}
 				m.updateViewport()
 			}
@@ -2746,12 +2759,12 @@ func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight in
 
 	if len(runningNames) > 0 {
 		glyph := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Width(2).Render("⚡")
-		label := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf(" RUNNING (%d): ", len(runningNames)))
+		label := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf(" (%d): ", len(runningNames)))
 		names := lipgloss.NewStyle().Foreground(colorGreen).Render(strings.Join(runningNames, ", "))
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
 	}
 	if len(idleNames) > 0 {
-		glyph := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Width(2).Render("●")
+		glyph := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Width(2).Render("💤")
 		label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(fmt.Sprintf(" IDLE (%d): ", len(idleNames)))
 		names := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Join(idleNames, ", "))
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
@@ -2779,6 +2792,70 @@ func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight in
 		Width(leftWidth - 2).
 		Height(runnersBoxHeight).
 		Render(strings.Join(sliceLines(runnerLines, runnersBoxHeight), "\n"))
+}
+
+// jobQueueRow is one visible row in the OVERALL JOB QUEUE panel: either a
+// regular job (header=false) or a synthetic "run" header inserted above a
+// multi-job run's children (header=true). itemIndex always points at the
+// JobQueue entry driving the row's content — for a header row, that's the
+// run's first child, used to build the header text.
+type jobQueueRow struct {
+	itemIndex int
+	header    bool
+}
+
+// buildJobQueueRows expands queue into its full list of rendered rows,
+// inserting one header row above each multi-job run's children. Rendering
+// (renderJobsPanel) and mouse click hit-testing (handleMouseMsg) both walk
+// this same list, so a click can never resolve to the wrong job just because
+// header rows shifted line numbers out of sync with JobQueue indices.
+func buildJobQueueRows(queue []*jobs.JobItem) []jobQueueRow {
+	runCounts := make(map[int64]int)
+	for _, j := range queue {
+		if j.RunID != 0 {
+			runCounts[j.RunID]++
+		}
+	}
+	renderedRuns := make(map[int64]bool)
+	rows := make([]jobQueueRow, 0, len(queue))
+	for i, j := range queue {
+		if runCounts[j.RunID] > 1 && !renderedRuns[j.RunID] {
+			renderedRuns[j.RunID] = true
+			rows = append(rows, jobQueueRow{itemIndex: i, header: true})
+		}
+		rows = append(rows, jobQueueRow{itemIndex: i})
+	}
+	return rows
+}
+
+// jobQueueVisibleWindow returns the slice of rows that should be visible for
+// the given selection and row budget, keeping the selected job's row within
+// view. This works in line-space rather than item-space so a run header —
+// which adds a line with no JobQueue entry of its own — can't push the
+// selection off screen the way naive item-index arithmetic would.
+func jobQueueVisibleWindow(rows []jobQueueRow, selectedIdx, maxRows int) []jobQueueRow {
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	selectedLine := 0
+	for lineIdx, row := range rows {
+		if !row.header && row.itemIndex == selectedIdx {
+			selectedLine = lineIdx
+			break
+		}
+	}
+	start := 0
+	if selectedLine >= maxRows {
+		start = selectedLine - maxRows + 1
+	}
+	end := start + maxRows
+	if end > len(rows) {
+		end = len(rows)
+	}
+	if start > end {
+		start = end
+	}
+	return rows[start:end]
 }
 
 // renderJobsPanel renders PANEL 3: OVERALL JOB QUEUE.
@@ -2818,14 +2895,6 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 	if maxJobRows < 1 {
 		maxJobRows = 1
 	}
-	jobStartIdx := 0
-	if m.SelectedJobIndex >= maxJobRows {
-		jobStartIdx = m.SelectedJobIndex - maxJobRows + 1
-	}
-	jobEndIdx := jobStartIdx + maxJobRows
-	if jobEndIdx > len(m.JobQueue) {
-		jobEndIdx = len(m.JobQueue)
-	}
 
 	// Detect grouped runs to add tree branch connectors for matrix jobs
 	runCounts := make(map[int64]int)
@@ -2837,9 +2906,11 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 		}
 	}
 
-	renderedRuns := make(map[int64]bool)
+	allRows := buildJobQueueRows(m.JobQueue)
+	visibleRows := jobQueueVisibleWindow(allRows, m.SelectedJobIndex, maxJobRows)
 
-	for i := jobStartIdx; i < jobEndIdx; i++ {
+	for _, row := range visibleRows {
+		i := row.itemIndex
 		j := m.JobQueue[i]
 		runToken, jobToken := parseJobHierarchy(j.Name, j.Repo)
 
@@ -2856,11 +2927,14 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 			stColor = colorRed
 		}
 
-		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
+		stText := string(j.Status)
+		if j.Status == jobs.JobRunning {
+			// The ⚡ glyph already says "running"; the word is redundant.
+			stText = ""
+		}
+		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, stText))
 
-		// If this job is part of a multi-job run and we haven't rendered the parent run header yet:
-		if runCounts[j.RunID] > 1 && !renderedRuns[j.RunID] {
-			renderedRuns[j.RunID] = true
+		if row.header {
 			runTitleText := runToken
 			if j.RunID != 0 {
 				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
@@ -2892,6 +2966,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 
 			runHeaderLine := fmt.Sprintf("  %s %s%s", stBadge, runTitleText, triggerBadge)
 			jobsLines = append(jobsLines, clipLine(runHeaderLine))
+			continue
 		}
 
 		runnerStr := j.RunnerName
