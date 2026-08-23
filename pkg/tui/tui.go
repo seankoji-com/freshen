@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/seankoji-com/freshen/pkg/config"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
@@ -367,8 +368,11 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
-		IsJobQueueLoading:   true,
-		IsRunnersLoading:    true,
+		// Runners and the job queue are only fetched when a GitHub owner is
+		// configured (see Init) — without one, these flags would never be
+		// cleared and their panels would show "Fetching..." forever.
+		IsJobQueueLoading: targetOrg != "",
+		IsRunnersLoading:  targetOrg != "",
 		Spinner:             s,
 		ProgressBar:         p,
 		Viewport:            vp,
@@ -1448,6 +1452,11 @@ func (m Model) handleRepoTickMsg() tea.Cmd {
 func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 	jobs.PollStep(m.Runners, m.JobQueue)
 	m.updateViewport()
+	if m.TargetOrg == "" {
+		// Owner was cleared mid-session (e.g. an unrecognized org); nothing
+		// left to poll, so stop the tick chain rather than retry forever.
+		return nil
+	}
 	var cmdsToAdd []tea.Cmd
 	if !m.RunnerPermissionDenied {
 		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
@@ -1466,6 +1475,9 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 // handleJobQueueTickMsg refreshes the job queue on its own slower cadence,
 // keeping the per-repo API cost off the 10s runner tick.
 func (m *Model) handleJobQueueTickMsg() tea.Cmd {
+	if m.TargetOrg == "" {
+		return nil
+	}
 	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors[fetchSourceJobQueue])))
 }
 
@@ -1557,7 +1569,18 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	m.IsOrgSyncing = false
 	if msg.err != nil {
 		slog.Error("org repos fetch failed", "org", m.TargetOrg, "error", msg.err)
-		m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+		if isUnknownOwnerError(msg.err) {
+			badOwner := m.TargetOrg
+			m.TargetOrg = ""
+			m.IsRunnersLoading = false
+			m.IsJobQueueLoading = false
+			if clearErr := clearConfiguredOwner(badOwner); clearErr != nil {
+				slog.Error("failed to clear invalid owner from config", "owner", badOwner, "error", clearErr)
+			}
+			m.setToast(fmt.Sprintf(" %s GitHub owner %q not found — cleared. Restart freshen to set a new one.", iconError, badOwner), 3)
+		} else {
+			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+		}
 		m.updateViewport()
 		return tea.Batch(), true
 	}
@@ -1583,9 +1606,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true
-		m.updateViewport()
 		cmd = m.startSyncCmd(m.Repos, true)
 	}
+	m.updateViewport()
 	return cmd, false
 }
 
@@ -2982,6 +3005,33 @@ func isRunnerPermissionError(err error) bool {
 		strings.Contains(errStr, "org admin") ||
 		strings.Contains(errStr, "must be an org admin") ||
 		strings.Contains(errStr, "fine-grained permission")
+}
+
+// isUnknownOwnerError reports whether err is gh's response to a repo-list
+// call against a user/org login that doesn't exist, as opposed to a
+// transient network or auth failure.
+func isUnknownOwnerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "was not recognized as either a github user or an organization")
+}
+
+// clearConfiguredOwner removes owner from the persisted config, but only if
+// it's still the currently saved value — so a bad owner from an earlier run
+// doesn't keep failing on every subsequent launch, without racing a config
+// change made since this session started.
+func clearConfiguredOwner(owner string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.Owner != owner {
+		return nil
+	}
+	cfg.Owner = ""
+	return config.Save(cfg)
 }
 
 func truncateString(str string, maxLen int) string {
