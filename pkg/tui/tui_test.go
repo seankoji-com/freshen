@@ -29,7 +29,9 @@ func TestFocusedRunViewportRendering(t *testing.T) {
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 1
+	// Row 0 is the synthetic initiator header, row 1 the synthetic run
+	// header (all 4 jobs share RunID 100), row 2 is the first job ("build").
+	m.SelectedJobIndex = 2
 	m.JobQueue = []*jobs.JobItem{
 		{ID: "run-100", Name: "myrepo / ci", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, IsRunHeader: true, Event: "push", Branch: "main"},
 		{ID: "#101", Name: "myrepo / ci / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, Event: "push", Branch: "main", Duration: "1m 30s", RunnerName: "runner-1"},
@@ -96,7 +98,9 @@ func TestEnterUnfocusesWhenFocusedRunMatches(t *testing.T) {
 func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
 	m := newTestModel("/tmp/test", "test-org")
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 0
+	// Row 0 is this job's synthetic initiator header (every job gets one);
+	// row 1 is the job itself, since it's not part of a multi-job run.
+	m.SelectedJobIndex = 1
 	m.FocusedRunID = 0
 	m.JobQueue = []*jobs.JobItem{
 		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100},
@@ -109,6 +113,106 @@ func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
 	if updated.FocusedRunID != 100 {
 		t.Errorf("pressing Enter should focus on the selected job's run (100), got %d", updated.FocusedRunID)
 	}
+}
+
+// Enter on an initiator header (row 0, above any single job) focuses the
+// initiator instead of a run — there's no run to focus at that row.
+func TestEnterFocusesOnSelectedInitiator(t *testing.T) {
+	m := newTestModel("/tmp/test", "test-org")
+	m.ActiveFocus = FocusJobs
+	m.SelectedJobIndex = 0
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, PRNumber: 7},
+	}
+
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	newModel, _ := m.Update(msg)
+	updated := newModel.(Model)
+
+	if updated.FocusedInitiatorKey != "myrepo#pr:7" {
+		t.Errorf("pressing Enter on the initiator header should set FocusedInitiatorKey, got %q", updated.FocusedInitiatorKey)
+	}
+	if updated.FocusedRunID != 0 {
+		t.Errorf("focusing an initiator should not also set FocusedRunID, got %d", updated.FocusedRunID)
+	}
+}
+
+// buildJobQueueRows groups jobs by initiator (PR, else branch/event) and
+// visually collates each initiator's jobs, inserting a run header above any
+// run with more than one job — this is the panel's single source of truth
+// for row layout, shared by rendering and click/keyboard selection.
+func TestBuildJobQueueRows(t *testing.T) {
+	t.Run("single job under one initiator gets only an initiator header", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / build", RunID: 1, PRNumber: 7},
+		}
+		rows := buildJobQueueRows(queue)
+		if len(rows) != 2 {
+			t.Fatalf("expected 2 rows (initiator header + job), got %d: %+v", len(rows), rows)
+		}
+		if rows[0].kind != rowKindInitiatorHeader || rows[0].initiatorKey != "repo1#pr:7" {
+			t.Errorf("expected row 0 to be the initiator header for repo1#pr:7, got %+v", rows[0])
+		}
+		if rows[1].kind != rowKindJob || rows[1].itemIndex != 0 {
+			t.Errorf("expected row 1 to be the job itself, got %+v", rows[1])
+		}
+	})
+
+	t.Run("multi-job run gets both an initiator and a run header", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / lint", RunID: 1, PRNumber: 7},
+			{Repo: "repo1", Name: "repo1 / test", RunID: 1, PRNumber: 7},
+		}
+		rows := buildJobQueueRows(queue)
+		wantKinds := []jobQueueRowKind{rowKindInitiatorHeader, rowKindRunHeader, rowKindJob, rowKindJob}
+		if len(rows) != len(wantKinds) {
+			t.Fatalf("expected %d rows, got %d: %+v", len(wantKinds), len(rows), rows)
+		}
+		for i, want := range wantKinds {
+			if rows[i].kind != want {
+				t.Errorf("row %d: expected kind %v, got %v", i, want, rows[i].kind)
+			}
+		}
+	})
+
+	t.Run("collates an initiator's jobs even when interleaved with another initiator's in the queue", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / a", RunID: 1, PRNumber: 7}, // initiator A
+			{Repo: "repo1", Name: "repo1 / b", RunID: 2, PRNumber: 9}, // initiator B
+			{Repo: "repo1", Name: "repo1 / c", RunID: 1, PRNumber: 7}, // initiator A again
+		}
+		rows := buildJobQueueRows(queue)
+		var order []string
+		for _, r := range rows {
+			if r.kind == rowKindInitiatorHeader {
+				order = append(order, r.initiatorKey)
+			}
+		}
+		if len(order) != 2 || order[0] != "repo1#pr:7" || order[1] != "repo1#pr:9" {
+			t.Fatalf("expected initiator headers in first-appearance order [repo1#pr:7 repo1#pr:9], got %v", order)
+		}
+		// Initiator A's two jobs (queue indices 0 and 2) must be contiguous,
+		// not split across B's header.
+		var aItemIndices []int
+		for _, r := range rows {
+			if r.kind == rowKindJob && jobInitiatorKey(queue[r.itemIndex]) == "repo1#pr:7" {
+				aItemIndices = append(aItemIndices, r.itemIndex)
+			}
+		}
+		if len(aItemIndices) != 2 || aItemIndices[0] != 0 || aItemIndices[1] != 2 {
+			t.Errorf("expected initiator A's jobs (queue[0], queue[2]) collated together, got item indices %v", aItemIndices)
+		}
+	})
+
+	t.Run("a fork PR job with no PRNumber falls back to branch grouping", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / build", RunID: 1, PRNumber: 0, Branch: "feature/x"},
+		}
+		rows := buildJobQueueRows(queue)
+		if rows[0].initiatorKey != "repo1#branch:feature/x" {
+			t.Errorf("expected fallback to branch grouping, got initiator key %q", rows[0].initiatorKey)
+		}
+	})
 }
 
 func TestEscUnfocusesRun(t *testing.T) {
@@ -327,7 +431,9 @@ func TestHyperlinksInView(t *testing.T) {
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 0
+	// Row 0 is this job's synthetic initiator header (every job gets one);
+	// row 1 is the job itself.
+	m.SelectedJobIndex = 1
 
 	m.JobQueue = []*jobs.JobItem{
 		{
@@ -729,6 +835,9 @@ func TestHandleLoadedJobQueueMsg(t *testing.T) {
 			{ID: "run-1", Repo: "repo1", Name: "repo1 / ci", Status: jobs.JobRunning, RunID: 1, IsRunHeader: true},
 			{ID: "#1", Repo: "repo1", Name: "repo1 / ci / build", Status: jobs.JobRunning, RunID: 1},
 		}
+		// Row 0 is the synthetic initiator header, row 1 the synthetic run
+		// header (both jobs share RunID 1), row 2 is the first actual job row.
+		m.SelectedJobIndex = 2
 		cmd := m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: partial, err: errors.New("timeout")})
 
 		if !m.JobQueueFetchFailed {
