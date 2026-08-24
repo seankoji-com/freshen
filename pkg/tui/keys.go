@@ -6,7 +6,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/git"
-	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 // handleKeyMsg dispatches a tea.KeyMsg to the per-key handler for msg.String(),
@@ -15,7 +14,11 @@ import (
 // spinner/viewport postlude (true only for the keys that used to `return m, ...`
 // mid-switch: quit, and the repo-tab-cycling right/left/"4" keys).
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Cmd, bool) {
-	m.setToast("", 0)
+	// Unconditional: setToast("", 0) would no-op here once any priority-1+
+	// toast has ever fired, since its own priority gate blocks a lower
+	// priority from clearing a higher one.
+	m.ToastMsg = ""
+	m.ToastPriority = 0
 	if msg.String() != "d" {
 		m.pendingDeletePath = ""
 	}
@@ -96,23 +99,41 @@ func (m *Model) handleKeyQuit() (tea.Cmd, bool) {
 	return tea.Quit, true
 }
 
+// handleKeyEnter drills into whatever's currently selected in the OVERALL
+// JOB QUEUE panel: an initiator header focuses that PR/branch (all its runs
+// and jobs), a run header or job row focuses that run — pressing Enter again
+// on the same target unfocuses it.
 func (m *Model) handleKeyEnter() {
-	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-		job := m.JobQueue[m.SelectedJobIndex]
-		// If already focused on this run, unfocus it
+	if m.ActiveFocus != FocusJobs {
+		return
+	}
+	_, row, ok := m.selectedJobRow()
+	if !ok {
+		return
+	}
+	job := m.JobQueue[row.itemIndex]
+	if row.kind == rowKindInitiatorHeader {
+		if m.FocusedInitiatorKey == row.initiatorKey {
+			m.FocusedInitiatorKey = ""
+		} else {
+			m.FocusedInitiatorKey = row.initiatorKey
+			m.FocusedRunID = 0
+		}
+	} else {
 		if m.FocusedRunID == job.RunID {
 			m.FocusedRunID = 0
 		} else {
-			// Focus this run
 			m.FocusedRunID = job.RunID
+			m.FocusedInitiatorKey = ""
 		}
-		m.updateViewport()
 	}
+	m.updateViewport()
 }
 
 func (m *Model) handleKeyEsc() {
-	if m.FocusedRunID != 0 {
+	if m.FocusedRunID != 0 || m.FocusedInitiatorKey != "" {
 		m.FocusedRunID = 0
+		m.FocusedInitiatorKey = ""
 		m.updateViewport()
 	}
 }
@@ -145,12 +166,7 @@ func (m *Model) handleKeyUp() tea.Cmd {
 		if m.SelectedJobIndex > 0 {
 			m.SelectedJobIndex--
 			m.updateViewport()
-			if m.SelectedJobIndex < len(m.JobQueue) {
-				j := m.JobQueue[m.SelectedJobIndex]
-				if j.Status == jobs.JobRunning {
-					cmd = m.loadJobLogsCmd(j)
-				}
-			}
+			cmd = m.loadLogsIfSelectedJobRunning()
 		} else {
 			m.ActiveFocus = FocusRunners
 			matching := m.getMatchingRunners()
@@ -189,23 +205,13 @@ func (m *Model) handleKeyDown() tea.Cmd {
 			m.SelectedJobIndex = 0
 			m.setToast(" Focused Jobs Panel", 1)
 			m.updateViewport()
-			if len(m.JobQueue) > 0 {
-				j := m.JobQueue[0]
-				if j.Status == jobs.JobRunning {
-					cmd = m.loadJobLogsCmd(j)
-				}
-			}
+			cmd = m.loadLogsIfSelectedJobRunning()
 		}
 	case FocusJobs:
-		if m.SelectedJobIndex < len(m.JobQueue)-1 {
+		if m.SelectedJobIndex < len(buildJobQueueRows(m.JobQueue))-1 {
 			m.SelectedJobIndex++
 			m.updateViewport()
-			if m.SelectedJobIndex < len(m.JobQueue) {
-				j := m.JobQueue[m.SelectedJobIndex]
-				if j.Status == jobs.JobRunning {
-					cmd = m.loadJobLogsCmd(j)
-				}
-			}
+			cmd = m.loadLogsIfSelectedJobRunning()
 		}
 	}
 	return cmd
@@ -287,13 +293,10 @@ func (m *Model) handleKeyPrevPanel() tea.Cmd {
 // triggerLogFetchForFocusedJob returns a log-fetch command when the jobs panel
 // is focused on a running job, and nil otherwise.
 func (m *Model) triggerLogFetchForFocusedJob() tea.Cmd {
-	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-		j := m.JobQueue[m.SelectedJobIndex]
-		if j.Status == jobs.JobRunning {
-			return m.loadJobLogsCmd(j)
-		}
+	if m.ActiveFocus != FocusJobs {
+		return nil
 	}
-	return nil
+	return m.loadLogsIfSelectedJobRunning()
 }
 
 // handleKeySyncAll starts a parallel sync across every loaded repository.
@@ -301,7 +304,7 @@ func (m *Model) handleKeySyncAll() tea.Cmd {
 	if !m.IsSyncing && len(m.Repos) > 0 {
 		m.IsSyncing = true
 		m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
-		cmd := m.startSyncCmd(m.Repos, true)
+		cmd := m.startSyncCmd(m.Repos, true, false)
 		m.updateViewport()
 		return cmd
 	}
@@ -337,7 +340,7 @@ func (m *Model) handleKeySync() tea.Cmd {
 	if m.ActiveFocus == FocusRepos && len(m.Repos) > 0 && m.SelectedIndex < len(m.Repos) {
 		item := m.Repos[m.SelectedIndex]
 		if !item.IsArchived {
-			cmd := m.startSyncCmd([]*git.RepoItem{item}, false)
+			cmd := m.startSyncCmd([]*git.RepoItem{item}, false, false)
 			m.updateViewport()
 			return cmd
 		}
@@ -368,12 +371,13 @@ func (m *Model) handleKeyCopy() {
 		} else {
 			m.setToast(fmt.Sprintf(" %s Copied Runner ID to clipboard: %s", iconCopy, r.ID), 1)
 		}
-	} else if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-		j := m.JobQueue[m.SelectedJobIndex]
-		if err := copyToClipboard(j.ID); err != nil {
-			m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
-		} else {
-			m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
+	} else if m.ActiveFocus == FocusJobs {
+		if j := m.selectedJob(); j != nil {
+			if err := copyToClipboard(j.ID); err != nil {
+				m.setToast(fmt.Sprintf(" %s Failed to copy: %v", iconCopy, err), 2)
+			} else {
+				m.setToast(fmt.Sprintf(" %s Copied Job ID to clipboard: %s", iconCopy, j.ID), 1)
+			}
 		}
 	}
 }

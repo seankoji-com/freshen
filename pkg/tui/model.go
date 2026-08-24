@@ -15,7 +15,6 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
-// --- Active Right-Pane Detail View Tab ---
 type TabType int
 
 const (
@@ -82,6 +81,7 @@ var (
 	iconSwitch   = "󰁨"
 	iconTrash    = "🗑️"
 	iconPending  = "•"
+	iconSkipped  = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
 	iconCopy     = "󰅍"
 	iconWorktree = "󰉓"
 	iconRunner   = "🏃"
@@ -148,6 +148,9 @@ var (
 	badgeArchived = lipgloss.NewStyle().
 			Foreground(colorMuted).
 			Strikethrough(true)
+
+	badgeSkipped = lipgloss.NewStyle().
+			Foreground(colorMuted)
 
 	selectedRowStyle = lipgloss.NewStyle().
 				Background(lipgloss.Color("#313244")).
@@ -274,14 +277,18 @@ type pushFinishedMsg struct {
 // --- Bubble Tea Model ---
 
 type Model struct {
-	TargetDir              string
-	TargetOrg              string
-	Concurrency            int
-	Repos                  []*git.RepoItem
-	Runners                []*jobs.RunnerItem
-	JobQueue               []*jobs.JobItem
-	SelectedIndex          int
-	SelectedRunnerIndex    int
+	TargetDir           string
+	TargetOrg           string
+	Concurrency         int
+	Repos               []*git.RepoItem
+	Runners             []*jobs.RunnerItem
+	JobQueue            []*jobs.JobItem
+	SelectedIndex       int
+	SelectedRunnerIndex int
+	// SelectedJobIndex indexes into buildJobQueueRows(m.JobQueue) — the
+	// OVERALL JOB QUEUE panel's full row list, which includes initiator and
+	// run header rows alongside job rows — not into JobQueue directly. Use
+	// m.selectedJobRow()/m.selectedJob() to resolve it.
 	SelectedJobIndex       int
 	SelectedTagIndex       int
 	ActiveFocus            FocusType
@@ -292,12 +299,17 @@ type Model struct {
 	IsRunnersLoading       bool
 	TotalCount             int
 	ToastMsg               string
-	FocusedRunID           int64 // When non-zero, a specific workflow run is focused
-	ToastPriority          int   // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	FocusedRunID           int64  // When non-zero, a specific workflow run is focused
+	FocusedInitiatorKey    string // When non-empty, a specific initiator (PR/branch) is focused — see jobInitiatorKey
+	ToastPriority          int    // higher priority overrides lower; 0 = none, 1 = info, 2 = error
 	ConsecutiveErrors      map[string]int
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
+	// JobDurationHistory holds recent completed-run durations keyed by run
+	// name (see parseJobHierarchy), used to estimate a running job's total
+	// time. Samples accumulate across refreshes — see processJobQueueUpdate.
+	JobDurationHistory map[string][]time.Duration
 
 	// pendingDeletePath holds the Path of the archived repo awaiting a second
 	// 'd' press to confirm deletion; "" means no pending delete. It is keyed
@@ -350,14 +362,17 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
-		IsJobQueueLoading:   true,
-		IsRunnersLoading:    true,
-		Spinner:             s,
-		ProgressBar:         p,
-		Viewport:            vp,
-		ctx:                 ctx,
-		cancel:              cancel,
-		bgWG:                bgWG,
+		// Runners and the job queue are only fetched when a GitHub owner is
+		// configured (see Init) — without one, these flags would never be
+		// cleared and their panels would show "Fetching..." forever.
+		IsJobQueueLoading: targetOrg != "",
+		IsRunnersLoading:  targetOrg != "",
+		Spinner:           s,
+		ProgressBar:       p,
+		Viewport:          vp,
+		ctx:               ctx,
+		cancel:            cancel,
+		bgWG:              bgWG,
 	}
 }
 

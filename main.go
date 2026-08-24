@@ -173,10 +173,31 @@ func main() {
 			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
 			os.Exit(1)
 		}
-		if ownerFlag == "" {
-			ownerFlag = cfg.Owner
-		}
 		defaultReposDir = cfg.Workspace
+	}
+	if ownerFlag == "" && !nonInteractiveFlag {
+		promptErr := ""
+		for {
+			owner, err := runOwnerPrompt(promptErr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+				os.Exit(1)
+			}
+			if owner == "" {
+				break
+			}
+			if !ownerExists(owner) {
+				promptErr = fmt.Sprintf("%q wasn't found as a GitHub user or organization.", owner)
+				continue
+			}
+			ownerFlag = owner
+			cfg.Owner = owner
+			if err := config.Save(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+				os.Exit(1)
+			}
+			break
+		}
 	}
 	validatePrerequisites(false, ownerFlag != "")
 
@@ -346,7 +367,9 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 			Logs:       make([]string, 0),
 		}
 
-		git.SyncRepository(ctx, item, nil)
+		// Explicit batch mode (--non-interactive/-y): keep today's full
+		// behavior, same as [a]/[r] in the interactive TUI.
+		git.SyncRepository(ctx, item, nil, false)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)

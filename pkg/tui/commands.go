@@ -25,8 +25,9 @@ func (m Model) loadRunnersCmd() tea.Cmd {
 }
 
 type loadedJobQueueMsg struct {
-	queue []*jobs.JobItem
-	err   error
+	queue   []*jobs.JobItem
+	history map[string][]time.Duration
+	err     error
 }
 
 func (m Model) loadJobQueueCmd() tea.Cmd {
@@ -55,8 +56,8 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 				}
 			}
 		}
-		queue, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList)
-		return loadedJobQueueMsg{queue: queue, err: err}
+		queue, history, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList)
+		return loadedJobQueueMsg{queue: queue, history: history, err: err}
 	}
 }
 
@@ -82,6 +83,18 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 		lines, resolvedGHJobID, err := jobs.FetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
 		return loadedJobLogsMsg{jobID: jobID, ghJobID: resolvedGHJobID, logs: lines, err: err}
 	}
+}
+
+// loadLogsIfSelectedJobRunning returns a command to fetch fresh logs when the
+// current OVERALL JOB QUEUE selection is a running job, or nil otherwise —
+// used after any keyboard move so a running job's log tail stays current,
+// and a no-op when the selection is a header row or an idle job.
+func (m Model) loadLogsIfSelectedJobRunning() tea.Cmd {
+	j := m.selectedJob()
+	if j != nil && j.Status == jobs.JobRunning {
+		return m.loadJobLogsCmd(j)
+	}
+	return nil
 }
 
 func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
@@ -254,7 +267,7 @@ var syncRepositoryFn = git.SyncRepository
 // publishes owned snapshots. Only Update — which Bubble Tea runs on a single
 // goroutine — writes to m.Repos, so the render path never reads a struct while
 // a sync is writing to it.
-func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
+func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool, safeOnly bool) tea.Cmd {
 	// Clone here, on the update goroutine, before any worker exists.
 	work := make([]*git.RepoItem, 0, len(items))
 	for _, item := range items {
@@ -308,7 +321,7 @@ func (m Model) startSyncCmd(items []*git.RepoItem, bulk bool) tea.Cmd {
 					case snapshots <- snapshot:
 					case <-ctx.Done():
 					}
-				})
+				}, safeOnly)
 			}(r)
 		}
 

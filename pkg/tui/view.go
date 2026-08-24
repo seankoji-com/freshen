@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -203,24 +204,99 @@ func (m *Model) updateViewport() {
 		}
 
 	case FocusJobs:
-		if len(m.JobQueue) == 0 || m.SelectedJobIndex >= len(m.JobQueue) {
+		_, row, ok := m.selectedJobRow()
+		if !ok {
 			m.Viewport.SetContent("No jobs in queue.")
 			return
 		}
-		job := m.JobQueue[m.SelectedJobIndex]
+		// row.itemIndex always points at a valid JobQueue entry, even for a
+		// header row — its group's first job, used as fallback metadata.
+		job := m.JobQueue[row.itemIndex]
 
-		// If a run is focused, show summary of all jobs in that run
-		if m.FocusedRunID != 0 {
-			// Find all jobs belonging to the focused run
-			var runJobs []*jobs.JobItem
+		// The cursor alone drives this pane: resting on an initiator or run
+		// header renders that group's full detail, with no Enter needed.
+		// Enter still pins a group, which is what keeps its detail on screen
+		// while the cursor moves down onto the group's individual job rows.
+		detailInitiatorKey, detailRunID := m.FocusedInitiatorKey, m.FocusedRunID
+		pinned := detailInitiatorKey != "" || detailRunID != 0
+		if !pinned {
+			switch row.kind {
+			case rowKindInitiatorHeader:
+				detailInitiatorKey = row.initiatorKey
+			case rowKindRunHeader:
+				detailRunID = job.RunID
+			}
+		}
+
+		switch {
+		case detailInitiatorKey != "":
+			initJobs := jobsForInitiator(m.JobQueue, detailInitiatorKey)
+			metaJob := job
+			if len(initJobs) > 0 {
+				metaJob = initJobs[0]
+			}
+
+			var titleText string
+			if metaJob.PRNumber != 0 {
+				prLabel := fmt.Sprintf("PR #%d", metaJob.PRNumber)
+				if metaJob.PRTitle != "" {
+					prLabel = fmt.Sprintf("PR #%d: %s", metaJob.PRNumber, metaJob.PRTitle)
+				}
+				prURL := metaJob.PRURL
+				if prURL == "" {
+					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, metaJob.Repo, metaJob.PRNumber)
+				}
+				titleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(prLabel), prURL)
+			} else {
+				branch := metaJob.Branch
+				if branch == "" {
+					branch = metaJob.Event
+				}
+				branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, metaJob.Repo, branch)
+				titleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(branch), branchURL)
+			}
+
+			sb.WriteString(fmt.Sprintf(" %s FOCUSED INITIATOR: %s\n\n", iconQueue, titleText))
+
+			runIDs := make(map[int64]bool)
+			for _, j := range initJobs {
+				if j.RunID != 0 {
+					runIDs[j.RunID] = true
+				}
+			}
+
+			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Repo:"),
+				lipgloss.NewStyle().Foreground(colorPrimary).Render(metaJob.Repo),
+			))
+			sb.WriteString(fmt.Sprintf(" %s  %d run(s), %d job(s)\n\n",
+				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Total:"),
+				len(runIDs), len(initJobs),
+			))
+
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" INITIATOR SUMMARY") + "\n")
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+				fmt.Sprintf(" %s", strings.Repeat("─", m.Viewport.Width-2)),
+			) + "\n")
+
+			if len(initJobs) == 0 {
+				sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  No jobs found for this initiator.") + "\n")
+			} else {
+				sb.WriteString(" " + jobStatusCountsLine(initJobs) + "\n\n")
+				writeJobSummaryRows(&sb, m.TargetOrg, initJobs, m.Viewport.Width, m.JobDurationHistory)
+			}
+
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" "+jobDetailPinHint(pinned)) + "\n")
+
+		// If a run is focused (or the cursor rests on its header), show a
+		// summary of every job in that run.
+		case detailRunID != 0:
+			runJobs := jobsForRun(m.JobQueue, detailRunID)
 			var runHeaderJob *jobs.JobItem
 			for _, j := range m.JobQueue {
-				if j.RunID == m.FocusedRunID {
-					if j.IsRunHeader {
-						runHeaderJob = j
-					} else {
-						runJobs = append(runJobs, j)
-					}
+				if j.RunID == detailRunID && j.IsRunHeader {
+					runHeaderJob = j
+					break
 				}
 			}
 
@@ -240,21 +316,7 @@ func (m *Model) updateViewport() {
 			sb.WriteString(fmt.Sprintf(" %s FOCUSED RUN: %s\n\n", iconQueue, runLink))
 
 			// Trigger info
-			triggerStr := "push"
-			if metaJob.Event != "" {
-				triggerStr = metaJob.Event
-			}
-			if metaJob.PRNumber != 0 {
-				prLabel := fmt.Sprintf("PR #%d", metaJob.PRNumber)
-				prURL := metaJob.PRURL
-				if prURL == "" {
-					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, metaJob.Repo, metaJob.PRNumber)
-				}
-				triggerStr = fmt.Sprintf("%s (%s)", Hyperlink(prLabel, prURL), metaJob.Event)
-			} else if metaJob.Branch != "" {
-				branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, metaJob.Repo, metaJob.Branch)
-				triggerStr = fmt.Sprintf("%s on %s", triggerStr, Hyperlink(metaJob.Branch, branchURL))
-			}
+			triggerStr := formatJobTrigger(m.TargetOrg, metaJob)
 
 			sb.WriteString(fmt.Sprintf(" %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Repo:"),
@@ -278,82 +340,13 @@ func (m *Model) updateViewport() {
 			if len(runJobs) == 0 {
 				sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  No jobs found for this run.") + "\n")
 			} else {
-				// Calculate status counts
-				statusCounts := make(map[jobs.JobStatus]int)
-				for _, j := range runJobs {
-					statusCounts[j.Status]++
-				}
-
-				// Status summary line
-				var statusParts []string
-				if statusCounts[jobs.JobRunning] > 0 {
-					statusParts = append(statusParts, lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf("%d running", statusCounts[jobs.JobRunning])))
-				}
-				if statusCounts[jobs.JobQueued] > 0 {
-					statusParts = append(statusParts, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(fmt.Sprintf("%d queued", statusCounts[jobs.JobQueued])))
-				}
-				if statusCounts[jobs.JobPassed] > 0 {
-					statusParts = append(statusParts, lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(fmt.Sprintf("%d passed", statusCounts[jobs.JobPassed])))
-				}
-				if statusCounts[jobs.JobFailed] > 0 {
-					statusParts = append(statusParts, lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render(fmt.Sprintf("%d failed", statusCounts[jobs.JobFailed])))
-				}
-				if statusCounts[jobs.JobCancelled] > 0 {
-					statusParts = append(statusParts, lipgloss.NewStyle().Foreground(colorMuted).Bold(true).Render(fmt.Sprintf("%d cancelled", statusCounts[jobs.JobCancelled])))
-				}
-				sb.WriteString(" " + strings.Join(statusParts, "  |  ") + "\n\n")
-
-				// Individual job rows
-				nameMaxLen := m.Viewport.Width - 40
-				if nameMaxLen < 15 {
-					nameMaxLen = 15
-				}
-
-				for idx, j := range runJobs {
-					var jColor lipgloss.Color
-					var jGlyph string
-					switch j.Status {
-					case jobs.JobRunning:
-						jColor, jGlyph = colorSecondary, "⚡"
-					case jobs.JobPassed:
-						jColor, jGlyph = colorGreen, "󰄬"
-					case jobs.JobFailed:
-						jColor, jGlyph = colorRed, "󰅙"
-					case jobs.JobCancelled:
-						jColor, jGlyph = colorMuted, "⊘"
-					default:
-						jColor, jGlyph = colorYellow, "⏳"
-					}
-
-					jLink := Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(j.ID), fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID))
-					_, jobToken := parseJobHierarchy(j.Name, j.Repo)
-					jNameTrunc := truncateString(jobToken, nameMaxLen)
-
-					runnerStr := j.RunnerName
-					if runnerStr == "" {
-						runnerStr = "awaiting"
-					}
-					runnerStr = truncateString(runnerStr, 20)
-
-					treeConnector := "├─"
-					if idx == len(runJobs)-1 {
-						treeConnector = "└─"
-					}
-
-					sb.WriteString(fmt.Sprintf("  %s %s  %s  %s  %s%s  %s\n",
-						treeConnector,
-						lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
-						jLink,
-						lipgloss.NewStyle().Foreground(colorSecondary).Render(jNameTrunc),
-						lipgloss.NewStyle().Foreground(colorMuted).Render(iconRunner+" "),
-						lipgloss.NewStyle().Foreground(colorMuted).Render(runnerStr),
-						lipgloss.NewStyle().Foreground(colorMuted).Render(j.Duration),
-					))
-				}
+				sb.WriteString(" " + jobStatusCountsLine(runJobs) + "\n\n")
+				writeJobSummaryRows(&sb, m.TargetOrg, runJobs, m.Viewport.Width, m.JobDurationHistory)
 			}
 
-			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" Press Enter or Esc to unfocus") + "\n")
-		} else {
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" "+jobDetailPinHint(pinned)) + "\n")
+
+		default:
 			statusBadge := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ " + string(job.Status))
 			if job.Status == jobs.JobRunning {
 				statusBadge = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("⚡ " + string(job.Status))
@@ -375,21 +368,7 @@ func (m *Model) updateViewport() {
 				runnerDisplay = "Awaiting available runner node..."
 			}
 
-			triggerStr := "push"
-			if job.Event != "" {
-				triggerStr = job.Event
-			}
-			if job.PRNumber != 0 {
-				prLabel := fmt.Sprintf("PR #%d", job.PRNumber)
-				prURL := job.PRURL
-				if prURL == "" {
-					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, job.Repo, job.PRNumber)
-				}
-				triggerStr = fmt.Sprintf("%s (%s)", Hyperlink(prLabel, prURL), job.Event)
-			} else if job.Branch != "" {
-				branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, job.Repo, job.Branch)
-				triggerStr = fmt.Sprintf("%s on %s", triggerStr, Hyperlink(job.Branch, branchURL))
-			}
+			triggerStr := formatJobTrigger(m.TargetOrg, job)
 
 			sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  Duration: %s\n\n",
 				iconQueue,
@@ -397,7 +376,7 @@ func (m *Model) updateViewport() {
 				statusBadge,
 				iconFolder,
 				lipgloss.NewStyle().Foreground(colorPrimary).Render(job.Repo),
-				job.Duration,
+				formatJobTiming(job, m.JobDurationHistory),
 			))
 
 			sb.WriteString(fmt.Sprintf(" %s  %s\n",
@@ -996,12 +975,12 @@ func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight in
 
 	if len(runningNames) > 0 {
 		glyph := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Width(2).Render("⚡")
-		label := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf(" RUNNING (%d): ", len(runningNames)))
+		label := lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(fmt.Sprintf(" (%d): ", len(runningNames)))
 		names := lipgloss.NewStyle().Foreground(colorGreen).Render(strings.Join(runningNames, ", "))
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
 	}
 	if len(idleNames) > 0 {
-		glyph := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Width(2).Render("●")
+		glyph := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Width(2).Render("💤")
 		label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(fmt.Sprintf(" IDLE (%d): ", len(idleNames)))
 		names := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Join(idleNames, ", "))
 		runnerLines = append(runnerLines, clipLine(" "+glyph+label+names))
@@ -1029,6 +1008,228 @@ func (m Model) renderRunnersPanel(leftWidth, paneInnerWidth, runnersBoxHeight in
 		Width(leftWidth - 2).
 		Height(runnersBoxHeight).
 		Render(strings.Join(sliceLines(runnerLines, runnersBoxHeight), "\n"))
+}
+
+// jobQueueRowKind distinguishes a real job row from the two kinds of
+// synthetic header rows the OVERALL JOB QUEUE panel groups jobs under.
+type jobQueueRowKind int
+
+const (
+	rowKindJob jobQueueRowKind = iota
+	rowKindRunHeader
+	rowKindInitiatorHeader
+)
+
+// jobQueueRow is one visible row in the OVERALL JOB QUEUE panel. itemIndex
+// always points at the JobQueue entry driving the row's content — for a
+// header row, that's the group's first job, used to build the header text.
+// initiatorKey is set on rowKindInitiatorHeader rows.
+type jobQueueRow struct {
+	itemIndex    int
+	kind         jobQueueRowKind
+	initiatorKey string
+}
+
+func (r jobQueueRow) isHeader() bool { return r.kind != rowKindJob }
+
+// jobInitiatorKey identifies what triggered a job: the PR that caused it, or
+// (for a direct push, schedule, workflow_dispatch, etc.) its branch/event.
+// Repo-qualified because FetchOrgJobQueue merges every repo into one flat
+// queue, and PR numbers collide across repos. PRNumber is preferred over
+// Branch when both are present since it's the more specific identity, but
+// PRNumber is 0 for PR runs from forks and several non-pull_request events
+// (see jobs.extractPRInfo), so those fall back to branch/event grouping —
+// the same thing a direct push would use.
+func jobInitiatorKey(j *jobs.JobItem) string {
+	if j.PRNumber != 0 {
+		return fmt.Sprintf("%s#pr:%d", j.Repo, j.PRNumber)
+	}
+	branch := j.Branch
+	if branch == "" {
+		branch = j.Event
+	}
+	return fmt.Sprintf("%s#branch:%s", j.Repo, branch)
+}
+
+// buildJobQueueRows expands queue into its full list of rendered rows:
+// one initiator header per distinct PR/branch (in first-appearance order,
+// collating that initiator's jobs contiguously even if they're interleaved
+// in queue), one run header above each multi-job run's children within it,
+// then the job rows themselves. Rendering (renderJobsPanel) and mouse click
+// hit-testing (handleMouseMsg) both walk this same list — and m.SelectedJobIndex
+// indexes into it directly — so nothing can drift out of sync with what's
+// actually drawn on screen.
+func buildJobQueueRows(queue []*jobs.JobItem) []jobQueueRow {
+	runCounts := make(map[int64]int)
+	for _, j := range queue {
+		if j.RunID != 0 {
+			runCounts[j.RunID]++
+		}
+	}
+
+	var initiatorOrder []string
+	initiatorIndices := make(map[string][]int)
+	for i, j := range queue {
+		key := jobInitiatorKey(j)
+		if _, seen := initiatorIndices[key]; !seen {
+			initiatorOrder = append(initiatorOrder, key)
+		}
+		initiatorIndices[key] = append(initiatorIndices[key], i)
+	}
+
+	renderedRuns := make(map[int64]bool)
+	rows := make([]jobQueueRow, 0, len(queue)*2)
+	for _, key := range initiatorOrder {
+		indices := initiatorIndices[key]
+		rows = append(rows, jobQueueRow{itemIndex: indices[0], kind: rowKindInitiatorHeader, initiatorKey: key})
+		for _, i := range indices {
+			j := queue[i]
+			if runCounts[j.RunID] > 1 && !renderedRuns[j.RunID] {
+				renderedRuns[j.RunID] = true
+				rows = append(rows, jobQueueRow{itemIndex: i, kind: rowKindRunHeader})
+			}
+			rows = append(rows, jobQueueRow{itemIndex: i, kind: rowKindJob})
+		}
+	}
+	return rows
+}
+
+// jobQueueVisibleWindow returns the slice of rows that should be visible for
+// the given selected row index and row budget, keeping the selection within
+// view, plus that slice's start offset into rows (so a caller resolving a
+// click within the window can recover the row's absolute index). selectedRowIdx
+// is an index into rows itself (m.SelectedJobIndex), not a JobQueue index —
+// headers are selectable rows with no JobQueue entry of their own, so
+// item-index arithmetic can't locate them.
+func jobQueueVisibleWindow(rows []jobQueueRow, selectedRowIdx, maxRows int) (window []jobQueueRow, start int) {
+	if maxRows < 1 {
+		maxRows = 1
+	}
+	if selectedRowIdx >= maxRows {
+		start = selectedRowIdx - maxRows + 1
+	}
+	end := start + maxRows
+	if end > len(rows) {
+		end = len(rows)
+	}
+	if start > end {
+		start = end
+	}
+	return rows[start:end], start
+}
+
+// selectedJobRow resolves m.SelectedJobIndex against the OVERALL JOB QUEUE
+// panel's current row list. ok is false when there's nothing to select
+// (empty queue, or an index left stale by a shrinking refresh).
+func (m Model) selectedJobRow() (rows []jobQueueRow, row jobQueueRow, ok bool) {
+	rows = buildJobQueueRows(m.JobQueue)
+	if m.SelectedJobIndex < 0 || m.SelectedJobIndex >= len(rows) {
+		return rows, jobQueueRow{}, false
+	}
+	return rows, rows[m.SelectedJobIndex], true
+}
+
+// selectedJob returns the JobQueue entry for the current selection, or nil
+// when the selection is a header row (initiator or run) rather than a job —
+// callers that need one concrete job (log fetch, push/PR actions) skip
+// their action in that case instead of guessing which child job was meant.
+func (m Model) selectedJob() *jobs.JobItem {
+	_, row, ok := m.selectedJobRow()
+	if !ok || row.kind != rowKindJob {
+		return nil
+	}
+	return m.JobQueue[row.itemIndex]
+}
+
+// Widths of the OVERALL JOB QUEUE panel's fixed columns.
+const (
+	// jobStatusBadgeW is the status glyph column. Fixed rather than measured
+	// so emoji (⚡, ⏳) and Nerd Font glyphs (󰄬, 󰅙) start every row's text at
+	// the same offset.
+	jobStatusBadgeW = 2
+	// Bounds on the progress bar inside a running job's timing readout.
+	jobProgressBarMinW = 6
+	jobProgressBarMaxW = 14
+)
+
+// jobProgress measures a running job against the average duration of past
+// runs of the same workflow: the fraction elapsed (clamped to 0-1) and the
+// time remaining, which goes negative once the job outlasts that average.
+// ok is false when there's no history to estimate against, or the job hasn't
+// reported an elapsed time yet.
+func jobProgress(j *jobs.JobItem, history map[string][]time.Duration) (pct float64, remaining time.Duration, ok bool) {
+	samples := history[j.WorkflowName]
+	if len(samples) == 0 || j.Seconds <= 0 {
+		return 0, 0, false
+	}
+	var total time.Duration
+	for _, s := range samples {
+		total += s
+	}
+	avg := total / time.Duration(len(samples))
+	if avg <= 0 {
+		return 0, 0, false
+	}
+	elapsed := time.Duration(j.Seconds) * time.Second
+	pct = elapsed.Seconds() / avg.Seconds()
+	if pct > 1 {
+		pct = 1
+	}
+	return pct, avg - elapsed, true
+}
+
+// jobRowTrailer renders a queue row's right-hand column, and reports the
+// width it occupies so the caller can size the job-name column against it.
+// A running job shows elapsed time, a progress bar against past runs of the
+// same workflow, and the estimated time remaining — its runner name is
+// dropped, since what a live job needs to answer is "how much longer", not
+// "where". Without duration history there's nothing to measure against, so
+// such a job shows elapsed time alone. Every other row keeps the runner, or
+// "awaiting" while it has none.
+func (m Model) jobRowTrailer(j *jobs.JobItem, paneInnerWidth int) (trailer string, width int) {
+	muted := lipgloss.NewStyle().Foreground(colorMuted)
+
+	if j.Status == jobs.JobRunning {
+		elapsed := j.Duration
+		if elapsed == "" || elapsed == "-" {
+			elapsed = "0s"
+		}
+		pct, remaining, ok := jobProgress(j, m.JobDurationHistory)
+		if !ok {
+			return muted.Render(elapsed), lipgloss.Width(elapsed)
+		}
+
+		remainStr := "overdue"
+		if remaining > 0 {
+			remainStr = "~" + jobs.FormatDuration(remaining)
+		}
+
+		barW := paneInnerWidth / 4
+		if barW > jobProgressBarMaxW {
+			barW = jobProgressBarMaxW
+		}
+		if barW < jobProgressBarMinW {
+			barW = jobProgressBarMinW
+		}
+		bar := m.ProgressBar
+		bar.Width = barW
+
+		trailer = fmt.Sprintf("%s %s %s", muted.Render(elapsed), bar.ViewAs(pct), muted.Render(remainStr))
+		return trailer, lipgloss.Width(elapsed) + 1 + barW + 1 + lipgloss.Width(remainStr)
+	}
+
+	runnerStr := j.RunnerName
+	if runnerStr == "" {
+		runnerStr = "awaiting"
+	}
+	width = len(runnerStr) + 2 // include "→ " prefix
+	if width < 10 {
+		width = 10
+	}
+	if width > 28 {
+		width = 28
+	}
+	return muted.Width(width).Render("→ " + truncateString(runnerStr, width-2)), width
 }
 
 // renderJobsPanel renders PANEL 3: OVERALL JOB QUEUE.
@@ -1068,14 +1269,6 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 	if maxJobRows < 1 {
 		maxJobRows = 1
 	}
-	jobStartIdx := 0
-	if m.SelectedJobIndex >= maxJobRows {
-		jobStartIdx = m.SelectedJobIndex - maxJobRows + 1
-	}
-	jobEndIdx := jobStartIdx + maxJobRows
-	if jobEndIdx > len(m.JobQueue) {
-		jobEndIdx = len(m.JobQueue)
-	}
 
 	// Detect grouped runs to add tree branch connectors for matrix jobs
 	runCounts := make(map[int64]int)
@@ -1087,9 +1280,12 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 		}
 	}
 
-	renderedRuns := make(map[int64]bool)
+	allRows := buildJobQueueRows(m.JobQueue)
+	visibleRows, windowStart := jobQueueVisibleWindow(allRows, m.SelectedJobIndex, maxJobRows)
 
-	for i := jobStartIdx; i < jobEndIdx; i++ {
+	for lineOffset, row := range visibleRows {
+		isSelected := m.ActiveFocus == FocusJobs && windowStart+lineOffset == m.SelectedJobIndex
+		i := row.itemIndex
 		j := m.JobQueue[i]
 		runToken, jobToken := parseJobHierarchy(j.Name, j.Repo)
 
@@ -1106,21 +1302,26 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 			stColor = colorRed
 		}
 
-		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, j.Status))
+		// The glyph alone carries the status — spelling it out again
+		// ("QUEUED") only cost the panel a column that job names and timing
+		// need more. Fixed width so mixed-width glyphs still line the rows up.
+		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Width(jobStatusBadgeW).Render(stSymbol)
 
-		// If this job is part of a multi-job run and we haven't rendered the parent run header yet:
-		if runCounts[j.RunID] > 1 && !renderedRuns[j.RunID] {
-			renderedRuns[j.RunID] = true
-			runTitleText := runToken
-			if j.RunID != 0 {
-				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
-				runTitleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken), runURL)
-			} else {
-				runTitleText = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken)
+		if row.kind == rowKindInitiatorHeader {
+			var initJobs []*jobs.JobItem
+			for _, oj := range m.JobQueue {
+				if jobInitiatorKey(oj) == row.initiatorKey {
+					initJobs = append(initJobs, oj)
+				}
 			}
+			statuses := make([]jobs.JobStatus, len(initJobs))
+			for k, oj := range initJobs {
+				statuses[k] = oj.Status
+			}
+			aggGlyph, aggColor := jobStatusGlyph(aggregateJobStatus(statuses))
+			aggBadge := lipgloss.NewStyle().Foreground(aggColor).Bold(true).Width(jobStatusBadgeW).Render(aggGlyph)
 
-			// Format Trigger badge with hyperlink
-			triggerBadge := ""
+			var titleText string
 			if j.PRNumber != 0 {
 				prLabel := fmt.Sprintf("PR #%d", j.PRNumber)
 				if j.PRTitle != "" {
@@ -1130,32 +1331,45 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				if prURL == "" {
 					prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", m.TargetOrg, j.Repo, j.PRNumber)
 				}
-				triggerBadge = lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(" (" + Hyperlink(prLabel, prURL) + ")")
-			} else if j.Event != "" {
-				eventText := fmt.Sprintf("(%s)", j.Event)
-				if j.Branch != "" {
-					branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, j.Repo, j.Branch)
-					eventText = fmt.Sprintf("(%s on %s)", j.Event, Hyperlink(j.Branch, branchURL))
+				titleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(prLabel), prURL)
+			} else {
+				branch := j.Branch
+				if branch == "" {
+					branch = j.Event
 				}
-				triggerBadge = " " + lipgloss.NewStyle().Foreground(colorMuted).Render(eventText)
+				branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", m.TargetOrg, j.Repo, branch)
+				titleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(branch), branchURL)
 			}
 
-			runHeaderLine := fmt.Sprintf("  %s %s%s", stBadge, runTitleText, triggerBadge)
-			jobsLines = append(jobsLines, clipLine(runHeaderLine))
+			initHeaderLine := fmt.Sprintf(" %s %s  %s", aggBadge, titleText, lipgloss.NewStyle().Foreground(colorMuted).Render(j.Repo))
+			if isSelected {
+				jobsLines = append(jobsLines, clipLine(selectedRowStyle.MaxWidth(paneInnerWidth).Render(">"+initHeaderLine)))
+			} else {
+				jobsLines = append(jobsLines, clipLine(initHeaderLine))
+			}
+			continue
 		}
 
-		runnerStr := j.RunnerName
-		if runnerStr == "" {
-			runnerStr = "awaiting"
+		if row.kind == rowKindRunHeader {
+			runTitleText := runToken
+			if j.RunID != 0 {
+				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
+				runTitleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken), runURL)
+			} else {
+				runTitleText = lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken)
+			}
+
+			triggerBadge := formatCompactTriggerBadge(m.TargetOrg, j)
+			runHeaderLine := fmt.Sprintf("  %s %s%s", stBadge, runTitleText, triggerBadge)
+			if isSelected {
+				jobsLines = append(jobsLines, clipLine(selectedRowStyle.MaxWidth(paneInnerWidth).Render(" >"+runHeaderLine)))
+			} else {
+				jobsLines = append(jobsLines, clipLine(runHeaderLine))
+			}
+			continue
 		}
-		runnerW := len(runnerStr) + 2 // include "→ " prefix
-		if runnerW < 10 {
-			runnerW = 10
-		}
-		if runnerW > 28 {
-			runnerW = 28
-		}
-		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render("→ " + truncateString(runnerStr, runnerW-2))
+
+		trailer, trailerW := m.jobRowTrailer(j, paneInnerWidth)
 
 		var line string
 		if runCounts[j.RunID] > 1 {
@@ -1166,7 +1380,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				treeConnector = "└─ "
 			}
 
-			nameW := paneInnerWidth - 4 - 5 - runnerW - 1
+			nameW := paneInnerWidth - 4 - 5 - trailerW - 1
 			if nameW < 10 {
 				nameW = 10
 			}
@@ -1178,10 +1392,10 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				}
 				jobStrText = Hyperlink(jobStrText, jobURL)
 			}
-			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStrText, runnerAssigned)
+			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStrText, trailer)
 		} else {
 			// Single job run
-			nameW := paneInnerWidth - 4 - 9 - 1 - runnerW - 1
+			nameW := paneInnerWidth - 4 - jobStatusBadgeW - 1 - trailerW - 1
 			if nameW < 10 {
 				nameW = 10
 			}
@@ -1193,10 +1407,10 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				}
 				jobStrText = Hyperlink(jobStrText, jobURL)
 			}
-			line = fmt.Sprintf("%s %s %s", stBadge, jobStrText, runnerAssigned)
+			line = fmt.Sprintf("%s %s %s", stBadge, jobStrText, trailer)
 		}
 
-		if m.ActiveFocus == FocusJobs && i == m.SelectedJobIndex {
+		if isSelected {
 			jobsLines = append(jobsLines, clipLine(selectedRowStyle.MaxWidth(paneInnerWidth).Render("> "+line)))
 		} else {
 			jobsLines = append(jobsLines, clipLine(normalRowStyle.Render("  "+line)))
@@ -1250,6 +1464,8 @@ func (m Model) renderStatusBadge(item *git.RepoItem) string {
 		return badgeError.Render(iconError)
 	case git.StatusArchived:
 		return badgeArchived.Render(iconTrash)
+	case git.StatusSkipped:
+		return badgeSkipped.Render(iconSkipped)
 	case git.StatusSyncing:
 		return m.Spinner.View()
 	default:
@@ -1266,6 +1482,215 @@ func truncateString(str string, maxLen int) string {
 		return string(runes[:maxLen])
 	}
 	return string(runes[:maxLen-3]) + "..."
+}
+
+// jobStatusGlyph returns the icon and color used to represent a JobStatus.
+func jobStatusGlyph(status jobs.JobStatus) (glyph string, color lipgloss.Color) {
+	switch status {
+	case jobs.JobRunning:
+		return "⚡", colorSecondary
+	case jobs.JobPassed:
+		return "󰄬", colorGreen
+	case jobs.JobFailed:
+		return "󰅙", colorRed
+	case jobs.JobCancelled:
+		return "⊘", colorMuted
+	default: // JobQueued and anything else
+		return "⏳", colorYellow
+	}
+}
+
+// aggregateJobStatus reduces a group of job statuses to one "worst status
+// wins" overall status, for a run's or initiator's aggregate badge: a single
+// failure marks the whole group failed even if others already passed, and a
+// still-running job outranks anything queued/passed/cancelled.
+func aggregateJobStatus(statuses []jobs.JobStatus) jobs.JobStatus {
+	severity := map[jobs.JobStatus]int{
+		jobs.JobFailed:    4,
+		jobs.JobRunning:   3,
+		jobs.JobQueued:    2,
+		jobs.JobCancelled: 1,
+		jobs.JobPassed:    0,
+	}
+	best := jobs.JobPassed
+	bestSeverity := -1
+	for _, st := range statuses {
+		if sev := severity[st]; sev > bestSeverity {
+			bestSeverity = sev
+			best = st
+		}
+	}
+	return best
+}
+
+// formatCompactTriggerBadge renders a job's trigger as a small parenthesized
+// badge for the OVERALL JOB QUEUE panel's header rows (run and initiator):
+// " (PR #123: title)" when PR-triggered, " (push on branch)" otherwise.
+func formatCompactTriggerBadge(org string, j *jobs.JobItem) string {
+	if j.PRNumber != 0 {
+		prLabel := fmt.Sprintf("PR #%d", j.PRNumber)
+		if j.PRTitle != "" {
+			prLabel = fmt.Sprintf("PR #%d: %s", j.PRNumber, j.PRTitle)
+		}
+		prURL := j.PRURL
+		if prURL == "" {
+			prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, j.Repo, j.PRNumber)
+		}
+		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(" (" + Hyperlink(prLabel, prURL) + ")")
+	}
+	if j.Event != "" {
+		eventText := fmt.Sprintf("(%s)", j.Event)
+		if j.Branch != "" {
+			branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", org, j.Repo, j.Branch)
+			eventText = fmt.Sprintf("(%s on %s)", j.Event, Hyperlink(j.Branch, branchURL))
+		}
+		return " " + lipgloss.NewStyle().Foreground(colorMuted).Render(eventText)
+	}
+	return ""
+}
+
+// formatJobTrigger renders a job's trigger — the PR that caused it (linked,
+// with its GitHub event in parens), or the branch/event a direct push ran
+// on — as one styled string, for the detail views (single-job, focused run,
+// focused initiator). Distinct from formatCompactTriggerBadge, which uses a
+// tighter parenthesized style for the compact panel's header rows.
+func formatJobTrigger(org string, j *jobs.JobItem) string {
+	triggerStr := "push"
+	if j.Event != "" {
+		triggerStr = j.Event
+	}
+	if j.PRNumber != 0 {
+		prLabel := fmt.Sprintf("PR #%d", j.PRNumber)
+		prURL := j.PRURL
+		if prURL == "" {
+			prURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", org, j.Repo, j.PRNumber)
+		}
+		return fmt.Sprintf("%s (%s)", Hyperlink(prLabel, prURL), j.Event)
+	}
+	if j.Branch != "" {
+		branchURL := fmt.Sprintf("https://github.com/%s/%s/tree/%s", org, j.Repo, j.Branch)
+		return fmt.Sprintf("%s on %s", triggerStr, Hyperlink(j.Branch, branchURL))
+	}
+	return triggerStr
+}
+
+// formatJobTiming renders a running job's elapsed time, plus an estimated
+// total when historical samples exist for its workflow — "3m12s / ~5m40s" —
+// or just the elapsed duration otherwise. A non-running job's Duration is
+// already a completed total (e.g. "4m02s"), so it's returned as-is.
+func formatJobTiming(j *jobs.JobItem, history map[string][]time.Duration) string {
+	if j.Status != jobs.JobRunning {
+		return j.Duration
+	}
+	samples := history[j.WorkflowName]
+	if len(samples) == 0 {
+		return j.Duration
+	}
+	var total time.Duration
+	for _, s := range samples {
+		total += s
+	}
+	avg := total / time.Duration(len(samples))
+	return fmt.Sprintf("%s / ~%s", j.Duration, jobs.FormatDuration(avg))
+}
+
+// jobsForRun returns every job sharing runID, in queue order — the "FOCUSED
+// RUN" detail view's data source.
+func jobsForRun(queue []*jobs.JobItem, runID int64) []*jobs.JobItem {
+	var out []*jobs.JobItem
+	for _, j := range queue {
+		if j.RunID == runID && !j.IsRunHeader {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// jobsForInitiator returns every job under the given initiator key (see
+// jobInitiatorKey), in queue order — the "FOCUSED INITIATOR" detail view's
+// data source.
+func jobsForInitiator(queue []*jobs.JobItem, key string) []*jobs.JobItem {
+	var out []*jobs.JobItem
+	for _, j := range queue {
+		if jobInitiatorKey(j) == key {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// jobDetailPinHint labels the detail pane's footer for a group view: pinned
+// (Enter) views survive the cursor moving off the group's header row, so
+// they need an explicit way out; a view the cursor is merely resting on
+// doesn't.
+func jobDetailPinHint(pinned bool) string {
+	if pinned {
+		return "Press Enter or Esc to unfocus"
+	}
+	return "Press Enter to pin this view"
+}
+
+// jobStatusCountsLine tallies a group's statuses into a styled "N running |
+// N queued | ..." summary line, omitting any status with zero jobs.
+func jobStatusCountsLine(group []*jobs.JobItem) string {
+	counts := make(map[jobs.JobStatus]int)
+	for _, j := range group {
+		counts[j.Status]++
+	}
+	order := []struct {
+		status jobs.JobStatus
+		label  string
+	}{
+		{jobs.JobRunning, "running"},
+		{jobs.JobQueued, "queued"},
+		{jobs.JobPassed, "passed"},
+		{jobs.JobFailed, "failed"},
+		{jobs.JobCancelled, "cancelled"},
+	}
+	var parts []string
+	for _, o := range order {
+		if n := counts[o.status]; n > 0 {
+			_, color := jobStatusGlyph(o.status)
+			parts = append(parts, lipgloss.NewStyle().Foreground(color).Bold(true).Render(fmt.Sprintf("%d %s", n, o.label)))
+		}
+	}
+	return strings.Join(parts, "  |  ")
+}
+
+// writeJobSummaryRows appends one tree-style line per job in group to sb —
+// shared by the "FOCUSED RUN" and "FOCUSED INITIATOR" detail views.
+func writeJobSummaryRows(sb *strings.Builder, org string, group []*jobs.JobItem, viewportWidth int, history map[string][]time.Duration) {
+	nameMaxLen := viewportWidth - 40
+	if nameMaxLen < 15 {
+		nameMaxLen = 15
+	}
+	for idx, j := range group {
+		jGlyph, jColor := jobStatusGlyph(j.Status)
+		jLink := Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(j.ID), fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", org, j.Repo, j.RunID))
+		_, jobToken := parseJobHierarchy(j.Name, j.Repo)
+		jNameTrunc := truncateString(jobToken, nameMaxLen)
+
+		runnerStr := j.RunnerName
+		if runnerStr == "" {
+			runnerStr = "awaiting"
+		}
+		runnerStr = truncateString(runnerStr, 20)
+
+		treeConnector := "├─"
+		if idx == len(group)-1 {
+			treeConnector = "└─"
+		}
+
+		sb.WriteString(fmt.Sprintf("  %s %s  %s  %s  %s%s  %s\n",
+			treeConnector,
+			lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
+			jLink,
+			lipgloss.NewStyle().Foreground(colorSecondary).Render(jNameTrunc),
+			lipgloss.NewStyle().Foreground(colorMuted).Render(iconRunner+" "),
+			lipgloss.NewStyle().Foreground(colorMuted).Render(runnerStr),
+			lipgloss.NewStyle().Foreground(colorMuted).Render(formatJobTiming(j, history)),
+		))
+	}
 }
 
 func parseJobHierarchy(fullName, repo string) (runName, jobName string) {

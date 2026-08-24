@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -29,7 +30,9 @@ func TestFocusedRunViewportRendering(t *testing.T) {
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 1
+	// Row 0 is the synthetic initiator header, row 1 the synthetic run
+	// header (all 4 jobs share RunID 100), row 2 is the first job ("build").
+	m.SelectedJobIndex = 2
 	m.JobQueue = []*jobs.JobItem{
 		{ID: "run-100", Name: "myrepo / ci", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, IsRunHeader: true, Event: "push", Branch: "main"},
 		{ID: "#101", Name: "myrepo / ci / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, Event: "push", Branch: "main", Duration: "1m 30s", RunnerName: "runner-1"},
@@ -96,7 +99,9 @@ func TestEnterUnfocusesWhenFocusedRunMatches(t *testing.T) {
 func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
 	m := newTestModel("/tmp/test", "test-org")
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 0
+	// Row 0 is this job's synthetic initiator header (every job gets one);
+	// row 1 is the job itself, since it's not part of a multi-job run.
+	m.SelectedJobIndex = 1
 	m.FocusedRunID = 0
 	m.JobQueue = []*jobs.JobItem{
 		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100},
@@ -109,6 +114,106 @@ func TestEnterFocusesOnSelectedJobRun(t *testing.T) {
 	if updated.FocusedRunID != 100 {
 		t.Errorf("pressing Enter should focus on the selected job's run (100), got %d", updated.FocusedRunID)
 	}
+}
+
+// Enter on an initiator header (row 0, above any single job) focuses the
+// initiator instead of a run — there's no run to focus at that row.
+func TestEnterFocusesOnSelectedInitiator(t *testing.T) {
+	m := newTestModel("/tmp/test", "test-org")
+	m.ActiveFocus = FocusJobs
+	m.SelectedJobIndex = 0
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#101", Name: "myrepo / build", Repo: "myrepo", Status: jobs.JobRunning, RunID: 100, PRNumber: 7},
+	}
+
+	msg := tea.KeyMsg{Type: tea.KeyEnter}
+	newModel, _ := m.Update(msg)
+	updated := newModel.(Model)
+
+	if updated.FocusedInitiatorKey != "myrepo#pr:7" {
+		t.Errorf("pressing Enter on the initiator header should set FocusedInitiatorKey, got %q", updated.FocusedInitiatorKey)
+	}
+	if updated.FocusedRunID != 0 {
+		t.Errorf("focusing an initiator should not also set FocusedRunID, got %d", updated.FocusedRunID)
+	}
+}
+
+// buildJobQueueRows groups jobs by initiator (PR, else branch/event) and
+// visually collates each initiator's jobs, inserting a run header above any
+// run with more than one job — this is the panel's single source of truth
+// for row layout, shared by rendering and click/keyboard selection.
+func TestBuildJobQueueRows(t *testing.T) {
+	t.Run("single job under one initiator gets only an initiator header", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / build", RunID: 1, PRNumber: 7},
+		}
+		rows := buildJobQueueRows(queue)
+		if len(rows) != 2 {
+			t.Fatalf("expected 2 rows (initiator header + job), got %d: %+v", len(rows), rows)
+		}
+		if rows[0].kind != rowKindInitiatorHeader || rows[0].initiatorKey != "repo1#pr:7" {
+			t.Errorf("expected row 0 to be the initiator header for repo1#pr:7, got %+v", rows[0])
+		}
+		if rows[1].kind != rowKindJob || rows[1].itemIndex != 0 {
+			t.Errorf("expected row 1 to be the job itself, got %+v", rows[1])
+		}
+	})
+
+	t.Run("multi-job run gets both an initiator and a run header", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / lint", RunID: 1, PRNumber: 7},
+			{Repo: "repo1", Name: "repo1 / test", RunID: 1, PRNumber: 7},
+		}
+		rows := buildJobQueueRows(queue)
+		wantKinds := []jobQueueRowKind{rowKindInitiatorHeader, rowKindRunHeader, rowKindJob, rowKindJob}
+		if len(rows) != len(wantKinds) {
+			t.Fatalf("expected %d rows, got %d: %+v", len(wantKinds), len(rows), rows)
+		}
+		for i, want := range wantKinds {
+			if rows[i].kind != want {
+				t.Errorf("row %d: expected kind %v, got %v", i, want, rows[i].kind)
+			}
+		}
+	})
+
+	t.Run("collates an initiator's jobs even when interleaved with another initiator's in the queue", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / a", RunID: 1, PRNumber: 7}, // initiator A
+			{Repo: "repo1", Name: "repo1 / b", RunID: 2, PRNumber: 9}, // initiator B
+			{Repo: "repo1", Name: "repo1 / c", RunID: 1, PRNumber: 7}, // initiator A again
+		}
+		rows := buildJobQueueRows(queue)
+		var order []string
+		for _, r := range rows {
+			if r.kind == rowKindInitiatorHeader {
+				order = append(order, r.initiatorKey)
+			}
+		}
+		if len(order) != 2 || order[0] != "repo1#pr:7" || order[1] != "repo1#pr:9" {
+			t.Fatalf("expected initiator headers in first-appearance order [repo1#pr:7 repo1#pr:9], got %v", order)
+		}
+		// Initiator A's two jobs (queue indices 0 and 2) must be contiguous,
+		// not split across B's header.
+		var aItemIndices []int
+		for _, r := range rows {
+			if r.kind == rowKindJob && jobInitiatorKey(queue[r.itemIndex]) == "repo1#pr:7" {
+				aItemIndices = append(aItemIndices, r.itemIndex)
+			}
+		}
+		if len(aItemIndices) != 2 || aItemIndices[0] != 0 || aItemIndices[1] != 2 {
+			t.Errorf("expected initiator A's jobs (queue[0], queue[2]) collated together, got item indices %v", aItemIndices)
+		}
+	})
+
+	t.Run("a fork PR job with no PRNumber falls back to branch grouping", func(t *testing.T) {
+		queue := []*jobs.JobItem{
+			{Repo: "repo1", Name: "repo1 / build", RunID: 1, PRNumber: 0, Branch: "feature/x"},
+		}
+		rows := buildJobQueueRows(queue)
+		if rows[0].initiatorKey != "repo1#branch:feature/x" {
+			t.Errorf("expected fallback to branch grouping, got initiator key %q", rows[0].initiatorKey)
+		}
+	})
 }
 
 func TestEscUnfocusesRun(t *testing.T) {
@@ -327,7 +432,9 @@ func TestHyperlinksInView(t *testing.T) {
 	m.Width = 120
 	m.Height = 40
 	m.ActiveFocus = FocusJobs
-	m.SelectedJobIndex = 0
+	// Row 0 is this job's synthetic initiator header (every job gets one);
+	// row 1 is the job itself.
+	m.SelectedJobIndex = 1
 
 	m.JobQueue = []*jobs.JobItem{
 		{
@@ -624,7 +731,7 @@ func TestStartSyncCmdSkipsArchivedAndClones(t *testing.T) {
 
 	// Every candidate is archived, so the stream finishes immediately without
 	// starting a worker.
-	msg := m.startSyncCmd(m.Repos, true)()
+	msg := m.startSyncCmd(m.Repos, true, false)()
 	finished, ok := msg.(syncFinishedMsg)
 	if !ok || !finished.bulk {
 		t.Fatalf("expected a bulk syncFinishedMsg, got %#v", msg)
@@ -729,6 +836,9 @@ func TestHandleLoadedJobQueueMsg(t *testing.T) {
 			{ID: "run-1", Repo: "repo1", Name: "repo1 / ci", Status: jobs.JobRunning, RunID: 1, IsRunHeader: true},
 			{ID: "#1", Repo: "repo1", Name: "repo1 / ci / build", Status: jobs.JobRunning, RunID: 1},
 		}
+		// Row 0 is the synthetic initiator header, row 1 the synthetic run
+		// header (both jobs share RunID 1), row 2 is the first actual job row.
+		m.SelectedJobIndex = 2
 		cmd := m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: partial, err: errors.New("timeout")})
 
 		if !m.JobQueueFetchFailed {
@@ -826,12 +936,12 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		}
 	})
 
-	t.Run("success with autoSync starts a parallel sync", func(t *testing.T) {
+	t.Run("success with autoSync starts a parallel sync restricted to safe actions", func(t *testing.T) {
 		orig := syncRepositoryFn
 		defer func() { syncRepositoryFn = orig }()
-		called := make(chan struct{}, 1)
-		syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
-			called <- struct{}{}
+		called := make(chan bool, 1) // carries the safeOnly arg it was invoked with
+		syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
+			called <- safeOnly
 		}
 
 		m := newTestModel("/tmp/test", "test-org")
@@ -848,7 +958,10 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		}
 
 		select {
-		case <-called:
+		case safeOnly := <-called:
+			if !safeOnly {
+				t.Error("the passive startup sync must call git.SyncRepository with safeOnly=true, so it never auto-switches or auto-rebases a feature branch")
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("expected syncRepositoryFn to be invoked for the loaded repo")
 		}
@@ -875,7 +988,7 @@ func TestStartSyncCmdSemaphoreCapsConcurrency(t *testing.T) {
 	const repoCount = 5 // one more than the concurrency limit (4)
 	started := make(chan struct{}, repoCount)
 	release := make(chan struct{})
-	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
 		started <- struct{}{}
 		<-release
 	}
@@ -887,7 +1000,7 @@ func TestStartSyncCmdSemaphoreCapsConcurrency(t *testing.T) {
 	}
 	m.Repos = repos
 
-	cmd := m.startSyncCmd(m.Repos, true)
+	cmd := m.startSyncCmd(m.Repos, true, false)
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 
@@ -940,7 +1053,7 @@ func TestStartSyncCmdContextCancellationStopsPendingWork(t *testing.T) {
 	const repoCount = 6 // more than the concurrency limit (4), so repos remain pending
 	started := make(chan struct{}, repoCount)
 	release := make(chan struct{}, repoCount)
-	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress) {
+	syncRepositoryFn = func(ctx context.Context, item *git.RepoItem, emit git.SyncProgress, safeOnly bool) {
 		started <- struct{}{}
 		<-release
 	}
@@ -952,7 +1065,7 @@ func TestStartSyncCmdContextCancellationStopsPendingWork(t *testing.T) {
 	}
 	m.Repos = repos
 
-	cmd := m.startSyncCmd(m.Repos, true)
+	cmd := m.startSyncCmd(m.Repos, true, false)
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 
@@ -1462,5 +1575,154 @@ func TestInteractiveLayoutTransitions(t *testing.T) {
 		if lipgloss.Width(line) > m.Width {
 			t.Errorf("After resize Line %d: width %d exceeds %d", i, lipgloss.Width(line), m.Width)
 		}
+	}
+}
+
+// jobPreviewModel builds a two-initiator queue: one single-job run that's
+// running with duration history behind it, one two-job matrix run, and one
+// queued job with no runner yet.
+func jobPreviewModel() Model {
+	m := newTestModel("/tmp", "test-org")
+	m.Width = 160
+	m.Height = 40
+	m.ActiveFocus = FocusJobs
+	m.JobDurationHistory = map[string][]time.Duration{
+		"CI": {5 * time.Minute, 4*time.Minute + 30*time.Second},
+	}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#1", Name: "alpha / ci / build", Repo: "alpha", Status: jobs.JobRunning, RunID: 1, Branch: "main", WorkflowName: "CI", Duration: "2m 10s", Seconds: 130, RunnerName: "pc-alpha"},
+		{ID: "#2", Name: "alpha / dependabot / Dependabot", Repo: "alpha", Status: jobs.JobQueued, RunID: 2, Branch: "main", Duration: "-"},
+		{ID: "#3", Name: "beta / ci / test:e2e", Repo: "beta", Status: jobs.JobRunning, RunID: 3, Branch: "main", WorkflowName: "CI", Duration: "1m 0s", Seconds: 60, RunnerName: "mac-eta"},
+		{ID: "#4", Name: "beta / ci / lint", Repo: "beta", Status: jobs.JobRunning, RunID: 3, Branch: "main", WorkflowName: "unseen", Duration: "40s", Seconds: 40, RunnerName: "mac-kappa"},
+	}
+	return m
+}
+
+// renderTestJobsPanel renders just the OVERALL JOB QUEUE panel, with hyperlink
+// escapes and styling stripped so assertions can match on plain text.
+func renderTestJobsPanel(m Model) string {
+	panel := m.renderJobsPanel(78, 74, 14,
+		func(s string) string { return s },
+		func(l []string, _ int) []string { return l },
+	)
+	return stripANSI(panel)
+}
+
+var ansiPattern = regexp.MustCompile("\x1b\\[[0-9;]*m|\x1b\\]8;;[^\x07]*\x07")
+
+func stripANSI(s string) string { return ansiPattern.ReplaceAllString(s, "") }
+
+func TestJobQueueRowsDropStatusWordAndJobCount(t *testing.T) {
+	panel := renderTestJobsPanel(jobPreviewModel())
+
+	// The header's own "(N running, N queued)" tally is the only place the
+	// status words belong; the per-row badges are glyph-only.
+	body := panel[strings.Index(panel, "queued)"):]
+	if strings.Contains(body, "QUEUED") {
+		t.Errorf("job rows should not spell out QUEUED, got:\n%s", body)
+	}
+	if strings.Contains(body, "RUNNING") {
+		t.Errorf("job rows should not spell out RUNNING, got:\n%s", body)
+	}
+	if strings.Contains(body, "jobs") {
+		t.Errorf("initiator headers should not carry a job count, got:\n%s", body)
+	}
+}
+
+func TestRunningJobRowShowsProgressInsteadOfRunner(t *testing.T) {
+	panel := renderTestJobsPanel(jobPreviewModel())
+
+	if strings.Contains(panel, "pc-alpha") || strings.Contains(panel, "mac-eta") {
+		t.Errorf("a running job's row should drop the runner name, got:\n%s", panel)
+	}
+	if !strings.Contains(panel, "█") || !strings.Contains(panel, "░") {
+		t.Errorf("a running job with duration history should render a progress bar, got:\n%s", panel)
+	}
+	// 2m 10s elapsed against a 4m 45s average leaves ~2m 35s.
+	if !strings.Contains(panel, "2m 10s") || !strings.Contains(panel, "~2m 35s") {
+		t.Errorf("running row should show elapsed and remaining time, got:\n%s", panel)
+	}
+	// The "unseen" workflow has no history, so there's nothing to measure
+	// against — elapsed time alone, no bar and no invented estimate.
+	if !strings.Contains(panel, "40s") {
+		t.Errorf("running row without history should still show elapsed time, got:\n%s", panel)
+	}
+	// A queued job has no elapsed time to show, so it keeps the runner column.
+	if !strings.Contains(panel, "awaiting") {
+		t.Errorf("queued row should still show its runner column, got:\n%s", panel)
+	}
+}
+
+func TestJobProgressClampsAndReportsOverrun(t *testing.T) {
+	history := map[string][]time.Duration{"CI": {2 * time.Minute}}
+
+	pct, remaining, ok := jobProgress(&jobs.JobItem{WorkflowName: "CI", Seconds: 30}, history)
+	if !ok || pct != 0.25 || remaining != 90*time.Second {
+		t.Errorf("got pct=%v remaining=%v ok=%v, want 0.25 / 1m30s / true", pct, remaining, ok)
+	}
+
+	// Overrunning the average caps the bar at full and reports negative
+	// remaining time, which the row renders as "overdue".
+	pct, remaining, ok = jobProgress(&jobs.JobItem{WorkflowName: "CI", Seconds: 300}, history)
+	if !ok || pct != 1 || remaining >= 0 {
+		t.Errorf("got pct=%v remaining=%v ok=%v, want 1 / negative / true", pct, remaining, ok)
+	}
+
+	if _, _, ok := jobProgress(&jobs.JobItem{WorkflowName: "other", Seconds: 30}, history); ok {
+		t.Errorf("a workflow with no history should report ok=false")
+	}
+	if _, _, ok := jobProgress(&jobs.JobItem{WorkflowName: "CI"}, history); ok {
+		t.Errorf("a job with no elapsed time should report ok=false")
+	}
+}
+
+func TestHeaderRowShowsGroupDetailWithoutEnter(t *testing.T) {
+	m := jobPreviewModel()
+	rows := buildJobQueueRows(m.JobQueue)
+
+	var initiatorRow, runRow = -1, -1
+	for i, r := range rows {
+		if r.kind == rowKindInitiatorHeader && initiatorRow == -1 {
+			initiatorRow = i
+		}
+		if r.kind == rowKindRunHeader && runRow == -1 {
+			runRow = i
+		}
+	}
+	if initiatorRow == -1 || runRow == -1 {
+		t.Fatalf("expected both header kinds in rows, got %+v", rows)
+	}
+
+	m.SelectedJobIndex = initiatorRow
+	m.updateViewport()
+	initiator := m.Viewport.View()
+	if !strings.Contains(initiator, "INITIATOR SUMMARY") {
+		t.Errorf("resting on an initiator header should show its full detail, got:\n%s", initiator)
+	}
+	if strings.Contains(initiator, "Press Enter to view full details") {
+		t.Errorf("detail should render without needing Enter, got:\n%s", initiator)
+	}
+	if !strings.Contains(initiator, "Press Enter to pin this view") {
+		t.Errorf("an unpinned group view should offer to pin itself, got:\n%s", initiator)
+	}
+
+	m.SelectedJobIndex = runRow
+	m.updateViewport()
+	run := m.Viewport.View()
+	if !strings.Contains(run, "RUN SUMMARY") {
+		t.Errorf("resting on a run header should show its full detail, got:\n%s", run)
+	}
+
+	// Pinning with Enter keeps that detail up once the cursor moves onto the
+	// run's own job rows, and swaps the footer to the unfocus hint.
+	m.FocusedRunID = m.JobQueue[rows[runRow].itemIndex].RunID
+	m.SelectedJobIndex = runRow + 1
+	m.updateViewport()
+	pinned := m.Viewport.View()
+	if !strings.Contains(pinned, "RUN SUMMARY") {
+		t.Errorf("a pinned run should stay in the detail pane, got:\n%s", pinned)
+	}
+	if !strings.Contains(pinned, "Press Enter or Esc to unfocus") {
+		t.Errorf("a pinned view should show the unfocus hint, got:\n%s", pinned)
 	}
 }

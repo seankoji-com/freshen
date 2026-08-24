@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/seankoji-com/freshen/pkg/config"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
@@ -157,9 +158,22 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd {
 			} else if msg.Y > runnersPaneEnd {
 				m.ActiveFocus = FocusJobs
 				jobsPaneStart := runnersPaneEnd + 1
-				clickedIdx := msg.Y - jobsPaneStart - 2
-				if clickedIdx >= 0 && clickedIdx < len(m.JobQueue) {
-					m.SelectedJobIndex = clickedIdx
+				jobsBoxHeight := totalInner - repoBoxHeight - runnersBoxHeight
+				if jobsBoxHeight < 3 {
+					jobsBoxHeight = 3
+				}
+				maxJobRows := jobsBoxHeight - 2
+				if maxJobRows < 1 {
+					maxJobRows = 1
+				}
+				// Mirror renderJobsPanel's row layout exactly: initiator/run
+				// headers add lines with no JobQueue entry of their own, so a
+				// click's Y position must be resolved against the same
+				// expanded row list rather than a flat offset into m.JobQueue.
+				visibleRows, windowStart := jobQueueVisibleWindow(buildJobQueueRows(m.JobQueue), m.SelectedJobIndex, maxJobRows)
+				clickedLine := msg.Y - jobsPaneStart - 2
+				if clickedLine >= 0 && clickedLine < len(visibleRows) {
+					m.SelectedJobIndex = windowStart + clickedLine
 				}
 				m.updateViewport()
 			}
@@ -197,16 +211,20 @@ func (m Model) handleRepoTickMsg() tea.Cmd {
 func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 	jobs.PollStep(m.Runners, m.JobQueue)
 	m.updateViewport()
+	if m.TargetOrg == "" {
+		// Owner was cleared mid-session (e.g. an unrecognized org); nothing
+		// left to poll, so stop the tick chain rather than retry forever.
+		return nil
+	}
 	var cmdsToAdd []tea.Cmd
 	if !m.RunnerPermissionDenied {
 		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
 	}
 	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
 	// Refresh logs for selected running job
-	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-		selJob := m.JobQueue[m.SelectedJobIndex]
-		if selJob.Status == jobs.JobRunning {
-			cmdsToAdd = append(cmdsToAdd, m.loadJobLogsCmd(selJob))
+	if m.ActiveFocus == FocusJobs {
+		if logsCmd := m.loadLogsIfSelectedJobRunning(); logsCmd != nil {
+			cmdsToAdd = append(cmdsToAdd, logsCmd)
 		}
 	}
 	return tea.Batch(cmdsToAdd...)
@@ -215,6 +233,9 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 // handleJobQueueTickMsg refreshes the job queue on its own slower cadence,
 // keeping the per-repo API cost off the 10s runner tick.
 func (m *Model) handleJobQueueTickMsg() tea.Cmd {
+	if m.TargetOrg == "" {
+		return nil
+	}
 	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors[fetchSourceJobQueue])))
 }
 
@@ -257,7 +278,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
 		var cmd tea.Cmd
 		if len(msg.queue) > 0 {
-			m.processJobQueueUpdate(msg.queue)
+			m.processJobQueueUpdate(msg.queue, msg.history)
 			if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 				m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
 			}
@@ -269,7 +290,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 
 	m.JobQueueFetchFailed = false
 	m.noteFetchSuccess(fetchSourceJobQueue)
-	m.processJobQueueUpdate(msg.queue)
+	m.processJobQueueUpdate(msg.queue, msg.history)
 	if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 		m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
 	}
@@ -306,7 +327,18 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	m.IsOrgSyncing = false
 	if msg.err != nil {
 		slog.Error("org repos fetch failed", "org", m.TargetOrg, "error", msg.err)
-		m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+		if isUnknownOwnerError(msg.err) {
+			badOwner := m.TargetOrg
+			m.TargetOrg = ""
+			m.IsRunnersLoading = false
+			m.IsJobQueueLoading = false
+			if clearErr := clearConfiguredOwner(badOwner); clearErr != nil {
+				slog.Error("failed to clear invalid owner from config", "owner", badOwner, "error", clearErr)
+			}
+			m.setToast(fmt.Sprintf(" %s GitHub owner %q not found — cleared. Restart freshen to set a new one.", iconError, badOwner), 3)
+		} else {
+			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+		}
 		m.updateViewport()
 		return tea.Batch(), true
 	}
@@ -332,9 +364,13 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true
-		m.updateViewport()
-		cmd = m.startSyncCmd(m.Repos, true)
+		// safeOnly=true: this is the passive startup sync, not something the
+		// user directly asked for — never auto-switch a feature branch or
+		// auto-rebase it. [a] Sync All and [r] Sync are explicit commands
+		// and keep the full behavior (see startSyncCmd call sites above).
+		cmd = m.startSyncCmd(m.Repos, true, true)
 	}
+	m.updateViewport()
 	return cmd, false
 }
 
@@ -375,7 +411,25 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 
 // processJobQueueUpdate processes a freshly loaded job queue, comparing to the
 // old queue for status-change notifications with proper priority handling.
-func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem) {
+// maxJobDurationSamples caps how many historical samples processJobQueueUpdate
+// keeps per workflow name — each fetch only turns up a handful (the runs
+// listing is 30 total, active and completed combined), so history
+// accumulates across polls rather than resetting every refresh; this just
+// bounds how far back that accumulation reaches.
+const maxJobDurationSamples = 5
+
+func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[string][]time.Duration) {
+	if m.JobDurationHistory == nil {
+		m.JobDurationHistory = make(map[string][]time.Duration)
+	}
+	for name, samples := range newHistory {
+		combined := append(m.JobDurationHistory[name], samples...)
+		if len(combined) > maxJobDurationSamples {
+			combined = combined[len(combined)-maxJobDurationSamples:]
+		}
+		m.JobDurationHistory[name] = combined
+	}
+
 	if len(m.JobQueue) > 0 {
 		oldJobs := make(map[string]*jobs.JobItem)
 		for _, j := range m.JobQueue {
@@ -447,9 +501,11 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem) {
 	}
 	m.JobQueue = reconcileRunnerJobs(m.Runners, queue, m.TargetOrg)
 
-	// Bounds validation after queue update
-	if len(m.JobQueue) > 0 && m.SelectedJobIndex >= len(m.JobQueue) {
-		m.SelectedJobIndex = len(m.JobQueue) - 1
+	// Bounds validation after queue update — against the row count (which
+	// includes header rows), not len(m.JobQueue), since SelectedJobIndex
+	// indexes into buildJobQueueRows(m.JobQueue).
+	if rowCount := len(buildJobQueueRows(m.JobQueue)); rowCount > 0 && m.SelectedJobIndex >= rowCount {
+		m.SelectedJobIndex = rowCount - 1
 	}
 	if len(m.Runners) > 0 && m.SelectedRunnerIndex >= len(m.Runners) {
 		m.SelectedRunnerIndex = len(m.Runners) - 1
@@ -458,13 +514,10 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem) {
 
 // triggerLogFetchForSelectedJob returns a log-fetch command if a running job is selected.
 func (m Model) triggerLogFetchForSelectedJob() tea.Cmd {
-	if m.ActiveFocus == FocusJobs && len(m.JobQueue) > 0 && m.SelectedJobIndex < len(m.JobQueue) {
-		selJob := m.JobQueue[m.SelectedJobIndex]
-		if selJob.Status == jobs.JobRunning {
-			return m.loadJobLogsCmd(selJob)
-		}
+	if m.ActiveFocus != FocusJobs {
+		return nil
 	}
-	return nil
+	return m.loadLogsIfSelectedJobRunning()
 }
 
 func (m *Model) triggerTabFetch() tea.Cmd {
@@ -493,6 +546,33 @@ func isRunnerPermissionError(err error) bool {
 		strings.Contains(errStr, "org admin") ||
 		strings.Contains(errStr, "must be an org admin") ||
 		strings.Contains(errStr, "fine-grained permission")
+}
+
+// isUnknownOwnerError reports whether err is gh's response to a repo-list
+// call against a user/org login that doesn't exist, as opposed to a
+// transient network or auth failure.
+func isUnknownOwnerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "was not recognized as either a github user or an organization")
+}
+
+// clearConfiguredOwner removes owner from the persisted config, but only if
+// it's still the currently saved value — so a bad owner from an earlier run
+// doesn't keep failing on every subsequent launch, without racing a config
+// change made since this session started.
+func clearConfiguredOwner(owner string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if cfg.Owner != owner {
+		return nil
+	}
+	cfg.Owner = ""
+	return config.Save(cfg)
 }
 
 func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targetOrg string) []*jobs.JobItem {

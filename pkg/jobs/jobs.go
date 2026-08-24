@@ -66,6 +66,12 @@ type JobItem struct {
 	RunID       int64 // GitHub workflow run ID
 	GHJobID     int64 // GitHub job ID within the run (populated lazily)
 	IsRunHeader bool  // True when this JobItem is a run-level header, not a specific job
+	// WorkflowName is the GitHub Actions workflow's own name (e.g. "CI"),
+	// distinct from Name (which is "repo / job name" for display). It's the
+	// key historical duration estimates are grouped by, since a job's own
+	// Name has no reliable run-identity segment to key off (see
+	// buildJobItemFromJob: Name never embeds the workflow name).
+	WorkflowName string
 }
 
 // SanitizeTerminal strips control characters from GitHub-sourced free text (titles,
@@ -132,6 +138,7 @@ type GHWorkflowRun struct {
 	CreatedAt    string              `json:"created_at"`
 	UpdatedAt    string              `json:"updated_at"`
 	RunStartedAt string              `json:"run_started_at"`
+	CompletedAt  string              `json:"completed_at"`
 	RunnerName   string              `json:"runner_name"`
 	RunnerID     int                 `json:"runner_id"`
 	PullRequests []GHPullRequestInfo `json:"pull_requests"`
@@ -224,6 +231,13 @@ func classifyGHError(stderrOut string, execErr error) error {
 	return fmt.Errorf("gh api: %w", execErr)
 }
 
+// FormatDuration renders a time.Duration in the same style as a job's own
+// Duration field (e.g. "5m40s"), for displaying historical estimates
+// computed outside this package.
+func FormatDuration(d time.Duration) string {
+	return formatDuration(int(d.Seconds()))
+}
+
 // formatDuration returns a human-readable duration string from seconds.
 func formatDuration(secs int) string {
 	if secs <= 0 {
@@ -283,19 +297,20 @@ func buildJobItemFromJob(j GHJobInfo, run GHWorkflowRun, repo string) *JobItem {
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
 
 	jobItem := &JobItem{
-		ID:         fmt.Sprintf("#%d", j.ID),
-		Name:       displayName,
-		Repo:       repo,
-		Branch:     SanitizeTerminal(run.HeadBranch),
-		Event:      run.Event,
-		Status:     js,
-		RunnerName: SanitizeTerminal(j.RunnerName),
-		QueuedAt:   queuedAgo,
-		Duration:   duration,
-		Seconds:    secs,
-		StartedAt:  startedAt,
-		RunID:      run.ID,
-		GHJobID:    j.ID,
+		ID:           fmt.Sprintf("#%d", j.ID),
+		Name:         displayName,
+		Repo:         repo,
+		Branch:       SanitizeTerminal(run.HeadBranch),
+		Event:        run.Event,
+		Status:       js,
+		RunnerName:   SanitizeTerminal(j.RunnerName),
+		QueuedAt:     queuedAgo,
+		Duration:     duration,
+		Seconds:      secs,
+		StartedAt:    startedAt,
+		RunID:        run.ID,
+		GHJobID:      j.ID,
+		WorkflowName: SanitizeTerminal(run.Name),
 	}
 	if j.RunnerID != 0 {
 		jobItem.RunnerID = fmt.Sprintf("runner-%d", j.RunnerID)
@@ -320,18 +335,19 @@ func buildJobItemFromRun(run GHWorkflowRun, repo string) *JobItem {
 	queuedAgo := formatQueuedAgo(run.CreatedAt)
 
 	job := &JobItem{
-		ID:         fmt.Sprintf("#%d", run.ID),
-		Name:       displayName,
-		Repo:       repo,
-		Branch:     SanitizeTerminal(run.HeadBranch),
-		Event:      run.Event,
-		Status:     js,
-		RunnerName: SanitizeTerminal(run.RunnerName),
-		QueuedAt:   queuedAgo,
-		Duration:   duration,
-		Seconds:    secs,
-		StartedAt:  startedAt,
-		RunID:      run.ID,
+		ID:           fmt.Sprintf("#%d", run.ID),
+		Name:         displayName,
+		Repo:         repo,
+		Branch:       SanitizeTerminal(run.HeadBranch),
+		Event:        run.Event,
+		Status:       js,
+		RunnerName:   SanitizeTerminal(run.RunnerName),
+		QueuedAt:     queuedAgo,
+		Duration:     duration,
+		Seconds:      secs,
+		StartedAt:    startedAt,
+		RunID:        run.ID,
+		WorkflowName: SanitizeTerminal(run.Name),
 	}
 	if run.RunnerID != 0 {
 		job.RunnerID = fmt.Sprintf("runner-%d", run.RunnerID)
@@ -477,8 +493,9 @@ var activeRunStatuses = map[string]bool{
 
 // repoQueueResult is one repository's contribution to the org job queue.
 type repoQueueResult struct {
-	jobs []*JobItem
-	err  error
+	jobs    []*JobItem
+	history map[string][]time.Duration
+	err     error
 }
 
 // FetchOrgJobQueue polls GitHub for active workflow runs across the tracked repositories.
@@ -491,9 +508,15 @@ type repoQueueResult struct {
 // A repository that fails on its own is logged and skipped; an error is only
 // returned when the whole sweep fails or GitHub reports a rate limit, so one
 // renamed or inaccessible repo cannot blank out the queue.
-func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
+//
+// The second return value is completed-run durations observed on this same
+// fetch, keyed by workflow name (JobItem.WorkflowName) — a byproduct of the
+// unfiltered runs listing every repo already pages through, so estimating a
+// running job's total time needs no extra API calls. Callers accumulate
+// these across polls (each fetch only has a handful of samples per key).
+func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, map[string][]time.Duration, error) {
 	if len(repos) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	results := make([]repoQueueResult, len(repos))
@@ -507,8 +530,8 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			repoJobs, err := fetchRepoJobQueue(org, repoName)
-			results[idx] = repoQueueResult{jobs: repoJobs, err: err}
+			repoJobs, history, err := fetchRepoJobQueue(org, repoName)
+			results[idx] = repoQueueResult{jobs: repoJobs, history: history, err: err}
 		}(i, repo)
 	}
 	wg.Wait()
@@ -516,6 +539,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 	// Merge in the caller's repo order so the queue stays deterministic across polls.
 	var allJobs []*JobItem
 	seenJobIDs := make(map[string]bool)
+	history := make(map[string][]time.Duration)
 	var failures []error
 	rateLimited := false
 
@@ -535,41 +559,56 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, error) {
 			seenJobIDs[j.ID] = true
 			allJobs = append(allJobs, j)
 		}
+		for name, samples := range res.history {
+			history[name] = append(history[name], samples...)
+		}
 	}
 
 	sorted := FilterAndSortJobQueue(allJobs)
 	if rateLimited {
-		return sorted, fmt.Errorf("GitHub API rate limit exceeded")
+		return sorted, history, fmt.Errorf("GitHub API rate limit exceeded")
 	}
 	if len(failures) == len(repos) {
-		return sorted, fmt.Errorf("failed fetching org job queue (%v)", failures[0])
+		return sorted, history, fmt.Errorf("failed fetching org job queue (%v)", failures[0])
 	}
-	return sorted, nil
+	return sorted, history, nil
 }
 
-// fetchRepoJobQueue returns the active job items for a single repository.
-func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
+// fetchRepoJobQueue returns the active job items for a single repository,
+// plus completed-run durations observed on the same unfiltered runs page —
+// see FetchOrgJobQueue for how that history is used.
+func fetchRepoJobQueue(org, repo string) ([]*JobItem, map[string][]time.Duration, error) {
 	out, err := runGH(
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=%d", org, repo, jobQueueRunsPerRepo),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var resp GHWorkflowRunsResponse
 	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse workflow runs JSON: %w", err)
+		return nil, nil, fmt.Errorf("failed to parse workflow runs JSON: %w", err)
 	}
 
 	var repoJobs []*JobItem
 	seenRunIDs := make(map[int64]bool)
+	history := make(map[string][]time.Duration)
 
 	for _, run := range resp.WorkflowRuns {
-		if !activeRunStatuses[run.Status] || seenRunIDs[run.ID] {
+		if seenRunIDs[run.ID] {
 			continue
 		}
 		seenRunIDs[run.ID] = true
+
+		if !activeRunStatuses[run.Status] {
+			if run.Status == "completed" {
+				if d, ok := runDuration(run); ok {
+					history[run.Name] = append(history[run.Name], d)
+				}
+			}
+			continue
+		}
 
 		prNum, prTitle, prURL := extractPRInfo(run, org, repo)
 
@@ -616,7 +655,29 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, error) {
 		}
 	}
 
-	return repoJobs, nil
+	return repoJobs, history, nil
+}
+
+// runDuration returns a completed run's wall-clock duration, or false if
+// either timestamp is missing/unparseable (e.g. an older run predating a
+// field, or a run that never actually started).
+func runDuration(run GHWorkflowRun) (time.Duration, bool) {
+	if run.RunStartedAt == "" || run.CompletedAt == "" {
+		return 0, false
+	}
+	start, err := time.Parse(time.RFC3339, run.RunStartedAt)
+	if err != nil {
+		return 0, false
+	}
+	end, err := time.Parse(time.RFC3339, run.CompletedAt)
+	if err != nil {
+		return 0, false
+	}
+	d := end.Sub(start)
+	if d <= 0 {
+		return 0, false
+	}
+	return d, true
 }
 
 // FetchJobLogs fetches the step log output for a specific running workflow job.
