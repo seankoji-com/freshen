@@ -2014,9 +2014,24 @@ func (m *Model) updateViewport() {
 		// header row — its group's first job, used as fallback metadata.
 		job := m.JobQueue[row.itemIndex]
 
+		// The cursor alone drives this pane: resting on an initiator or run
+		// header renders that group's full detail, with no Enter needed.
+		// Enter still pins a group, which is what keeps its detail on screen
+		// while the cursor moves down onto the group's individual job rows.
+		detailInitiatorKey, detailRunID := m.FocusedInitiatorKey, m.FocusedRunID
+		pinned := detailInitiatorKey != "" || detailRunID != 0
+		if !pinned {
+			switch row.kind {
+			case rowKindInitiatorHeader:
+				detailInitiatorKey = row.initiatorKey
+			case rowKindRunHeader:
+				detailRunID = job.RunID
+			}
+		}
+
 		switch {
-		case m.FocusedInitiatorKey != "":
-			initJobs := jobsForInitiator(m.JobQueue, m.FocusedInitiatorKey)
+		case detailInitiatorKey != "":
+			initJobs := jobsForInitiator(m.JobQueue, detailInitiatorKey)
 			metaJob := job
 			if len(initJobs) > 0 {
 				metaJob = initJobs[0]
@@ -2072,20 +2087,17 @@ func (m *Model) updateViewport() {
 				writeJobSummaryRows(&sb, m.TargetOrg, initJobs, m.Viewport.Width, m.JobDurationHistory)
 			}
 
-			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" Press Enter or Esc to unfocus") + "\n")
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" "+jobDetailPinHint(pinned)) + "\n")
 
-		// If a run is focused, show summary of all jobs in that run
-		case m.FocusedRunID != 0:
-			// Find all jobs belonging to the focused run
-			var runJobs []*jobs.JobItem
+		// If a run is focused (or the cursor rests on its header), show a
+		// summary of every job in that run.
+		case detailRunID != 0:
+			runJobs := jobsForRun(m.JobQueue, detailRunID)
 			var runHeaderJob *jobs.JobItem
 			for _, j := range m.JobQueue {
-				if j.RunID == m.FocusedRunID {
-					if j.IsRunHeader {
-						runHeaderJob = j
-					} else {
-						runJobs = append(runJobs, j)
-					}
+				if j.RunID == detailRunID && j.IsRunHeader {
+					runHeaderJob = j
+					break
 				}
 			}
 
@@ -2133,24 +2145,7 @@ func (m *Model) updateViewport() {
 				writeJobSummaryRows(&sb, m.TargetOrg, runJobs, m.Viewport.Width, m.JobDurationHistory)
 			}
 
-			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" Press Enter or Esc to unfocus") + "\n")
-
-		case row.kind != rowKindJob:
-			// Cursor is resting on an initiator or run header, but it hasn't
-			// been focused (Enter) yet — a lightweight preview instead of the
-			// full single-job detail below, which would misrepresent a group
-			// as if it were one job.
-			group := jobsForRun(m.JobQueue, job.RunID)
-			label := "RUN"
-			if row.kind == rowKindInitiatorHeader {
-				group = jobsForInitiator(m.JobQueue, row.initiatorKey)
-				label = "INITIATOR"
-			}
-			sb.WriteString(fmt.Sprintf(" %s %s: %d job(s)\n\n", iconQueue, label, len(group)))
-			if len(group) > 0 {
-				sb.WriteString(" " + jobStatusCountsLine(group) + "\n\n")
-			}
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(" Press Enter to view full details") + "\n")
+			sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorMuted).Render(" "+jobDetailPinHint(pinned)) + "\n")
 
 		default:
 			statusBadge := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ " + string(job.Status))
@@ -2947,6 +2942,97 @@ func (m Model) selectedJob() *jobs.JobItem {
 	return m.JobQueue[row.itemIndex]
 }
 
+// Widths of the OVERALL JOB QUEUE panel's fixed columns.
+const (
+	// jobStatusBadgeW is the status glyph column. Fixed rather than measured
+	// so emoji (⚡, ⏳) and Nerd Font glyphs (󰄬, 󰅙) start every row's text at
+	// the same offset.
+	jobStatusBadgeW = 2
+	// Bounds on the progress bar inside a running job's timing readout.
+	jobProgressBarMinW = 6
+	jobProgressBarMaxW = 14
+)
+
+// jobProgress measures a running job against the average duration of past
+// runs of the same workflow: the fraction elapsed (clamped to 0-1) and the
+// time remaining, which goes negative once the job outlasts that average.
+// ok is false when there's no history to estimate against, or the job hasn't
+// reported an elapsed time yet.
+func jobProgress(j *jobs.JobItem, history map[string][]time.Duration) (pct float64, remaining time.Duration, ok bool) {
+	samples := history[j.WorkflowName]
+	if len(samples) == 0 || j.Seconds <= 0 {
+		return 0, 0, false
+	}
+	var total time.Duration
+	for _, s := range samples {
+		total += s
+	}
+	avg := total / time.Duration(len(samples))
+	if avg <= 0 {
+		return 0, 0, false
+	}
+	elapsed := time.Duration(j.Seconds) * time.Second
+	pct = elapsed.Seconds() / avg.Seconds()
+	if pct > 1 {
+		pct = 1
+	}
+	return pct, avg - elapsed, true
+}
+
+// jobRowTrailer renders a queue row's right-hand column, and reports the
+// width it occupies so the caller can size the job-name column against it.
+// A running job shows elapsed time, a progress bar against past runs of the
+// same workflow, and the estimated time remaining — its runner name is
+// dropped, since what a live job needs to answer is "how much longer", not
+// "where". Without duration history there's nothing to measure against, so
+// such a job shows elapsed time alone. Every other row keeps the runner, or
+// "awaiting" while it has none.
+func (m Model) jobRowTrailer(j *jobs.JobItem, paneInnerWidth int) (trailer string, width int) {
+	muted := lipgloss.NewStyle().Foreground(colorMuted)
+
+	if j.Status == jobs.JobRunning {
+		elapsed := j.Duration
+		if elapsed == "" || elapsed == "-" {
+			elapsed = "0s"
+		}
+		pct, remaining, ok := jobProgress(j, m.JobDurationHistory)
+		if !ok {
+			return muted.Render(elapsed), lipgloss.Width(elapsed)
+		}
+
+		remainStr := "overdue"
+		if remaining > 0 {
+			remainStr = "~" + jobs.FormatDuration(remaining)
+		}
+
+		barW := paneInnerWidth / 4
+		if barW > jobProgressBarMaxW {
+			barW = jobProgressBarMaxW
+		}
+		if barW < jobProgressBarMinW {
+			barW = jobProgressBarMinW
+		}
+		bar := m.ProgressBar
+		bar.Width = barW
+
+		trailer = fmt.Sprintf("%s %s %s", muted.Render(elapsed), bar.ViewAs(pct), muted.Render(remainStr))
+		return trailer, lipgloss.Width(elapsed) + 1 + barW + 1 + lipgloss.Width(remainStr)
+	}
+
+	runnerStr := j.RunnerName
+	if runnerStr == "" {
+		runnerStr = "awaiting"
+	}
+	width = len(runnerStr) + 2 // include "→ " prefix
+	if width < 10 {
+		width = 10
+	}
+	if width > 28 {
+		width = 28
+	}
+	return muted.Width(width).Render("→ " + truncateString(runnerStr, width-2)), width
+}
+
 // renderJobsPanel renders PANEL 3: OVERALL JOB QUEUE.
 func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, clipLine func(string) string, sliceLines func([]string, int) []string) string {
 	var jobsLines []string
@@ -3017,12 +3103,10 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 			stColor = colorRed
 		}
 
-		stText := string(j.Status)
-		if j.Status == jobs.JobRunning {
-			// The ⚡ glyph already says "running"; the word is redundant.
-			stText = ""
-		}
-		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Render(fmt.Sprintf("%s %-7s", stSymbol, stText))
+		// The glyph alone carries the status — spelling it out again
+		// ("QUEUED") only cost the panel a column that job names and timing
+		// need more. Fixed width so mixed-width glyphs still line the rows up.
+		stBadge := lipgloss.NewStyle().Foreground(stColor).Bold(true).Width(jobStatusBadgeW).Render(stSymbol)
 
 		if row.kind == rowKindInitiatorHeader {
 			var initJobs []*jobs.JobItem
@@ -3036,7 +3120,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				statuses[k] = oj.Status
 			}
 			aggGlyph, aggColor := jobStatusGlyph(aggregateJobStatus(statuses))
-			aggBadge := lipgloss.NewStyle().Foreground(aggColor).Bold(true).Render(fmt.Sprintf("%s %d jobs", aggGlyph, len(initJobs)))
+			aggBadge := lipgloss.NewStyle().Foreground(aggColor).Bold(true).Width(jobStatusBadgeW).Render(aggGlyph)
 
 			var titleText string
 			if j.PRNumber != 0 {
@@ -3086,23 +3170,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 			continue
 		}
 
-		runnerStr := j.RunnerName
-		if runnerStr == "" {
-			runnerStr = "awaiting"
-		}
-		runnerW := len(runnerStr) + 2 // include "→ " prefix
-		if runnerW < 10 {
-			runnerW = 10
-		}
-		if runnerW > 28 {
-			runnerW = 28
-		}
-		runnerAssigned := lipgloss.NewStyle().Foreground(colorMuted).Width(runnerW).Render("→ " + truncateString(runnerStr, runnerW-2))
-
-		timing := ""
-		if j.Status == jobs.JobRunning {
-			timing = " " + lipgloss.NewStyle().Foreground(colorMuted).Render(formatJobTiming(j, m.JobDurationHistory))
-		}
+		trailer, trailerW := m.jobRowTrailer(j, paneInnerWidth)
 
 		var line string
 		if runCounts[j.RunID] > 1 {
@@ -3113,7 +3181,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				treeConnector = "└─ "
 			}
 
-			nameW := paneInnerWidth - 4 - 5 - runnerW - 1
+			nameW := paneInnerWidth - 4 - 5 - trailerW - 1
 			if nameW < 10 {
 				nameW = 10
 			}
@@ -3125,10 +3193,10 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				}
 				jobStrText = Hyperlink(jobStrText, jobURL)
 			}
-			line = fmt.Sprintf("  %s%s %s%s", treeConnector, jobStrText, runnerAssigned, timing)
+			line = fmt.Sprintf("  %s%s %s", treeConnector, jobStrText, trailer)
 		} else {
 			// Single job run
-			nameW := paneInnerWidth - 4 - 9 - 1 - runnerW - 1
+			nameW := paneInnerWidth - 4 - jobStatusBadgeW - 1 - trailerW - 1
 			if nameW < 10 {
 				nameW = 10
 			}
@@ -3140,7 +3208,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 				}
 				jobStrText = Hyperlink(jobStrText, jobURL)
 			}
-			line = fmt.Sprintf("%s %s %s%s", stBadge, jobStrText, runnerAssigned, timing)
+			line = fmt.Sprintf("%s %s %s", stBadge, jobStrText, trailer)
 		}
 
 		if isSelected {
@@ -3389,6 +3457,17 @@ func jobsForInitiator(queue []*jobs.JobItem, key string) []*jobs.JobItem {
 		}
 	}
 	return out
+}
+
+// jobDetailPinHint labels the detail pane's footer for a group view: pinned
+// (Enter) views survive the cursor moving off the group's header row, so
+// they need an explicit way out; a view the cursor is merely resting on
+// doesn't.
+func jobDetailPinHint(pinned bool) string {
+	if pinned {
+		return "Press Enter or Esc to unfocus"
+	}
+	return "Press Enter to pin this view"
 }
 
 // jobStatusCountsLine tallies a group's statuses into a styled "N running |

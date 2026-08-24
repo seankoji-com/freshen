@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1574,5 +1575,154 @@ func TestInteractiveLayoutTransitions(t *testing.T) {
 		if lipgloss.Width(line) > m.Width {
 			t.Errorf("After resize Line %d: width %d exceeds %d", i, lipgloss.Width(line), m.Width)
 		}
+	}
+}
+
+// jobPreviewModel builds a two-initiator queue: one single-job run that's
+// running with duration history behind it, one two-job matrix run, and one
+// queued job with no runner yet.
+func jobPreviewModel() Model {
+	m := newTestModel("/tmp", "test-org")
+	m.Width = 160
+	m.Height = 40
+	m.ActiveFocus = FocusJobs
+	m.JobDurationHistory = map[string][]time.Duration{
+		"CI": {5 * time.Minute, 4*time.Minute + 30*time.Second},
+	}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "#1", Name: "alpha / ci / build", Repo: "alpha", Status: jobs.JobRunning, RunID: 1, Branch: "main", WorkflowName: "CI", Duration: "2m 10s", Seconds: 130, RunnerName: "pc-alpha"},
+		{ID: "#2", Name: "alpha / dependabot / Dependabot", Repo: "alpha", Status: jobs.JobQueued, RunID: 2, Branch: "main", Duration: "-"},
+		{ID: "#3", Name: "beta / ci / test:e2e", Repo: "beta", Status: jobs.JobRunning, RunID: 3, Branch: "main", WorkflowName: "CI", Duration: "1m 0s", Seconds: 60, RunnerName: "mac-eta"},
+		{ID: "#4", Name: "beta / ci / lint", Repo: "beta", Status: jobs.JobRunning, RunID: 3, Branch: "main", WorkflowName: "unseen", Duration: "40s", Seconds: 40, RunnerName: "mac-kappa"},
+	}
+	return m
+}
+
+// renderTestJobsPanel renders just the OVERALL JOB QUEUE panel, with hyperlink
+// escapes and styling stripped so assertions can match on plain text.
+func renderTestJobsPanel(m Model) string {
+	panel := m.renderJobsPanel(78, 74, 14,
+		func(s string) string { return s },
+		func(l []string, _ int) []string { return l },
+	)
+	return stripANSI(panel)
+}
+
+var ansiPattern = regexp.MustCompile("\x1b\\[[0-9;]*m|\x1b\\]8;;[^\x07]*\x07")
+
+func stripANSI(s string) string { return ansiPattern.ReplaceAllString(s, "") }
+
+func TestJobQueueRowsDropStatusWordAndJobCount(t *testing.T) {
+	panel := renderTestJobsPanel(jobPreviewModel())
+
+	// The header's own "(N running, N queued)" tally is the only place the
+	// status words belong; the per-row badges are glyph-only.
+	body := panel[strings.Index(panel, "queued)"):]
+	if strings.Contains(body, "QUEUED") {
+		t.Errorf("job rows should not spell out QUEUED, got:\n%s", body)
+	}
+	if strings.Contains(body, "RUNNING") {
+		t.Errorf("job rows should not spell out RUNNING, got:\n%s", body)
+	}
+	if strings.Contains(body, "jobs") {
+		t.Errorf("initiator headers should not carry a job count, got:\n%s", body)
+	}
+}
+
+func TestRunningJobRowShowsProgressInsteadOfRunner(t *testing.T) {
+	panel := renderTestJobsPanel(jobPreviewModel())
+
+	if strings.Contains(panel, "pc-alpha") || strings.Contains(panel, "mac-eta") {
+		t.Errorf("a running job's row should drop the runner name, got:\n%s", panel)
+	}
+	if !strings.Contains(panel, "█") || !strings.Contains(panel, "░") {
+		t.Errorf("a running job with duration history should render a progress bar, got:\n%s", panel)
+	}
+	// 2m 10s elapsed against a 4m 45s average leaves ~2m 35s.
+	if !strings.Contains(panel, "2m 10s") || !strings.Contains(panel, "~2m 35s") {
+		t.Errorf("running row should show elapsed and remaining time, got:\n%s", panel)
+	}
+	// The "unseen" workflow has no history, so there's nothing to measure
+	// against — elapsed time alone, no bar and no invented estimate.
+	if !strings.Contains(panel, "40s") {
+		t.Errorf("running row without history should still show elapsed time, got:\n%s", panel)
+	}
+	// A queued job has no elapsed time to show, so it keeps the runner column.
+	if !strings.Contains(panel, "awaiting") {
+		t.Errorf("queued row should still show its runner column, got:\n%s", panel)
+	}
+}
+
+func TestJobProgressClampsAndReportsOverrun(t *testing.T) {
+	history := map[string][]time.Duration{"CI": {2 * time.Minute}}
+
+	pct, remaining, ok := jobProgress(&jobs.JobItem{WorkflowName: "CI", Seconds: 30}, history)
+	if !ok || pct != 0.25 || remaining != 90*time.Second {
+		t.Errorf("got pct=%v remaining=%v ok=%v, want 0.25 / 1m30s / true", pct, remaining, ok)
+	}
+
+	// Overrunning the average caps the bar at full and reports negative
+	// remaining time, which the row renders as "overdue".
+	pct, remaining, ok = jobProgress(&jobs.JobItem{WorkflowName: "CI", Seconds: 300}, history)
+	if !ok || pct != 1 || remaining >= 0 {
+		t.Errorf("got pct=%v remaining=%v ok=%v, want 1 / negative / true", pct, remaining, ok)
+	}
+
+	if _, _, ok := jobProgress(&jobs.JobItem{WorkflowName: "other", Seconds: 30}, history); ok {
+		t.Errorf("a workflow with no history should report ok=false")
+	}
+	if _, _, ok := jobProgress(&jobs.JobItem{WorkflowName: "CI"}, history); ok {
+		t.Errorf("a job with no elapsed time should report ok=false")
+	}
+}
+
+func TestHeaderRowShowsGroupDetailWithoutEnter(t *testing.T) {
+	m := jobPreviewModel()
+	rows := buildJobQueueRows(m.JobQueue)
+
+	var initiatorRow, runRow = -1, -1
+	for i, r := range rows {
+		if r.kind == rowKindInitiatorHeader && initiatorRow == -1 {
+			initiatorRow = i
+		}
+		if r.kind == rowKindRunHeader && runRow == -1 {
+			runRow = i
+		}
+	}
+	if initiatorRow == -1 || runRow == -1 {
+		t.Fatalf("expected both header kinds in rows, got %+v", rows)
+	}
+
+	m.SelectedJobIndex = initiatorRow
+	m.updateViewport()
+	initiator := m.Viewport.View()
+	if !strings.Contains(initiator, "INITIATOR SUMMARY") {
+		t.Errorf("resting on an initiator header should show its full detail, got:\n%s", initiator)
+	}
+	if strings.Contains(initiator, "Press Enter to view full details") {
+		t.Errorf("detail should render without needing Enter, got:\n%s", initiator)
+	}
+	if !strings.Contains(initiator, "Press Enter to pin this view") {
+		t.Errorf("an unpinned group view should offer to pin itself, got:\n%s", initiator)
+	}
+
+	m.SelectedJobIndex = runRow
+	m.updateViewport()
+	run := m.Viewport.View()
+	if !strings.Contains(run, "RUN SUMMARY") {
+		t.Errorf("resting on a run header should show its full detail, got:\n%s", run)
+	}
+
+	// Pinning with Enter keeps that detail up once the cursor moves onto the
+	// run's own job rows, and swaps the footer to the unfocus hint.
+	m.FocusedRunID = m.JobQueue[rows[runRow].itemIndex].RunID
+	m.SelectedJobIndex = runRow + 1
+	m.updateViewport()
+	pinned := m.Viewport.View()
+	if !strings.Contains(pinned, "RUN SUMMARY") {
+		t.Errorf("a pinned run should stay in the detail pane, got:\n%s", pinned)
+	}
+	if !strings.Contains(pinned, "Press Enter or Esc to unfocus") {
+		t.Errorf("a pinned view should show the unfocus hint, got:\n%s", pinned)
 	}
 }
