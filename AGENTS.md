@@ -15,7 +15,11 @@
 | Entry point | `main.go` |
 | Git/repo operations | `pkg/git/git.go` |
 | CI runner & job polling | `pkg/jobs/jobs.go` |
-| TUI (model, view, update) | `pkg/tui/tui.go` |
+| TUI model, init, message/const defs | `pkg/tui/model.go` |
+| TUI background commands (loading, sync) | `pkg/tui/commands.go` |
+| TUI update dispatch (non-key messages) | `pkg/tui/update.go` |
+| TUI keybinding handlers | `pkg/tui/keys.go` |
+| TUI rendering (View + panels) | `pkg/tui/view.go` |
 | Tests | `*_test.go` alongside source |
 
 ## How to build & test
@@ -44,4 +48,3 @@ go test ./...                  # test
 - `docs/architecture.md` — full package layout, data flow, type catalog, function catalog
 - `docs/conventions.md` — code patterns, naming, testing style, Lip Gloss conventions
 - `docs/dependencies.md` — Go modules, external binaries, build requirements
-- `docs/persona-review-setup.md` — persona review CI: routine/App/secret setup, scripts, validation checklist

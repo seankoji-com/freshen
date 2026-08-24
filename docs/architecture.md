@@ -14,7 +14,11 @@ pkg/
   git/git.go              # Git operations, GitHub API (gh CLI wrapper), repo model
   jobs/jobs.go            # GitHub Actions runner & job queue polling, data types
   jobs/jobs_test.go       # Unit tests for filtering, sorting, merging
-  tui/tui.go              # Bubble Tea Model, Update, View, viewport rendering
+  tui/model.go            # Model struct, NewModel, Init, message types, glyphs/styles
+  tui/commands.go         # tea.Cmd producers: loading, syncing, background git/gh work
+  tui/update.go           # Update dispatch and non-key message handlers
+  tui/keys.go             # handleKey* keybinding handlers
+  tui/view.go             # View, panel rendering, and rendering helpers
   tui/tui_test.go         # TUI rendering & behavior tests
 ```
 
@@ -83,13 +87,13 @@ pkg/
 
 **Rendering:** `View()` builds a split layout — left column has 3 stacked bordered panes (repos, runners, jobs), right column has a viewport for detail content. Heavy use of Lip Gloss styles and OSC 8 hyperlinks.
 
-**Helper functions in tui.go:**
+**Helper functions in view.go (unless noted):**
 - `Hyperlink(text, url)` — OSC 8 terminal hyperlinks
 - `truncateString(str, maxLen)` — ellipsis truncation
 - `parseJobHierarchy(fullName, repo)` — splits `"repo / workflow / job-name"` into (runName, jobName)
 - `findJobForRunner(runner, queue)` — 4-step matching: exact name, case-insensitive, any assigned, any running
-- `reconcileRunnerJobs(runners, queue, targetOrg)` — ensures running runners have corresponding queue entries
-- `isRunnerPermissionError(err)` — detects HTTP 403 / fine-grained admin permission errors from runner API calls
+- `reconcileRunnerJobs(runners, queue, targetOrg)` — ensures running runners have corresponding queue entries (update.go)
+- `isRunnerPermissionError(err)` — detects HTTP 403 / fine-grained admin permission errors from runner API calls (update.go)
 - `highlightLogLine(line)` — regex-based syntax highlighting for log output
 - `getAvailableTags()` — collects unique runner tags for filter navigation
 
