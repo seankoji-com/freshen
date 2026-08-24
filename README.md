@@ -1,7 +1,7 @@
 # freshen 🍃
 
 <p align="center">
-  <img width="1728" height="1045" alt="image" src="https://github.com/user-attachments/assets/0767b51a-6872-4eaa-8cae-00e06ed3716f" />
+  <img width="1728" height="1045" alt="screenshot of freshen TUI" src="https://github.com/user-attachments/assets/40e6c704-3f34-4d2f-a4ed-b898f799a529" />
 </p>
 
 **freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
