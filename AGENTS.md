@@ -27,6 +27,7 @@
 ```bash
 go build -o freshen main.go    # build
 go test ./...                  # test
+make lint                      # golangci-lint + gofmt/goimports via `go run` (version pinned in Makefile); report-only, never rewrites
 ```
 
 ## External tools required at runtime (not build-time)

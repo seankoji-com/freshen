@@ -225,7 +225,16 @@ func main() {
 	// Launch TUI Application
 	logFile := configureTUILogging()
 	if logFile != nil {
-		defer logFile.Close()
+		defer func() {
+			// p.Run() has already released the alt screen by the time this
+			// fires, and slog's default handler still points at this same
+			// file (see configureTUILogging), so a post-close slog.Error call
+			// here would write into an already-closed descriptor and be
+			// silently discarded — stderr is the only surface left.
+			if err := logFile.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "freshen: closing log file %s: %v\n", logPath(), err)
+			}
+		}()
 	}
 
 	var bgWG sync.WaitGroup
@@ -282,7 +291,15 @@ func configureTUILogging() *os.File {
 		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
 			slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
 			return f
+		} else {
+			// The TUI hasn't entered the alt screen yet at this point in
+			// startup, so stderr is still safe to write to (unlike the
+			// post-close path in main() above) — surface the failure rather
+			// than silently discarding every log line for the whole run.
+			fmt.Fprintf(os.Stderr, "freshen: opening log file %s: %v — log output will be discarded for this session\n", path, err)
 		}
+	} else {
+		fmt.Fprintf(os.Stderr, "freshen: creating log directory for %s: %v — log output will be discarded for this session\n", path, err)
 	}
 
 	// No writable log file — discard rather than corrupt the display.

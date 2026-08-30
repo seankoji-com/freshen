@@ -36,3 +36,37 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # No separate install step: `make lint`'s GOLANGCI_LINT variable
+      # resolves the binary via `go run .../golangci-lint@version` (the Go
+      # module proxy's checksum-verified fetch), the same command a
+      # developer runs locally — one place pins the version, one place
+      # defines the enforcing pipeline, so CI and local dev can't drift.
+      - name: Tier 1a (enforcing) — make lint
+        run: make lint
+      # Tier 1b (govet/shadow) is intentionally never enforcing — 3 of its 5
+      # current findings sit in pkg/config/pkg/git/pkg/jobs, out of scope for
+      # #128/#129. Tracked in #132 so this deferral has an owner rather than
+      # becoming a permanent unowned green checkmark.
+      - name: Tier 1b (govet/shadow, non-enforcing — see #132)
+        shell: bash
+        run: |
+          set +e
+          output=$(make lint-shadow 2>&1)
+          status=$?
+          set -e
+          {
+            echo '```text'
+            echo "$output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$output"
+          exit "$status"
+        continue-on-error: true

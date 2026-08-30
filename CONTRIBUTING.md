@@ -13,6 +13,7 @@ Before you start, ensure you have:
 - **git** — for version control
 - **GitHub CLI (`gh`)** — [install from github.com/cli/cli](https://cli.github.com)
   - Authenticate with your GitHub account: `gh auth login`
+- **golangci-lint** — no separate install needed. `make lint`/`make lint-shadow` resolve it via `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@<version>` (the version is pinned once, in the `Makefile`'s `GOLANGCI_LINT_VERSION` variable) — the same command CI runs, so there's no local-vs-CI drift to manage.
 
 Verify prerequisites:
 ```bash
@@ -38,6 +39,18 @@ make test
 
 # Run Go's static analysis
 make vet
+
+# Run golangci-lint (errcheck, ineffassign, staticcheck, unused, misspell)
+# plus a gofmt/goimports formatting check — report-only, never rewrites
+# your files. On a formatting diff it prints the exact diff and exits
+# non-zero; fix it with `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@<version> fmt ./...`
+# (the version printed by `make lint`'s own output) and commit the result.
+make lint
+
+# Run the non-enforcing govet/shadow tier (Tier 1b, separate config).
+# Reports findings for information only — CI never gates on it, and it is
+# deliberately not part of `make lint`.
+make lint-shadow
 
 # Run tests with coverage report
 make coverage

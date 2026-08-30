@@ -71,7 +71,10 @@ func runFirstSetup(defaultDir string) (config.Config, error) {
 	if err != nil {
 		return config.Config{}, err
 	}
-	m := p.(setupModel)
+	m, ok := p.(setupModel)
+	if !ok {
+		return config.Config{}, fmt.Errorf("unexpected program model type %T", p)
+	}
 	if m.quit || !m.done {
 		return config.Config{}, fmt.Errorf("setup cancelled")
 	}
@@ -136,7 +139,10 @@ func runOwnerPrompt(errMsg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	m := p.(ownerPromptModel)
+	m, ok := p.(ownerPromptModel)
+	if !ok {
+		return "", fmt.Errorf("unexpected program model type %T", p)
+	}
 	if m.quit || !m.done {
 		return "", nil
 	}

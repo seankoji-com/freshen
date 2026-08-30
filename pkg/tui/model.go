@@ -86,7 +86,6 @@ var (
 	iconWorktree = "󰉓"
 	iconRunner   = "🏃"
 	iconQueue    = "📋"
-	iconCpu      = "⚡"
 
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
@@ -176,9 +175,8 @@ var (
 			Padding(0, 1)
 
 	// Explicit Column Width Styles for Table Alignment
-	// Total: 2 + 20 + 16 + 4 + 6 + spaces = ~51 chars, fits in a ~55 char inner pane
+	// Total: 2 + 20 + 4 + 6 + spaces = ~35 chars, fits in a ~55 char inner pane
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
-	cellNameStyle       = lipgloss.NewStyle().Width(20)
 	cellBranchStyle     = lipgloss.NewStyle().Width(20)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
 	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)

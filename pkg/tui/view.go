@@ -125,9 +125,7 @@ func (m *Model) updateViewport() {
 				if matchedJ != nil {
 					dispName := matchedJ.Name
 					repoPrefix := matchedJ.Repo + " / "
-					if strings.HasPrefix(dispName, repoPrefix) {
-						dispName = strings.TrimPrefix(dispName, repoPrefix)
-					}
+					dispName = strings.TrimPrefix(dispName, repoPrefix)
 					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(dispName, maxJobLen))
 				} else if r.CurrentJob != "-" && r.CurrentJob != "" {
 					currentJobStr = lipgloss.NewStyle().Foreground(colorYellow).Render(truncateString(r.CurrentJob, maxJobLen))
@@ -194,12 +192,12 @@ func (m *Model) updateViewport() {
 					jLink = Hyperlink(jLink, jobURL)
 				}
 				jNameTrunc := truncateString(j.Name, nameMaxLen)
-				sb.WriteString(fmt.Sprintf(" %s  %s  %s  %s\n",
+				fmt.Fprintf(&sb, " %s  %s  %s  %s\n",
 					lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
 					jLink,
 					lipgloss.NewStyle().Foreground(colorSecondary).Render(jNameTrunc),
 					lipgloss.NewStyle().Foreground(colorMuted).Render(j.Duration),
-				))
+				)
 			}
 		}
 
@@ -256,7 +254,7 @@ func (m *Model) updateViewport() {
 				titleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(branch), branchURL)
 			}
 
-			sb.WriteString(fmt.Sprintf(" %s FOCUSED INITIATOR: %s\n\n", iconQueue, titleText))
+			fmt.Fprintf(&sb, " %s FOCUSED INITIATOR: %s\n\n", iconQueue, titleText)
 
 			runIDs := make(map[int64]bool)
 			for _, j := range initJobs {
@@ -265,14 +263,14 @@ func (m *Model) updateViewport() {
 				}
 			}
 
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Repo:"),
 				lipgloss.NewStyle().Foreground(colorPrimary).Render(metaJob.Repo),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %d run(s), %d job(s)\n\n",
+			)
+			fmt.Fprintf(&sb, " %s  %d run(s), %d job(s)\n\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Total:"),
 				len(runIDs), len(initJobs),
-			))
+			)
 
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" INITIATOR SUMMARY") + "\n")
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
@@ -313,23 +311,23 @@ func (m *Model) updateViewport() {
 			runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, metaJob.Repo, metaJob.RunID)
 			runLink := Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken), runURL)
 
-			sb.WriteString(fmt.Sprintf(" %s FOCUSED RUN: %s\n\n", iconQueue, runLink))
+			fmt.Fprintf(&sb, " %s FOCUSED RUN: %s\n\n", iconQueue, runLink)
 
 			// Trigger info
 			triggerStr := formatJobTrigger(m.TargetOrg, metaJob)
 
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Repo:"),
 				lipgloss.NewStyle().Foreground(colorPrimary).Render(metaJob.Repo),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			)
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Trigger:"),
 				lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(triggerStr),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %d jobs\n\n",
+			)
+			fmt.Fprintf(&sb, " %s  %d jobs\n\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Total:"),
 				len(runJobs),
-			))
+			)
 
 			// Summary table of all jobs in this run
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(" RUN SUMMARY") + "\n")
@@ -348,11 +346,12 @@ func (m *Model) updateViewport() {
 
 		default:
 			statusBadge := lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ " + string(job.Status))
-			if job.Status == jobs.JobRunning {
+			switch job.Status {
+			case jobs.JobRunning:
 				statusBadge = lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render("⚡ " + string(job.Status))
-			} else if job.Status == jobs.JobPassed {
+			case jobs.JobPassed:
 				statusBadge = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("󰄬 " + string(job.Status))
-			} else if job.Status == jobs.JobFailed {
+			case jobs.JobFailed:
 				statusBadge = lipgloss.NewStyle().Foreground(colorRed).Bold(true).Render("󰅙 " + string(job.Status))
 			}
 
@@ -370,32 +369,32 @@ func (m *Model) updateViewport() {
 
 			triggerStr := formatJobTrigger(m.TargetOrg, job)
 
-			sb.WriteString(fmt.Sprintf(" %s %s  |  %s  |  %s %s  |  Duration: %s\n\n",
+			fmt.Fprintf(&sb, " %s %s  |  %s  |  %s %s  |  Duration: %s\n\n",
 				iconQueue,
 				jobIDLink,
 				statusBadge,
 				iconFolder,
 				lipgloss.NewStyle().Foreground(colorPrimary).Render(job.Repo),
 				formatJobTiming(job, m.JobDurationHistory),
-			))
+			)
 
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Run:"),
 				lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			)
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Trigger:"),
 				lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(triggerStr),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %s\n",
+			)
+			fmt.Fprintf(&sb, " %s  %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Job:"),
 				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(jobToken),
-			))
-			sb.WriteString(fmt.Sprintf(" %s  %s %s\n",
+			)
+			fmt.Fprintf(&sb, " %s  %s %s\n",
 				lipgloss.NewStyle().Bold(true).Foreground(colorMuted).Width(10).Render("Runner:"),
 				iconRunner,
 				lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(runnerDisplay),
-			))
+			)
 
 			if job.Status == jobs.JobQueued {
 				sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render("⏳ Job is currently queued. Awaiting available runner worker node...") + "\n")
@@ -478,9 +477,9 @@ func (m *Model) updateViewport() {
 		issueURL := fmt.Sprintf("%s/issues", repoURL)
 		issueLink := Hyperlink(fmt.Sprintf("%s %s", iconIssue, issueCountStr), issueURL)
 
-		sb.WriteString(fmt.Sprintf(" %s  |  %s  |  %s  |  %s  |  %s\n\n",
+		fmt.Fprintf(&sb, " %s  |  %s  |  %s  |  %s  |  %s\n\n",
 			repoLink, branchLink, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(item.StatusMsg), prLink, issueLink,
-		))
+		)
 
 		sb.WriteString(m.renderTabBar() + "\n\n")
 
@@ -488,10 +487,10 @@ func (m *Model) updateViewport() {
 
 		case TabLogs:
 			if item.ExistingPRURL != "" {
-				sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL)))
+				fmt.Fprintf(&sb, "%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL))
 			}
 			if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
-				sb.WriteString(fmt.Sprintf("%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL)))
+				fmt.Fprintf(&sb, "%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL))
 			}
 
 			dashCount := (m.Viewport.Width - 18) / 2
@@ -522,7 +521,7 @@ func (m *Model) updateViewport() {
 				sb.WriteString("  (None found)\n")
 			} else {
 				for _, b := range localBranches {
-					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+					fmt.Fprintf(&sb, "  %s %s\n", iconBranch, b)
 				}
 			}
 
@@ -532,7 +531,7 @@ func (m *Model) updateViewport() {
 				sb.WriteString("  (None found)\n")
 			} else {
 				for _, b := range remoteBranches {
-					sb.WriteString(fmt.Sprintf("  %s %s\n", iconBranch, b))
+					fmt.Fprintf(&sb, "  %s %s\n", iconBranch, b)
 				}
 			}
 
@@ -541,7 +540,7 @@ func (m *Model) updateViewport() {
 				sb.WriteString("  (No worktrees found)\n")
 			} else {
 				for _, w := range item.BranchDetails.Worktrees {
-					sb.WriteString(fmt.Sprintf("  %s %s\n", iconWorktree, w))
+					fmt.Fprintf(&sb, "  %s %s\n", iconWorktree, w)
 				}
 			}
 
@@ -550,7 +549,7 @@ func (m *Model) updateViewport() {
 				sb.WriteString("  󰄬 Working tree is clean.\n")
 			} else {
 				for _, f := range item.BranchDetails.ChangedFiles {
-					sb.WriteString(fmt.Sprintf("  %s\n", f))
+					fmt.Fprintf(&sb, "  %s\n", f)
 				}
 			}
 
@@ -562,17 +561,17 @@ func (m *Model) updateViewport() {
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
 
 			if len(item.IssuesList) == 0 && item.IsLoadingIssues {
-				sb.WriteString(fmt.Sprintf("  %s Loading open issues from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View())))
+				fmt.Fprintf(&sb, "  %s Loading open issues from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View()))
 			} else if len(item.IssuesList) == 0 {
 				sb.WriteString("  󰄬 No open issues found for this repository.\n")
 			} else {
 				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
 				for _, issue := range item.IssuesList {
 					header := fmt.Sprintf("#%-4d %s", issue.Number, issue.Title)
-					sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+					fmt.Fprintf(&sb, "  %s %s\n     %s\n\n",
 						badgeIssue.Render("⊙"), titleWrapper.Render(header),
 						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
-					))
+					)
 				}
 			}
 
@@ -584,17 +583,17 @@ func (m *Model) updateViewport() {
 			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
 
 			if len(item.PRsList) == 0 && item.IsLoadingPRs {
-				sb.WriteString(fmt.Sprintf("  %s Loading open pull requests from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View())))
+				fmt.Fprintf(&sb, "  %s Loading open pull requests from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View()))
 			} else if len(item.PRsList) == 0 {
 				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
 			} else {
 				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
 				for _, pr := range item.PRsList {
 					header := fmt.Sprintf("#%-4d %s (%s %s)", pr.Number, pr.Title, iconBranch, pr.HeadRefName)
-					sb.WriteString(fmt.Sprintf("  %s %s\n     %s\n\n",
+					fmt.Fprintf(&sb, "  %s %s\n     %s\n\n",
 						badgePR.Render("󰏫"), titleWrapper.Render(header),
 						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
-					))
+					)
 				}
 			}
 		}
@@ -734,11 +733,6 @@ func (m Model) View() string {
 	// Render Details Viewport (Right)
 	// logBoxStyle has Border (1+1) + Padding (1+1) = 4 chars horizontal overhead.
 	// Width(rightWidth - 2) gives content width (rightWidth - 4) and outer width rightWidth.
-	rightInnerWidth := rightWidth - 4
-	if rightInnerWidth < 20 {
-		rightInnerWidth = 20
-	}
-
 	rightPane := logBoxStyle.
 		Width(rightWidth - 2).
 		Height(rightBoxHeight).
@@ -1030,8 +1024,6 @@ type jobQueueRow struct {
 	initiatorKey string
 }
 
-func (r jobQueueRow) isHeader() bool { return r.kind != rowKindJob }
-
 // jobInitiatorKey identifies what triggered a job: the PR that caused it, or
 // (for a direct push, schedule, workflow_dispatch, etc.) its branch/event.
 // Repo-qualified because FetchOrgJobQueue merges every repo into one flat
@@ -1238,9 +1230,10 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 	runningCount := 0
 	queuedCount := 0
 	for _, j := range m.JobQueue {
-		if j.Status == jobs.JobRunning {
+		switch j.Status {
+		case jobs.JobRunning:
 			runningCount++
-		} else if j.Status == jobs.JobQueued {
+		case jobs.JobQueued:
 			queuedCount++
 		}
 	}
@@ -1291,13 +1284,14 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 
 		stSymbol := "⏳"
 		stColor := colorYellow
-		if j.Status == jobs.JobRunning {
+		switch j.Status {
+		case jobs.JobRunning:
 			stSymbol = "⚡"
 			stColor = colorSecondary
-		} else if j.Status == jobs.JobPassed {
+		case jobs.JobPassed:
 			stSymbol = "󰄬"
 			stColor = colorGreen
-		} else if j.Status == jobs.JobFailed {
+		case jobs.JobFailed:
 			stSymbol = "󰅙"
 			stColor = colorRed
 		}
@@ -1351,7 +1345,7 @@ func (m Model) renderJobsPanel(leftWidth, paneInnerWidth, jobsBoxHeight int, cli
 		}
 
 		if row.kind == rowKindRunHeader {
-			runTitleText := runToken
+			var runTitleText string
 			if j.RunID != 0 {
 				runURL := fmt.Sprintf("https://github.com/%s/%s/actions/runs/%d", m.TargetOrg, j.Repo, j.RunID)
 				runTitleText = Hyperlink(lipgloss.NewStyle().Foreground(colorPrimary).Bold(true).Render(runToken), runURL)
@@ -1681,7 +1675,7 @@ func writeJobSummaryRows(sb *strings.Builder, org string, group []*jobs.JobItem,
 			treeConnector = "└─"
 		}
 
-		sb.WriteString(fmt.Sprintf("  %s %s  %s  %s  %s%s  %s\n",
+		fmt.Fprintf(sb, "  %s %s  %s  %s  %s%s  %s\n",
 			treeConnector,
 			lipgloss.NewStyle().Foreground(jColor).Render(jGlyph+" "+string(j.Status)),
 			jLink,
@@ -1689,16 +1683,14 @@ func writeJobSummaryRows(sb *strings.Builder, org string, group []*jobs.JobItem,
 			lipgloss.NewStyle().Foreground(colorMuted).Render(iconRunner+" "),
 			lipgloss.NewStyle().Foreground(colorMuted).Render(runnerStr),
 			lipgloss.NewStyle().Foreground(colorMuted).Render(formatJobTiming(j, history)),
-		))
+		)
 	}
 }
 
 func parseJobHierarchy(fullName, repo string) (runName, jobName string) {
 	cleanName := fullName
 	repoPrefix := repo + " / "
-	if strings.HasPrefix(cleanName, repoPrefix) {
-		cleanName = strings.TrimPrefix(cleanName, repoPrefix)
-	}
+	cleanName = strings.TrimPrefix(cleanName, repoPrefix)
 
 	parts := strings.Split(cleanName, " / ")
 	if len(parts) >= 2 {

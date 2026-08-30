@@ -466,11 +466,15 @@ func TestIssue37Fixes(t *testing.T) {
 		{Name: "myrepo", CurrentBranch: "feat/long-branch-name-feature-x", Status: git.StatusUpToDate},
 	}
 
-	// 1. Verify tab bar active styling
+	// 1. Verify tab bar label wording and ordering (not styling — stripped()
+	// removes all SGR sequences before comparison). Exact match (not
+	// Contains): the four tab labels are fixed text regardless of which tab
+	// is active, so this also pins their exact wording and order.
 	m.ActiveTab = TabLogs
-	tabBar := m.renderTabBar()
-	if !strings.Contains(tabBar, "[1 Logs]") || !strings.Contains(tabBar, "[2 Branches & Worktrees]") {
-		t.Errorf("renderTabBar missing expected tab headers, got: %q", tabBar)
+	tabBar := stripped(m.renderTabBar())
+	wantTabBar := " [1 Logs]  [2 Branches & Worktrees]  [3 Issues]  [4 PRs] "
+	if tabBar != wantTabBar {
+		t.Errorf("renderTabBar mismatch\n got:  %q\nwant: %q", tabBar, wantTabBar)
 	}
 
 	// 2. Verify cellBranchStyle width is at least 20
@@ -568,28 +572,31 @@ func TestTabBranchesGroupedRendering(t *testing.T) {
 
 func TestFooterSeparationAndLineWidthBounds(t *testing.T) {
 	m := newTestModel("/tmp/test", "test-org")
-	m.Width = 160
-	m.Height = 40
 	m.IsOrgSyncing = false
 	m.Repos = []*git.RepoItem{
 		{Name: "repo1", CurrentBranch: "main", Status: git.StatusUpToDate},
 	}
 
-	view := m.View()
+	const w, h = 160, 40
+	view := renderAt(m, w, h)
 	lines := strings.Split(view, "\n")
 
-	if len(lines) != m.Height {
-		t.Errorf("expected View() total line count to equal m.Height (%d), got %d lines", m.Height, len(lines))
+	if len(lines) != h {
+		t.Errorf("expected View() total line count to equal height (%d), got %d lines", h, len(lines))
 	}
 
-	lastLine := lines[len(lines)-1]
-	if !strings.Contains(lastLine, "Focus") || !strings.Contains(lastLine, "Quit") {
-		t.Errorf("expected last line of View() to be footer keybindings help, got: %q", lastLine)
+	// Exact match (not Contains): the footer is a fixed keybindings string
+	// whenever no toast is showing, so a golden comparison here catches a
+	// wrong truncation threshold or an accidentally-triggered toast overlay
+	// that a substring check would miss.
+	wantFooter := "[w/⇥/⇧⇥] Focus  [↑/↓/j/k] Select  [1-4/←/→] Tabs  [a] Sync All  [r] Sync  [b] Branch  [p] Push/PR  [dd] Del Archived  [X] Prune  [c] Copy  [q] Quit"
+	if gotFooter := stripped(lines[len(lines)-1]); gotFooter != wantFooter {
+		t.Errorf("expected exact footer keybindings help on the last line\n got:  %q\nwant: %q", gotFooter, wantFooter)
 	}
 
 	for i, line := range lines {
-		if lipgloss.Width(line) > m.Width {
-			t.Errorf("line %d width (%d) exceeds m.Width (%d): %q", i, lipgloss.Width(line), m.Width, line)
+		if lipgloss.Width(line) > w {
+			t.Errorf("line %d width (%d) exceeds width (%d): %q", i, lipgloss.Width(line), w, line)
 		}
 	}
 }
