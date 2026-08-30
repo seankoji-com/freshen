@@ -44,20 +44,22 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Install golangci-lint
-        shell: bash
-        run: curl -sSfL --retry 3 --max-time 60 https://raw.githubusercontent.com/golangci/golangci-lint/v2.13.2/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.13.2
-      - name: golangci-lint run (Tier 1a, enforcing)
-        run: golangci-lint run ./...
-      - name: golangci-lint fmt (rewrites in place — run `make lint` locally and commit the result before pushing)
-        run: golangci-lint fmt ./...
-      - name: Fail if fmt changed the tree
-        run: git diff --exit-code
-      - name: Tier 1b (govet/shadow, non-enforcing)
+      # No separate install step: `make lint`'s GOLANGCI_LINT variable
+      # resolves the binary via `go run .../golangci-lint@version` (the Go
+      # module proxy's checksum-verified fetch), the same command a
+      # developer runs locally — one place pins the version, one place
+      # defines the enforcing pipeline, so CI and local dev can't drift.
+      - name: Tier 1a (enforcing) — make lint
+        run: make lint
+      # Tier 1b (govet/shadow) is intentionally never enforcing — 3 of its 5
+      # current findings sit in pkg/config/pkg/git/pkg/jobs, out of scope for
+      # #128/#129. Tracked in #132 so this deferral has an owner rather than
+      # becoming a permanent unowned green checkmark.
+      - name: Tier 1b (govet/shadow, non-enforcing — see #132)
         shell: bash
         run: |
           set +e
-          output=$(golangci-lint run -c .golangci-shadow.yml ./... 2>&1)
+          output=$(make lint-shadow 2>&1)
           status=$?
           set -e
           {

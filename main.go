@@ -296,10 +296,10 @@ func configureTUILogging() *os.File {
 			// startup, so stderr is still safe to write to (unlike the
 			// post-close path in main() above) — surface the failure rather
 			// than silently discarding every log line for the whole run.
-			fmt.Fprintf(os.Stderr, "freshen: opening log file %s: %v\n", path, err)
+			fmt.Fprintf(os.Stderr, "freshen: opening log file %s: %v — log output will be discarded for this session\n", path, err)
 		}
 	} else {
-		fmt.Fprintf(os.Stderr, "freshen: creating log directory for %s: %v\n", path, err)
+		fmt.Fprintf(os.Stderr, "freshen: creating log directory for %s: %v — log output will be discarded for this session\n", path, err)
 	}
 
 	// No writable log file — discard rather than corrupt the display.
