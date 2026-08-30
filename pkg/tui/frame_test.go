@@ -88,8 +88,13 @@ func smokeFixtureModel() Model {
 	return m
 }
 
-// assertRendersWithoutPanic drives updateViewport()+View() on m and fails
-// the (sub)test on panic or empty output.
+// assertRendersWithoutPanic renders m at its own Width/Height through the
+// real resize path (renderAt -> tea.WindowSizeMsg -> handleWindowSizeMsg ->
+// updateViewport -> View) and fails the (sub)test on panic or empty output.
+// It deliberately does not call updateViewport() directly on a
+// field-assigned model: that combination leaves Viewport.Width/Height at
+// their NewModel defaults (60x15) while m.Width/m.Height say something else,
+// i.e. a frame the running app can never actually produce.
 func assertRendersWithoutPanic(t *testing.T, name string, m Model) string {
 	t.Helper()
 	var view string
@@ -99,8 +104,7 @@ func assertRendersWithoutPanic(t *testing.T, name string, m Model) string {
 				t.Fatalf("%s: panic: %v", name, r)
 			}
 		}()
-		m.updateViewport()
-		view = m.View()
+		view = renderAt(m, m.Width, m.Height)
 	}()
 	if strings.TrimSpace(view) == "" {
 		t.Fatalf("%s: View() returned empty output", name)
@@ -141,9 +145,15 @@ func TestSmokeAllViewsRenderWithoutPanic(t *testing.T) {
 	t.Run("substate=runner-tag-match-list", func(t *testing.T) {
 		m := smokeFixtureModel()
 		m.ActiveFocus = FocusRunners
-		view := assertRendersWithoutPanic(t, "runner-tag-match-list", m)
-		if !strings.Contains(view, "mac-alpha") {
-			t.Errorf("expected matching-runners list to include mac-alpha, got:\n%s", view)
+		assertRendersWithoutPanic(t, "runner-tag-match-list", m)
+
+		// Assert against the detail viewport, not the whole frame: the left
+		// RUNNERS panel prints "mac-alpha" too, so a full-frame Contains check
+		// passes even when the tag-match list is empty.
+		m.updateViewport()
+		vp := m.Viewport.View()
+		if !strings.Contains(vp, "RUNNERS MATCHING") || !strings.Contains(vp, "mac-alpha") {
+			t.Errorf("expected tag-match list in the detail viewport, got:\n%s", vp)
 		}
 	})
 
@@ -190,39 +200,46 @@ func TestSmokeAllViewsRenderWithoutPanic(t *testing.T) {
 func TestWidthSweepNeverPanicsAndFillsWhenSpaceAllows(t *testing.T) {
 	widths := []int{1, 5, 10, 20, 30, 50, 80, 120, 200}
 	focuses := []FocusType{FocusRepos, FocusRunners, FocusJobs}
+	// ActiveTab is swept too: TabIssues/TabPRs render through their own
+	// m.Viewport.Width-6 title wrappers and TabBranches through its own list
+	// paths, none of which the FocusRepos default tab (TabLogs) reaches.
+	tabs := []TabType{TabLogs, TabBranches, TabIssues, TabPRs}
 
 	for _, w := range widths {
 		for _, focus := range focuses {
-			t.Run(fmt.Sprintf("w=%d/focus=%d", w, focus), func(t *testing.T) {
-				m := smokeFixtureModel()
-				m.ActiveFocus = focus
+			for _, tab := range tabs {
+				t.Run(fmt.Sprintf("w=%d/focus=%d/tab=%d", w, focus, tab), func(t *testing.T) {
+					m := smokeFixtureModel()
+					m.ActiveFocus = focus
+					m.ActiveTab = tab
 
-				var view string
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							t.Fatalf("panic at width %d, focus %d: %v", w, focus, r)
-						}
+					var view string
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								t.Fatalf("panic at width %d, focus %d, tab %d: %v", w, focus, tab, r)
+							}
+						}()
+						view = renderAt(m, w, 40)
 					}()
-					view = renderAt(m, w, 40)
-				}()
 
-				if view == "" {
-					t.Fatalf("width %d focus %d: empty view", w, focus)
-				}
+					if view == "" {
+						t.Fatalf("width %d focus %d tab %d: empty view", w, focus, tab)
+					}
 
-				if w >= 80 {
-					maxWidth := 0
-					for _, line := range strings.Split(view, "\n") {
-						if lw := lipgloss.Width(line); lw > maxWidth {
-							maxWidth = lw
+					if w >= 80 {
+						maxWidth := 0
+						for _, line := range strings.Split(view, "\n") {
+							if lw := lipgloss.Width(line); lw > maxWidth {
+								maxWidth = lw
+							}
+						}
+						if maxWidth != w {
+							t.Errorf("width %d focus %d tab %d: max rendered line width %d, want exact fill %d", w, focus, tab, maxWidth, w)
 						}
 					}
-					if maxWidth != w {
-						t.Errorf("width %d focus %d: max rendered line width %d, want exact fill %d", w, focus, maxWidth, w)
-					}
-				}
-			})
+				})
+			}
 		}
 	}
 }

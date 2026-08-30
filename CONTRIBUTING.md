@@ -42,8 +42,16 @@ make vet
 
 # Run golangci-lint (errcheck, ineffassign, staticcheck, unused, misspell)
 # plus gofmt/goimports formatting — note this rewrites the working tree in
-# place before diffing, same as CI
+# place before diffing, same as CI.
+# Run it on a CLEAN tree: the final `git diff --exit-code` gate cannot tell a
+# formatting rewrite from your own uncommitted edits, so it fails on any dirty
+# working tree. Commit or stash first.
 make lint
+
+# Run the non-enforcing govet/shadow tier (Tier 1b, separate config).
+# Reports findings for information only — CI never gates on it, and it is
+# deliberately not part of `make lint`.
+make lint-shadow
 
 # Run tests with coverage report
 make coverage
