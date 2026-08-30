@@ -27,6 +27,7 @@
 ```bash
 go build -o freshen main.go    # build
 go test ./...                  # test
+make lint                      # golangci-lint (v2.13.x) + gofmt/goimports; rewrites tree, then `git diff --exit-code`
 ```
 
 ## External tools required at runtime (not build-time)
