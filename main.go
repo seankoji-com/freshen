@@ -225,7 +225,11 @@ func main() {
 	// Launch TUI Application
 	logFile := configureTUILogging()
 	if logFile != nil {
-		defer logFile.Close()
+		defer func() {
+			if err := logFile.Close(); err != nil {
+				slog.Error("closing log file", "error", err)
+			}
+		}()
 	}
 
 	var bgWG sync.WaitGroup

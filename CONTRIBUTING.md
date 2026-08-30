@@ -13,6 +13,7 @@ Before you start, ensure you have:
 - **git** — for version control
 - **GitHub CLI (`gh`)** — [install from github.com/cli/cli](https://cli.github.com)
   - Authenticate with your GitHub account: `gh auth login`
+- **golangci-lint v2.13.x** — [install from golangci-lint.run](https://golangci-lint.run/welcome/install) — required for `make lint`; pin the same major/minor version CI uses
 
 Verify prerequisites:
 ```bash
@@ -38,6 +39,11 @@ make test
 
 # Run Go's static analysis
 make vet
+
+# Run golangci-lint (errcheck, ineffassign, staticcheck, unused, misspell)
+# plus gofmt/goimports formatting — note this rewrites the working tree in
+# place before diffing, same as CI
+make lint
 
 # Run tests with coverage report
 make coverage
