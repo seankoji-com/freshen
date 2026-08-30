@@ -113,9 +113,9 @@ func (m *Model) handleLoadedPRsMsg(msg loadedPRsMsg) {
 func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd {
 	var cmd tea.Cmd
 	if msg.Button == tea.MouseButtonWheelUp {
-		m.Viewport.LineUp(3)
+		m.Viewport.ScrollUp(3)
 	} else if msg.Button == tea.MouseButtonWheelDown {
-		m.Viewport.LineDown(3)
+		m.Viewport.ScrollDown(3)
 	} else if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
 		// Click in Left Column Panes
 		if msg.X < m.Width/2 {
@@ -394,7 +394,11 @@ func (m *Model) handleSyncFinishedMsg(msg syncFinishedMsg) {
 func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Width = msg.Width
 	m.Height = msg.Height
-	m.ProgressBar.Width = msg.Width - 20
+	progressBarWidth := msg.Width - 20
+	if progressBarWidth < 0 {
+		progressBarWidth = 0
+	}
+	m.ProgressBar.Width = progressBarWidth
 
 	// Mirror the same height budget as View()
 	rightBoxH := msg.Height - 4
@@ -404,7 +408,14 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	halfWidth := msg.Width / 2
 	leftWidth := halfWidth - 1
 	rightWidth := msg.Width - leftWidth - 2
-	m.Viewport.Width = rightWidth - 4
+	// Floor at 2 so updateViewport()'s unguarded `m.Viewport.Width-2`
+	// strings.Repeat calls (the divider rules in the runners/job-detail
+	// panes) never see a negative count at very small terminal widths.
+	viewportWidth := rightWidth - 4
+	if viewportWidth < 2 {
+		viewportWidth = 2
+	}
+	m.Viewport.Width = viewportWidth
 	m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
 	m.updateViewport()
 }
@@ -445,30 +456,32 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 		for _, newJ := range queue {
 			if oldJ, ok := oldJobs[newJ.ID]; ok {
 				if oldJ.Status != newJ.Status {
-					if newJ.Status == jobs.JobFailed {
+					switch newJ.Status {
+					case jobs.JobFailed:
 						runnerStr := newJ.RunnerName
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
 						m.setToast(fmt.Sprintf(" ❌ Job %s failed (%s) on %s", newJ.ID, newJ.Name, runnerStr), 2)
-					} else if newJ.Status == jobs.JobRunning {
+					case jobs.JobRunning:
 						runnerStr := newJ.RunnerName
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
 						m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
-					} else if newJ.Status == jobs.JobPassed {
+					case jobs.JobPassed:
 						m.setToast(fmt.Sprintf(" ✅ Job %s passed (%s)", newJ.ID, newJ.Name), 1)
 					}
 				}
 			} else {
-				if newJ.Status == jobs.JobRunning {
+				switch newJ.Status {
+				case jobs.JobRunning:
 					runnerStr := newJ.RunnerName
 					if runnerStr == "" {
 						runnerStr = "worker"
 					}
 					m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
-				} else if newJ.Status == jobs.JobQueued {
+				case jobs.JobQueued:
 					m.setToast(fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name), 1)
 				}
 			}
