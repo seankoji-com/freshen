@@ -394,11 +394,6 @@ func (m *Model) handleSyncFinishedMsg(msg syncFinishedMsg) {
 func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Width = msg.Width
 	m.Height = msg.Height
-	progressBarWidth := msg.Width - 20
-	if progressBarWidth < 0 {
-		progressBarWidth = 0
-	}
-	m.ProgressBar.Width = progressBarWidth
 
 	// Mirror the same height budget as View()
 	rightBoxH := msg.Height - 4

@@ -149,8 +149,13 @@ func TestSmokeAllViewsRenderWithoutPanic(t *testing.T) {
 
 		// Assert against the detail viewport, not the whole frame: the left
 		// RUNNERS panel prints "mac-alpha" too, so a full-frame Contains check
-		// passes even when the tag-match list is empty.
-		m.updateViewport()
+		// passes even when the tag-match list is empty. Resize through the
+		// real Update path first (same as renderAt/assertRendersWithoutPanic
+		// above) — a direct m.updateViewport() call on the outer m here would
+		// read Viewport.Width/Height still at NewModel's 60x15 default, not
+		// the 120x40 frame just rendered above.
+		updated, _ := m.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
+		m = updated.(Model)
 		vp := m.Viewport.View()
 		if !strings.Contains(vp, "RUNNERS MATCHING") || !strings.Contains(vp, "mac-alpha") {
 			t.Errorf("expected tag-match list in the detail viewport, got:\n%s", vp)
@@ -185,6 +190,49 @@ func TestSmokeAllViewsRenderWithoutPanic(t *testing.T) {
 		if !strings.Contains(view, "#3") {
 			t.Errorf("expected single-job-detail view for job #3, got:\n%s", view)
 		}
+	})
+
+	// --- Branches the fixture above pins false/populated, exercised here ---
+
+	t.Run("width-zero-early-return", func(t *testing.T) {
+		m := smokeFixtureModel()
+		m.Width = 0
+		m.Height = 0
+		view := assertRendersWithoutPanic(t, "width-zero-early-return", m)
+		if !strings.Contains(view, "Initializing") {
+			t.Errorf("expected the m.Width==0 early-return placeholder, got:\n%s", view)
+		}
+	})
+
+	t.Run("org-syncing", func(t *testing.T) {
+		m := smokeFixtureModel()
+		m.IsOrgSyncing = true
+		assertRendersWithoutPanic(t, "org-syncing", m)
+	})
+
+	t.Run("runners-fetch-failed", func(t *testing.T) {
+		m := smokeFixtureModel()
+		m.Runners = nil
+		m.IsRunnersLoading = false
+		m.RunnerFetchFailed = true
+		m.RunnerPermissionDenied = false
+		view := assertRendersWithoutPanic(t, "runners-fetch-failed", m)
+		if !strings.Contains(view, "Failed to fetch registered runners") {
+			t.Errorf("expected the runner-fetch-failed message, got:\n%s", view)
+		}
+	})
+
+	t.Run("runners-permission-denied", func(t *testing.T) {
+		m := smokeFixtureModel()
+		m.Runners = nil
+		m.IsRunnersLoading = false
+		m.RunnerFetchFailed = true
+		m.RunnerPermissionDenied = true
+		// RunnerPermissionDenied suppresses the fetch-failed message (view.go's
+		// `if m.RunnerFetchFailed && !m.RunnerPermissionDenied` guard) in favor
+		// of the generic no-runners message — assert no-panic only, matching
+		// the smoke table's own stated purpose.
+		assertRendersWithoutPanic(t, "runners-permission-denied", m)
 	})
 }
 

@@ -175,7 +175,7 @@ var (
 			Padding(0, 1)
 
 	// Explicit Column Width Styles for Table Alignment
-	// Total: 2 + 20 + 16 + 4 + 6 + spaces = ~51 chars, fits in a ~55 char inner pane
+	// Total: 2 + 20 + 4 + 6 + spaces = ~35 chars, fits in a ~55 char inner pane
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
 	cellBranchStyle     = lipgloss.NewStyle().Width(20)
 	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)

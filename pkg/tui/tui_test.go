@@ -466,10 +466,10 @@ func TestIssue37Fixes(t *testing.T) {
 		{Name: "myrepo", CurrentBranch: "feat/long-branch-name-feature-x", Status: git.StatusUpToDate},
 	}
 
-	// 1. Verify tab bar active styling. Exact match (not Contains): the four
-	// tab labels are fixed text regardless of which tab is active — only
-	// styling (stripped away here) differs — so this also pins the label
-	// wording and ordering, not just their presence.
+	// 1. Verify tab bar label wording and ordering (not styling — stripped()
+	// removes all SGR sequences before comparison). Exact match (not
+	// Contains): the four tab labels are fixed text regardless of which tab
+	// is active, so this also pins their exact wording and order.
 	m.ActiveTab = TabLogs
 	tabBar := stripped(m.renderTabBar())
 	wantTabBar := " [1 Logs]  [2 Branches & Worktrees]  [3 Issues]  [4 PRs] "
