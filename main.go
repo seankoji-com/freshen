@@ -226,8 +226,13 @@ func main() {
 	logFile := configureTUILogging()
 	if logFile != nil {
 		defer func() {
+			// p.Run() has already released the alt screen by the time this
+			// fires, and slog's default handler still points at this same
+			// file (see configureTUILogging), so a post-close slog.Error call
+			// here would write into an already-closed descriptor and be
+			// silently discarded — stderr is the only surface left.
 			if err := logFile.Close(); err != nil {
-				slog.Error("closing log file", "error", err)
+				fmt.Fprintf(os.Stderr, "freshen: closing log file %s: %v\n", logPath(), err)
 			}
 		}()
 	}
