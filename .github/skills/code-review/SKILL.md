@@ -27,10 +27,10 @@ repo's closed-PR history, not generic Go advice.
   `filepath.Join`) against repo/branch-derived strings. Treat any new code
   building shell args, joining paths from external strings, or printing
   GitHub API text as security-sensitive.
-- **Destructive-action paths**: the `d d` archived-repo delete (`rm -rf`)
-  and `X` prune (removes worktrees/local branches). Changes to confirmation
-  state or key handling here are high-stakes — a bypassed confirm deletes
-  user data.
+- **Destructive-action paths**: the `dd` archived-repo delete (os.RemoveAll
+  via git.DeleteLocalRepo, guarded by ValidateWorkspacePath) and `X` prune
+  (removes worktrees/local branches). Changes to confirmation state or key
+  handling here are high-stakes — a bypassed confirm deletes user data.
 
 ## Do not spend attention here
 - `docs/*.md` (architecture.md, conventions.md, dependencies.md) and
