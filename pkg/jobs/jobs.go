@@ -65,6 +65,7 @@ type RunItem struct {
 	StartedAt   time.Time
 	CompletedAt time.Time
 	JobsKnown   bool
+	JobsStale   bool
 	JobsError   string
 }
 
@@ -617,8 +618,9 @@ type repoQueueResult struct {
 // QueueFetchError distinguishes incomplete coverage from a failed sweep.
 // Partial data should remain visible without backing off healthy repositories.
 type QueueFetchError struct {
-	Partial bool
-	Cause   error
+	Partial       bool
+	Failed, Total int
+	Cause         error
 }
 
 func (e *QueueFetchError) Error() string { return e.Cause.Error() }
@@ -655,12 +657,16 @@ func FetchOrgJobQueue(org string, repos []string, refreshRunIDs ...int64) ([]*Jo
 	seenJobIDs := make(map[string]bool)
 	history := make(map[string][]time.Duration)
 	var failures []error
+	failedRepos := 0
 	rateLimited := false
 
 	for i, res := range results {
 		if res.err != nil {
 			slog.Warn("workflow runs fetch failed for repo", "org", org, "repo", repos[i], "error", res.err)
 			failures = append(failures, res.err)
+			if len(res.jobs) == 0 {
+				failedRepos++
+			}
 			if strings.Contains(res.err.Error(), "rate limit") {
 				rateLimited = true
 			}
@@ -682,7 +688,7 @@ func FetchOrgJobQueue(org string, repos []string, refreshRunIDs ...int64) ([]*Jo
 		return sorted, history, fmt.Errorf("GitHub API rate limit exceeded")
 	}
 	if len(failures) > 0 {
-		return sorted, history, &QueueFetchError{Partial: len(allJobs) > 0, Cause: fmt.Errorf("actions incomplete: %d of %d repositories had fetch errors (%v)", len(failures), len(repos), failures[0])}
+		return sorted, history, &QueueFetchError{Partial: len(allJobs) > 0, Failed: failedRepos, Total: len(repos), Cause: fmt.Errorf("actions incomplete: %d of %d repositories had fetch errors (%v)", len(failures), len(repos), failures[0])}
 	}
 	return sorted, history, nil
 }
@@ -923,7 +929,7 @@ func FilterAndSortJobQueue(queue []*JobItem) []*JobItem {
 // Uses the same sort comparator as FilterAndSortJobQueue for consistency.
 func PollStep(runners []*RunnerItem, jobQueue []*JobItem) {
 	for _, j := range jobQueue {
-		if j.Status == JobRunning && !j.StartedAt.IsZero() {
+		if j.Status == JobRunning && !j.StartedAt.IsZero() && (j.Run == nil || !j.Run.JobsStale) {
 			j.Seconds = int(time.Since(j.StartedAt).Seconds())
 			j.Duration = formatDuration(j.Seconds)
 		}

@@ -47,7 +47,7 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 	var refreshRunIDs []int64
 	seen := map[int64]bool{}
 	for _, j := range m.JobQueue {
-		if j.Run != nil && (!terminalStatus(j.Run.Status) || j.Run.JobsError != "") && !seen[j.RunID] {
+		if j.Run != nil && (!terminalStatus(j.Run.Status) || j.Run.JobsError != "" || j.Run.JobsStale) && !seen[j.RunID] {
 			refreshRunIDs = append(refreshRunIDs, j.RunID)
 			seen[j.RunID] = true
 		}

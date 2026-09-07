@@ -225,7 +225,11 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	if msg.err != nil {
 		m.JobQueueFetchFailed = true
 		var partial *jobs.QueueFetchError
-		if errors.As(msg.err, &partial) && partial.Partial {
+		m.ActionsCoverage = msg.err.Error()
+		if errors.As(msg.err, &partial) {
+			slog.Warn("Actions coverage incomplete", "unavailable", partial.Failed, "total", partial.Total, "error", partial.Cause)
+		}
+		if partial != nil && partial.Partial && partial.Total > 0 && partial.Failed*4 < partial.Total {
 			m.noteFetchSuccess(fetchSourceJobQueue)
 		} else {
 			m.noteFetchFailure(fetchSourceJobQueue, m.actionsPollInterval())
@@ -245,6 +249,7 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	}
 
 	m.JobQueueFetchFailed = false
+	m.ActionsCoverage = ""
 	m.LastActionsRefresh = time.Now()
 	m.noteFetchSuccess(fetchSourceJobQueue)
 	m.processJobQueueUpdate(msg.queue, msg.history)
@@ -503,12 +508,15 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 			}
 			copyJob := *old
 			copyJob.Run = header.Run
+			if header.Run.JobsError != "" || old.Run.JobsStale {
+				header.Run.JobsStale = true
+			}
 			queue = append(queue, &copyJob)
 			if header.Run.JobsError == "" {
 				if terminalStatus(old.Run.Status) {
 					header.Run.JobsKnown = old.Run.JobsKnown
 				} else {
-					header.Run.JobsError = "Final job results pending refresh"
+					header.Run.JobsStale = true
 				}
 			}
 		}
@@ -581,16 +589,13 @@ func clearConfiguredOwner(owner string) error {
 	return config.Save(cfg)
 }
 
-func extractRunnersFromJobQueue(queue []*jobs.JobItem, existing []*jobs.RunnerItem) []*jobs.RunnerItem {
+func extractRunnersFromJobQueue(queue []*jobs.JobItem, _ []*jobs.RunnerItem) []*jobs.RunnerItem {
 	runnerMap := make(map[string]*jobs.RunnerItem)
-	for _, r := range existing {
-		copyRunner := *r
-		copyRunner.Status = jobs.RunnerUnknown
-		copyRunner.CurrentJob = ""
-		copyRunner.CurrentJobID = ""
-		runnerMap[r.Name] = &copyRunner
-	}
+
 	for _, j := range queue {
+		if j.IsRunHeader || terminalStatus(j.Status) {
+			continue
+		}
 		if j.RunnerName == "" || j.RunnerName == "worker" {
 			continue
 		}

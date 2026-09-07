@@ -215,11 +215,8 @@ func TestRepositoryShortcutsAreScopedAndNonblocking(t *testing.T) {
 		t.Fatal("Actions shortcut triggered repository mutation")
 	}
 	press(&m, "1")
-	cmd := press(&m, "b")
-	if cmd == nil || m.BusyAction == "" {
-		t.Fatal("branch action needs a background command and busy feedback")
-	}
-	// The command is intentionally not executed: fixture paths are never mutated.
+	m.BusyAction = "test operation"
+
 	press(&m, "p")
 	if m.PendingAction != "" {
 		t.Fatal("allowed concurrent repository mutation")
@@ -291,7 +288,8 @@ func TestDemoCannotStartRepositoryOperations(t *testing.T) {
 func TestActionsRegisterWithShutdownBeforeCommandRuns(t *testing.T) {
 	m := smokeFixtureModel()
 	m.ActionURL = ""
-	cmd := m.executeAction("copy") // Empty target fails locally, without clipboard access.
+	release := make(chan struct{})
+	cmd := m.actionCmd(func() actionResultMsg { <-release; return actionResultMsg{err: fmt.Errorf("test result")} })
 	finished := make(chan struct{})
 	go func() { m.bgWG.Wait(); close(finished) }()
 	select {
@@ -299,6 +297,7 @@ func TestActionsRegisterWithShutdownBeforeCommandRuns(t *testing.T) {
 		t.Fatal("shutdown saw no work before command started")
 	case <-time.After(20 * time.Millisecond):
 	}
+	close(release)
 	result := cmd().(actionResultMsg)
 	if result.err == nil {
 		t.Fatal("expected empty-target error")
@@ -339,9 +338,61 @@ func TestLargeBudgetIsNeverShortenedByBackoff(t *testing.T) {
 }
 func TestPartialCoverageDoesNotBackOffHealthyRepositories(t *testing.T) {
 	m := smokeFixtureModel()
-	err := &jobs.QueueFetchError{Partial: true, Cause: fmt.Errorf("one repo unavailable")}
+	err := &jobs.QueueFetchError{Partial: true, Failed: 1, Total: 20, Cause: fmt.Errorf("one repo unavailable")}
 	m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: m.JobQueue, err: err})
 	if !m.JobQueueFetchFailed || m.ConsecutiveErrors[fetchSourceJobQueue] != 0 || m.ToastMsg != "" {
 		t.Fatal("partial coverage treated as total outage")
+	}
+}
+
+func TestWidespreadCoverageLossWarnsEveryScreen(t *testing.T) {
+	m := smokeFixtureModel()
+	err := &jobs.QueueFetchError{Partial: true, Failed: 19, Total: 20, Cause: fmt.Errorf("19 of 20 repositories unavailable")}
+	m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: m.JobQueue, err: err})
+	if m.ConsecutiveErrors[fetchSourceJobQueue] != 1 || m.ToastPriority != 2 {
+		t.Fatal("widespread outage did not back off and warn")
+	}
+	for _, focus := range []FocusType{FocusRepos, FocusJobs, FocusRunners} {
+		m.ActiveFocus = focus
+		if !strings.Contains(stripped(m.View()), "Actions incomplete") {
+			t.Fatal("coverage warning hidden on screen", focus)
+		}
+	}
+}
+func TestPendingFinalResultsAreDistinctFromFetchFailure(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "enter")
+	m.OpenJobID = "#2"
+	r := *m.OpenRun
+	r.Status = jobs.JobFailed
+	r.JobsKnown = false
+	m.processJobQueueUpdate([]*jobs.JobItem{{ID: "run:100", RunID: 100, Repo: "alpha", Run: &r, IsRunHeader: true, Status: jobs.JobFailed}}, nil)
+	if !m.OpenRun.JobsStale || m.OpenRun.JobsError != "" {
+		t.Fatal("pending refresh was represented as a fetch error")
+	}
+	content := m.jobDetailContent()
+	if strings.Contains(content, "refresh failed") || !strings.Contains(content, "previous poll") {
+		t.Fatal(content)
+	}
+}
+func TestDerivedRunnersOnlyReflectActiveAssignments(t *testing.T) {
+	old := []*jobs.RunnerItem{{ID: "runner-old", Name: "old", Status: jobs.RunnerRunning}}
+	queue := []*jobs.JobItem{{ID: "1", RunnerName: "finished", Status: jobs.JobPassed}, {ID: "2", RunnerName: "active", Status: jobs.JobRunning}}
+	got := extractRunnersFromJobQueue(queue, old)
+	if len(got) != 1 || got[0].Name != "active" {
+		t.Fatalf("phantom runners retained: %+v", got)
+	}
+}
+func TestDiscardedActionCommandDoesNotStrandShutdown(t *testing.T) {
+	m := smokeFixtureModel()
+	m.actionCmd(func() actionResultMsg { <-m.ctx.Done(); return actionResultMsg{} })
+	m.cancel()
+	done := make(chan struct{})
+	go func() { m.bgWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("discarded result command stranded shutdown")
 	}
 }

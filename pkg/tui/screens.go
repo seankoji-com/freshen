@@ -210,6 +210,9 @@ func (m Model) entries() []screenEntry {
 				if !r.run.JobsKnown {
 					progress = "Enter to load jobs"
 				}
+				if r.run.JobsStale {
+					progress = "Cached results · refreshing"
+				}
 				if r.run.JobsError != "" {
 					progress = "Job details unavailable · r retries"
 				}
@@ -400,6 +403,9 @@ func (m Model) screenView() string {
 		return fitFrame("freshen\nResize to at least 30 × 10\nq quit", m.Width, m.Height)
 	}
 	header := titleStyle.Render(" freshen ") + "  " + lipgloss.NewStyle().Foreground(colorSecondary).Render(m.TargetOrg)
+	if m.JobQueueFetchFailed {
+		header += badgeError.Render(" · Actions incomplete")
+	}
 	tabs := ""
 	for i, tab := range []struct {
 		name  string
@@ -433,8 +439,8 @@ func (m Model) statusLine() string {
 	if m.ToastMsg != "" {
 		return m.ToastMsg + "  (Esc dismiss)"
 	}
-	if m.JobQueueFetchFailed && m.ActiveFocus == FocusJobs {
-		return "Snapshot incomplete · r retry · some repositories may be missing"
+	if m.JobQueueFetchFailed {
+		return "Actions incomplete · " + m.ActionsCoverage
 	}
 	if m.ActiveFocus == FocusJobs && !m.LastActionsRefresh.IsZero() {
 		return fmt.Sprintf("Updated %s ago · auto-refresh %s · recent history: 30 runs/repository", jobs.FormatDuration(time.Since(m.LastActionsRefresh)), jobs.FormatDuration(m.actionsPollInterval()))
@@ -492,6 +498,8 @@ func (m Model) jobDetailContent() string {
 	var sb strings.Builder
 	if j.Run != nil && j.Run.JobsError != "" {
 		sb.WriteString("Cached job state; refresh failed: " + j.Run.JobsError + "\n\n")
+	} else if j.Run != nil && j.Run.JobsStale {
+		sb.WriteString("Cached job state from the previous poll; refreshing.\n\n")
 	}
 	fmt.Fprintf(&sb, "%s  %s\n%s\n\n", stateBadge(j.Status), j.Name, Hyperlink("Open job in GitHub", m.jobURL(j)))
 	if j.RunnerName != "" {

@@ -189,10 +189,7 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		}
 		return result
 	}
-	var result actionResultMsg
-	run := m.bgGuard(func() { result = work() })
-	// Register before returning the command so shutdown cannot observe zero work.
-	return func() tea.Msg { run(); return result }
+	return m.actionCmd(work)
 }
 func (m *Model) receiveAction(msg actionResultMsg) {
 	if msg.id != "copy" && msg.id != "open" {
@@ -221,4 +218,13 @@ func (m *Model) receiveAction(msg actionResultMsg) {
 
 func (m Model) confirmationFits() bool {
 	return m.Width >= 30 && len(strings.Split(ansi.Wrap(m.menuContent(), max(1, m.Width-4), ""), "\n")) <= m.bodyHeight()
+}
+
+// Start the guarded worker immediately. A discarded Bubble Tea command cannot
+// strand the WaitGroup; the buffered result never needs a surviving UI consumer.
+func (m *Model) actionCmd(work func() actionResultMsg) tea.Cmd {
+	results := make(chan actionResultMsg, 1)
+	run := m.bgGuard(func() { results <- work() })
+	go run()
+	return func() tea.Msg { return <-results }
 }

@@ -329,6 +329,7 @@ func (m *Model) receiveRunJobs(msg runJobsLoadedMsg) {
 	}
 	run := *m.OpenRun
 	run.JobsKnown = true
+	run.JobsStale = false
 	run.JobsError = ""
 	m.OpenRun = &run
 	logs := map[string][]string{}

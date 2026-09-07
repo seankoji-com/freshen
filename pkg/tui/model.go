@@ -285,6 +285,7 @@ type Model struct {
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
+	ActionsCoverage        string
 	// JobDurationHistory retains historical timing samples, never used as completion progress.
 	JobDurationHistory map[string][]time.Duration
 
