@@ -81,8 +81,8 @@ func TestFilterAndSortJobQueue(t *testing.T) {
 	}
 
 	filtered := FilterAndSortJobQueue(queue)
-	if len(filtered) != 2 {
-		t.Fatalf("expected 2 items after filtering passed jobs, got %d", len(filtered))
+	if len(filtered) != 3 {
+		t.Fatalf("expected all 3 items including completed jobs, got %d", len(filtered))
 	}
 	if filtered[0].Status != JobRunning {
 		t.Errorf("expected running job first, got: %s", filtered[0].Status)
@@ -228,19 +228,16 @@ func TestFetchOrgJobQueuePerRepo(t *testing.T) {
 
 	// Per repo: the in-progress run contributes its live job (the successful
 	// "lint" job is dropped) and the queued run falls back to a run header.
-	if len(queue) != 4 {
-		t.Fatalf("expected 4 queue items across 2 repos, got %d", len(queue))
+	if len(queue) != 10 {
+		t.Fatalf("expected 6 run headers and 4 jobs across 2 repos, got %d", len(queue))
 	}
 
 	perRepo := map[string]int{}
 	for _, j := range queue {
 		perRepo[j.Repo]++
-		if j.RunID == 1003 || j.RunID == 2003 {
-			t.Errorf("completed run %d should not appear in the queue", j.RunID)
-		}
 	}
-	if perRepo["alpha"] != 2 || perRepo["beta"] != 2 {
-		t.Errorf("expected 2 items per repo, got %v", perRepo)
+	if perRepo["alpha"] != 5 || perRepo["beta"] != 5 {
+		t.Errorf("expected 5 items per repo, got %v", perRepo)
 	}
 	if queue[0].Status != JobRunning {
 		t.Errorf("expected a running job sorted first, got %s", queue[0].Status)
@@ -255,11 +252,11 @@ func TestFetchOrgJobQueuePartialFailure(t *testing.T) {
 	stubGH(t, repoQueueHandler(map[string]int64{"alpha": 1000}))
 
 	queue, _, err := FetchOrgJobQueue("acme", []string{"alpha", "gone"})
-	if err != nil {
-		t.Fatalf("partial failure should not surface an error: %v", err)
+	if err == nil {
+		t.Fatal("partial failure must label the snapshot incomplete")
 	}
-	if len(queue) != 2 {
-		t.Fatalf("expected the healthy repo's 2 items, got %d", len(queue))
+	if len(queue) != 5 {
+		t.Fatalf("expected the healthy repo's 5 items, got %d", len(queue))
 	}
 
 	// A sweep where every repo fails is a real error.
@@ -469,7 +466,7 @@ func TestFetchJobLogs(t *testing.T) {
 			return []byte("{bad"), nil
 		})
 		_, _, err := FetchJobLogs("acme", "repo", 1, 0, "", 10)
-		if err == nil || !strings.Contains(err.Error(), "jobs parse:") {
+		if err == nil || !strings.Contains(err.Error(), "jobs list:") {
 			t.Fatalf("expected jobs parse error, got %v", err)
 		}
 	})
@@ -534,13 +531,13 @@ func TestFetchJobLogs(t *testing.T) {
 		if jobID != 60 {
 			t.Errorf("expected jobID 60, got %d", jobID)
 		}
-		if len(lines) != 2 {
-			t.Fatalf("expected 2 step lines, got %d: %v", len(lines), lines)
+		if len(lines) != 3 {
+			t.Fatalf("expected explanation and 2 step lines, got %d: %v", len(lines), lines)
 		}
-		if !strings.Contains(lines[0], "✓") || !strings.Contains(lines[0], "checkout") {
+		if !strings.Contains(lines[1], "✓") || !strings.Contains(lines[1], "checkout") {
 			t.Errorf("expected success glyph for checkout step, got %q", lines[0])
 		}
-		if !strings.Contains(lines[1], "▶") || !strings.Contains(lines[1], "test") {
+		if !strings.Contains(lines[2], "▶") || !strings.Contains(lines[2], "test") {
 			t.Errorf("expected in_progress glyph for test step, got %q", lines[1])
 		}
 	})
@@ -602,5 +599,88 @@ func TestClassifyGHError(t *testing.T) {
 				t.Errorf("classifyGHError(%q, %v) = %v, want %q", tc.stderr, tc.execErr, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestGitHubResultsAndCompletedTiming(t *testing.T) {
+	for _, tc := range []struct {
+		status, conclusion string
+		want               JobStatus
+	}{
+		{"completed", "success", JobPassed}, {"completed", "skipped", JobSkipped},
+		{"completed", "neutral", JobSkipped}, {"completed", "timed_out", JobFailed},
+		{"completed", "cancelled", JobCancelled}, {"waiting", "", JobWaiting},
+		{"pending", "", JobWaiting}, {"queued", "", JobQueued}, {"completed", "", JobUnknown},
+	} {
+		if got := jobStatusFromGH(tc.status, tc.conclusion); got != tc.want {
+			t.Errorf("%+v: got %s", tc, got)
+		}
+	}
+	item := buildJobItemFromJob(GHJobInfo{ID: 1, Status: "completed", Conclusion: "success", StartedAt: "2026-09-01T01:00:00Z", CompletedAt: "2026-09-01T01:00:42Z"}, GHWorkflowRun{ID: 10}, "repo")
+	if item.Seconds != 42 || item.Duration != "42s" {
+		t.Fatalf("completed job duration keeps increasing: %+v", item)
+	}
+}
+
+func TestRunJobPaginationAndExactLogIdentity(t *testing.T) {
+	first := GHJobsResponse{TotalCount: 51}
+	for i := 1; i <= 50; i++ {
+		first.Jobs = append(first.Jobs, GHJobInfo{ID: int64(i), Name: fmt.Sprint(i)})
+	}
+	stubGH(t, func(path string) ([]byte, error) {
+		switch {
+		case strings.Contains(path, "/jobs/51/logs"):
+			return []byte("correct job"), nil
+		case strings.Contains(path, "page=2"):
+			return mustJSON(t, GHJobsResponse{TotalCount: 51, Jobs: []GHJobInfo{{ID: 51, Name: "last"}}}), nil
+		case strings.Contains(path, "/runs/10/jobs"):
+			return mustJSON(t, first), nil
+		default:
+			t.Errorf("unexpected request %s", path)
+			return nil, fmt.Errorf("unexpected request")
+		}
+	})
+	infos, err := FetchRunJobs("org", "repo", 10)
+	if err != nil || len(infos) != 51 {
+		t.Fatalf("pagination: %d %v", len(infos), err)
+	}
+	lines, id, err := FetchJobLogs("org", "repo", 10, 51, "last", 10)
+	if err != nil || id != 51 || len(lines) != 1 || lines[0] != "correct job" {
+		t.Fatalf("wrong log identity: %v %d %v", lines, id, err)
+	}
+	if _, _, err := FetchJobLogs("org", "repo", 10, 99, "last", 10); err == nil {
+		t.Fatal("missing explicit ID fell back to another job")
+	}
+}
+
+func TestFullRecentPageStillFindsOldQueuedRun(t *testing.T) {
+	recent := GHWorkflowRunsResponse{TotalCount: 100}
+	for i := 0; i < 30; i++ {
+		recent.WorkflowRuns = append(recent.WorkflowRuns, GHWorkflowRun{ID: int64(100 + i), Status: "completed", Conclusion: "success"})
+	}
+	stubGH(t, func(path string) ([]byte, error) {
+		switch {
+		case strings.Contains(path, "status=queued"):
+			return mustJSON(t, GHWorkflowRunsResponse{TotalCount: 1, WorkflowRuns: []GHWorkflowRun{{ID: 1, Status: "queued"}}}), nil
+		case strings.Contains(path, "status="):
+			return mustJSON(t, GHWorkflowRunsResponse{}), nil
+		case strings.Contains(path, "/runs/1/jobs"):
+			return mustJSON(t, GHJobsResponse{}), nil
+		default:
+			return mustJSON(t, recent), nil
+		}
+	})
+	queue, _, err := FetchOrgJobQueue("org", []string{"repo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, j := range queue {
+		if j.RunID == 1 && j.IsRunHeader && j.Status == JobQueued {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("recent completed runs hid old queued run")
 	}
 }

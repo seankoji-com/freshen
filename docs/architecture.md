@@ -1,114 +1,55 @@
 # Architecture
 
-## Entry point
+`main.go` selects interactive Bubble Tea or non-interactive batch mode. Runtime
+GitHub operations use the authenticated `gh` CLI; repository operations use `git`.
 
-`main.go` — parses flags (`-dir`, `-org`, `-y/-non-interactive`, `-v/-version`), then either:
-- Non-interactive: calls `runNonInteractive()` which does sequential clone/sync
-- Interactive: launches `tui.NewModel(targetDir, orgFlag)` via `tea.NewProgram()`
+| File | Responsibility |
+|---|---|
+| `pkg/git/git.go` | Repository discovery, clone/sync, branches, worktrees and PR operations |
+| `pkg/jobs/jobs.go` | Typed workflow runs/jobs/steps, polling, result mapping and logs |
+| `pkg/tui/model.go` | Model, messages, polling constants and shared styles |
+| `pkg/tui/screens.go` | Screen entries, identity, layout, progress and detail content |
+| `pkg/tui/screen_keys.go` | Navigation, search, mouse input and run-detail requests |
+| `pkg/tui/actions.go` | Action menus, captured confirmation targets and background results |
+| `pkg/tui/keys.go` | Key dispatch, quit and bulk sync |
+| `pkg/tui/commands.go` | Background commands, streaming sync snapshots and API budget |
+| `pkg/tui/update.go` | Message dispatch and reconciliation |
+| `pkg/tui/view.go` | Repository details, status styles, runner matching and tag helpers |
 
-## Package layout
+## State and navigation
 
-```
-main.go                   # CLI entry, flag parsing, non-interactive path
-pkg/
-  git/git.go              # Git operations, GitHub API (gh CLI wrapper), repo model
-  jobs/jobs.go            # GitHub Actions runner & job queue polling, data types
-  jobs/jobs_test.go       # Unit tests for filtering, sorting, merging
-  tui/model.go            # Model struct, NewModel, Init, message types, glyphs/styles
-  tui/commands.go         # tea.Cmd producers: loading, syncing, background git/gh work
-  tui/update.go           # Update dispatch and non-key message handlers
-  tui/keys.go             # handleKey* keybinding handlers
-  tui/view.go             # View, panel rendering, and rendering helpers
-  tui/tui_test.go         # TUI rendering & behavior tests
-```
+Repositories, Actions and Runners are separate screens. Repository details use
+Logs/Branches/Issues/PRs tabs. Actions has run and job-queue views; a run opens its
+jobs, and a job opens steps and log tail. Stable keys drive selection and mouse
+hit testing. A response for a previously opened run cannot replace another run.
 
-## Package `pkg/git` — Repository sync engine
+`RunItem` owns the workflow invocation's ID, attempt, workflow name, display title,
+trigger and status. `JobItem` owns job ID, status, runner, labels, steps and timing.
+The queue transport includes explicit `IsRunHeader` records; renderers count only
+actual jobs. Completed runs load jobs on demand. Retained job details belong to the
+same completed attempt; a new attempt never inherits old jobs or logs.
 
-**Core types:**
-- `RepoItem` — the main model for a local repo. Fields: Name, GHRepoName, Path, CurrentBranch, DefaultBranch, Status, Logs, BranchDetails, IssuesList, PRsList, etc.
-- `RepoStatus` — enum: PENDING, SYNCING, UP_TO_DATE, UPDATED, STASHED_APPLIED, SWITCHED_DEFAULT, REBASED, REBASE_CONFLICT, PR_CREATED, CLONED, ARCHIVED, ERROR
-- `GHRepoInfo`, `RepoCounts`, `IssueItem`, `PRItem`, `BranchWorktreeDetails`
+All model mutation occurs in `Update`. Background operations use private repository
+snapshots and return messages. Repository sync uses a semaphore and streams snapshots.
+Destructive confirmation captures the repository before the command starts. A busy
+operation prevents overlapping repository mutations while navigation stays available.
 
-**Key functions:**
-- `FetchOrgRepos(org)` — shells out to `gh repo list` (JSON), returns all org repos
-- `FetchOrgRepoCounts(org)` — GraphQL query for open issues/PRs per repo
-- `SyncRepository(item)` — the core workflow. Determines default branch, checks dirty state, then:
-  - If not cloned locally: clones repo into target directory via `gh repo clone` (with `git clone` fallback), sets status `CLONED`
-  - On default, clean: `git pull`
-  - On default, dirty: `git stash && git pull && git stash apply`
-  - On feature, clean: `git checkout default && git pull`
-  - On feature, dirty: `git fetch && git rebase origin/default`
-- `CommitPushPRAndSwitchDefault(item)` — commits, pushes, creates/updates PR via `gh pr create`
-- `PruneBranchesAndWorktrees(path, defaultBranch)` — fetch prune + delete non-default branches + remove worktrees
-- `GetLocalDirName` / `GetGHRepoName` — alias mapping (`.github` ↔ `github`, `careynas.net` ↔ `wiki.robot.house`)
+## Polling and failure states
 
-**GitHub integration pattern:** All API calls go through the `gh` CLI binary (not the Go SDK). Commands are built via `exec.Command("gh", ...)` with JSON output parsing.
+Startup reads metadata. Repository metadata refreshes every five minutes. Runner
+polling uses a ten-second baseline; organisation Actions polling starts at twenty
+seconds and scales with repository/active-run count to budget API calls. Pollers use
+independent exponential backoff after failures. Read commands have bounded execution.
 
-## Package `pkg/jobs` — CI runner & job monitoring
+Recent runs are bounded to thirty per repository. A full recent page triggers
+separate active-state queries; job lists are paginated. Partial repository failures
+are surfaced. Failed job-detail requests retain run metadata and an error marker.
+Fleet permission failures fall back to observed runner assignments, with unknown
+availability. A disappearing job never implies success.
 
-**Core types:**
-- `RunnerItem` — a self-hosted GitHub Actions runner. Fields: ID, Name, Platform, Status, Tags, CurrentJob, OutputLogs, StepCount, LastHeartbeat
-- `RunnerStatus` — IDLE, RUNNING, OFFLINE, MAINTENANCE
-- `JobItem` — a workflow job. Fields: ID, Name, Repo, Branch, Event, PRNumber, PRTitle, PRURL, Status, RunnerName, Duration, Logs, RunID, GHJobID, IsRunHeader, StartedAt
-- `JobStatus` — QUEUED, RUNNING, PASSED, FAILED, CANCELLED
-- `GHRunnerLabel`, `GHRunnerInfo`, `GHWorkflowRun`, `GHWorkflowRunsResponse`, `GHJobInfo`, `GHJobsResponse`
+Bubbles supplies text input, help, progress, spinner and viewport components. Lip
+Gloss supplies screen tabs, selection and borders. Progress counts completed jobs
+or steps, never elapsed-time estimates. Rendering and input share row geometry.
 
-**Key functions:**
-- `FetchOrgRunners(org)` — queries `/orgs/{org}/actions/runners` and returns runners
-- `MergeRunners(newRunners, existing, jobQueue)` — merges with existing data preserving log history, cross-references with job queue
-- `FetchOrgJobQueue(org, repos)` — iterates over repos, queries `/repos/{org}/{repo}/actions/runs` and `/repos/{org}/{repo}/actions/runs/{id}/jobs`
-- `FetchJobLogs(org, repo, runID, targetGHJobID, targetJobName, maxLines)` — fetches raw log text for a specific job; falls back through 4 matching strategies
-- `FilterAndSortJobQueue(queue)` — removes passed/completed jobs; sorts running first, then groups by run ID, then matrix children
-- `PollStep(runners, jobQueue)` — updates running job durations and sorts
-- `mergeRunners(newRunners, existing, jobQueue)` — preserves logs, cross-references active jobs
-
-## Package `pkg/tui` — Bubble Tea UI
-
-**Model struct:** All app state — repos, runners, jobQueue, focus state, tab state, spinner, progress bar, viewport, error tracking (`RunnerPermissionDenied`, `RunnerFetchFailed`, `JobQueueFetchFailed`).
-
-**Focus model:** Three-column left pane with focusable panels:
-- `FocusRepos` (0) — repository list with status badges
-- `FocusRunners` (1) — tag-filtered runner grid
-- `FocusJobs` (2) — overall job queue with tree hierarchy
-
-**Tab model:** Right-side detail view has 4 tabs: Logs, Branches, Issues, PRs.
-
-**Message types:** `orgSyncedMsg`, `loadedRunnersMsg`, `loadedJobQueueMsg`, `loadedJobLogsMsg`, `loadedIssuesMsg`, `loadedPRsMsg`, `repoTickMsg`, `runnerJobTickMsg`, `syncFinishedMsg`
-
-**Key behaviors:**
-- `Init()` fires 5 commands in batch: spinner tick, org repo load, runners load, job queue load, and two periodic ticks
-- Repo tick: every 5 minutes
-- Runner/job tick: every 10 seconds (skips runner query if `RunnerPermissionDenied` is set)
-- Runner permissions: HTTP 403 / non-admin runner access errors are caught gracefully (`RunnerPermissionDenied`), suppressing recurring toast alerts and displaying an informative notice in the runners panel
-- Job queue polling fetches real GitHub API data; no mock simulation
-- Job log fetching targets running jobs via 4-step fallback matching
-- Toast notifications for job status transitions (QUEUED→RUNNING, etc.)
-- `FocusedRunID` enables drill-down into a workflow run's matrix jobs (Enter to focus, Esc/Enter again to unfocus)
-
-**Rendering:** `View()` builds a split layout — left column has 3 stacked bordered panes (repos, runners, jobs), right column has a viewport for detail content. Heavy use of Lip Gloss styles and OSC 8 hyperlinks.
-
-**Helper functions in view.go (unless noted):**
-- `Hyperlink(text, url)` — OSC 8 terminal hyperlinks
-- `truncateString(str, maxLen)` — ellipsis truncation
-- `parseJobHierarchy(fullName, repo)` — splits `"repo / workflow / job-name"` into (runName, jobName)
-- `findJobForRunner(runner, queue)` — 4-step matching: exact name, case-insensitive, any assigned, any running
-- `reconcileRunnerJobs(runners, queue, targetOrg)` — ensures running runners have corresponding queue entries (update.go)
-- `isRunnerPermissionError(err)` — detects HTTP 403 / fine-grained admin permission errors from runner API calls (update.go)
-- `highlightLogLine(line)` — regex-based syntax highlighting for log output
-- `getAvailableTags()` — collects unique runner tags for filter navigation
-
-## Data flow
-
-1. On start: `Init()` → parallel `loadOrgReposCmd`, `loadRunnersCmd`, `loadJobQueueCmd`
-2. Org sync completes → `startParallelSyncCmd` (4 concurrent workers) → `SyncRepository` per repo (clones uncloned repos if missing)
-3. Periodic ticks refresh org repos (5min) and runners+jobs (10s)
-4. Job log fetching is on-demand: triggered when selecting a running job; refreshed on each poll tick
-5. Left pane selection drives right-pane viewport content via `updateViewport()`
-
-## Testing
-
-Tests in `pkg/git/git_test.go` test: deep cloning of `RepoItem`, progress snapshot publishing, offline sync execution, cancelled context handling, auto-cloning of uncloned repositories during sync.
-
-Tests in `pkg/jobs/jobs_test.go` test: default constructors, `FilterAndSortJobQueue`, `PollStep`, `MergeRunners` cross-referencing.
-
-Tests in `pkg/tui/tui_test.go` test: view height constraints, header stickiness, viewport initial offset, `loadJobQueueCmd` fallback, runner rendering (no "Busy" word, hyperlink presence, empty state variants, permission notice), runner permission error detection, table ordering, toast notifications, hyperlink OSC 8 syntax, focused run viewport, Enter/Esc focus toggle.
+See [the UX audit](ux-audit.md) for findings, verification and limits, and
+[conventions](conventions.md) for package conventions.

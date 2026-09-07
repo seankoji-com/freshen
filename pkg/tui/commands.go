@@ -48,6 +48,9 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 		repoList := repos
 		if len(repoList) == 0 {
 			orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+			if err != nil {
+				return loadedJobQueueMsg{err: err}
+			}
 			if err == nil {
 				for _, r := range orgRepos {
 					if !r.IsArchived {
@@ -90,7 +93,10 @@ func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
 // used after any keyboard move so a running job's log tail stays current,
 // and a no-op when the selection is a header row or an idle job.
 func (m Model) loadLogsIfSelectedJobRunning() tea.Cmd {
-	j := m.selectedJob()
+	if m.ActiveFocus != FocusJobs || m.OpenJobID == "" || m.LogLoading != "" {
+		return nil
+	}
+	j := m.openJob()
 	if j != nil && j.Status == jobs.JobRunning {
 		return m.loadJobLogsCmd(j)
 	}
@@ -108,7 +114,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 			for _, name := range entries {
 				path := filepath.Join(m.TargetDir, name)
 				if git.IsGitRepo(path) {
-					repos = append(repos, &git.RepoItem{Name: name, Path: path, Status: git.StatusPending, Logs: []string{}})
+					repos = append(repos, &git.RepoItem{Name: name, Path: path, CurrentBranch: git.GetOriginalBranch(m.ctx, path), OriginalBranch: git.GetOriginalBranch(m.ctx, path), DefaultBranch: git.GetDefaultBranch(m.ctx, path), Status: git.StatusPending, Logs: []string{}})
 				}
 			}
 			return orgSyncedMsg{repos: repos, autoSync: false}
@@ -163,6 +169,7 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 
 			if git.IsGitRepo(localPath) {
 				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
+				item.OriginalBranch = item.CurrentBranch
 				item.DefaultBranch = git.GetDefaultBranch(m.ctx, localPath)
 			}
 
@@ -185,14 +192,15 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 				path := filepath.Join(m.TargetDir, name)
 				if git.IsGitRepo(path) {
 					item := &git.RepoItem{
-						Name:          name,
-						GHRepoName:    git.GetGHRepoName(name),
-						Path:          path,
-						URL:           fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch: git.GetOriginalBranch(m.ctx, path),
-						DefaultBranch: git.GetDefaultBranch(m.ctx, path),
-						Status:        git.StatusPending,
-						Logs:          make([]string, 0),
+						Name:           name,
+						GHRepoName:     git.GetGHRepoName(name),
+						Path:           path,
+						URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
+						CurrentBranch:  git.GetOriginalBranch(m.ctx, path),
+						DefaultBranch:  git.GetDefaultBranch(m.ctx, path),
+						OriginalBranch: git.GetOriginalBranch(m.ctx, path),
+						Status:         git.StatusPending,
+						Logs:           make([]string, 0),
 					}
 
 					if counts, found := orgCounts[item.GHRepoName]; found {
@@ -427,5 +435,35 @@ func (m *Model) setToast(msg string, priority int) {
 	if priority >= m.ToastPriority {
 		m.ToastMsg = msg
 		m.ToastPriority = priority
+	}
+}
+
+// Budget the organisation sweep to roughly 3,000 requests/hour, leaving room
+// for runner polling and explicit detail requests. Small workspaces keep 20s.
+func (m Model) actionsPollInterval() time.Duration {
+	active := 0
+	for _, r := range m.actionRuns() {
+		if !terminalStatus(r.run.Status) {
+			active++
+		}
+	}
+	return max(jobQueueTickInterval, time.Duration(6*len(m.Repos)+active)*1200*time.Millisecond)
+}
+
+type repoDetailsLoadedMsg struct{ repo *git.RepoItem }
+
+func (m *Model) loadRepoDetails() tea.Cmd {
+	if m.SelectedIndex >= len(m.Repos) || m.RepoDetailLoading != "" {
+		return nil
+	}
+	repo := m.Repos[m.SelectedIndex].Clone()
+	if repo.IsNew {
+		return nil
+	}
+	m.RepoDetailLoading = repo.Path
+	ctx := m.ctx
+	return func() tea.Msg {
+		repo.BranchDetails = git.GetRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
+		return repoDetailsLoadedMsg{repo: repo}
 	}
 }

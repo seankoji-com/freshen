@@ -6,8 +6,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -68,25 +70,19 @@ func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
 
 // --- NerdFont Glyphs & Color Palette ---
 var (
-	iconLeaf     = "🍃"
-	iconGithub   = "\uea84" //  GitHub Octocat NerdFont Icon
-	iconFolder   = "󰉋"
-	iconBranch   = ""
-	iconPR       = "󰏫"
-	iconIssue    = "⊙"
-	iconSuccess  = "󰄬"
-	iconError    = "󰅙"
-	iconRebase   = "󰚰"
-	iconStash    = "󰏖"
-	iconSwitch   = "󰁨"
-	iconTrash    = "🗑️"
-	iconPending  = "•"
-	iconSkipped  = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
-	iconCopy     = "󰅍"
-	iconWorktree = "󰉓"
-	iconRunner   = "🏃"
-	iconQueue    = "📋"
-
+	iconGithub     = "\uea84" //  GitHub Octocat NerdFont Icon
+	iconBranch     = ""
+	iconPR         = "󰏫"
+	iconIssue      = "⊙"
+	iconSuccess    = "󰄬"
+	iconError      = "󰅙"
+	iconRebase     = "󰚰"
+	iconStash      = "󰏖"
+	iconSwitch     = "󰁨"
+	iconTrash      = "🗑️"
+	iconPending    = "•"
+	iconSkipped    = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
+	iconWorktree   = "󰉓"
 	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
 	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
 	colorGreen     = lipgloss.Color("#10B981") // Emerald Green
@@ -156,36 +152,16 @@ var (
 				Foreground(lipgloss.Color("#F5E0DC")).
 				Bold(true)
 
-	normalRowStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#CDD6F4"))
-
-	borderBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorPrimary).
-			Padding(0, 1)
-
 	borderFocusedStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(colorSecondary).
 				Padding(0, 1)
 
-	logBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorSecondary).
-			Padding(0, 1)
-
-	// Explicit Column Width Styles for Table Alignment
-	// Total: 2 + 20 + 4 + 6 + spaces = ~35 chars, fits in a ~55 char inner pane
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
-	cellBranchStyle     = lipgloss.NewStyle().Width(20)
-	cellPRsStyle        = lipgloss.NewStyle().Width(4).Align(lipgloss.Right)
-	cellIssuesStyle     = lipgloss.NewStyle().Width(6).Align(lipgloss.Right)
-
-	// Pre-compiled regex for highlightLogLine (package level to avoid re-compiling on every call)
-	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
-	reCmd       = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
-	reURL       = regexp.MustCompile(`https?://[^\s]+`)
-	reQuoted    = regexp.MustCompile(`'[^']+'`)
+	reTimestamp         = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
+	reCmd               = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
+	reURL               = regexp.MustCompile(`https?://[^\s]+`)
+	reQuoted            = regexp.MustCompile(`'[^']+'`)
 )
 
 // --- Messages for Bubble Tea Update Loop ---
@@ -260,34 +236,40 @@ type loadedPRsMsg struct {
 	err      error
 }
 
-// pushFinishedMsg carries the result of a background commit/push/PR run back
-// to the update goroutine, which is the only writer of m.Repos. The worker
-// mutates a private clone and never touches the live item; repo is that clone,
-// folded onto the live item via applyRepoSnapshot so every field the push
-// wrote (Status, StatusMsg, Logs, DraftPRURL, ExistingPRURL, branch state)
-// survives the handoff.
-type pushFinishedMsg struct {
-	repoName string
-	repo     *git.RepoItem
-	err      error
-}
-
 // --- Bubble Tea Model ---
 
 type Model struct {
-	TargetDir           string
-	TargetOrg           string
-	Concurrency         int
-	Repos               []*git.RepoItem
-	Runners             []*jobs.RunnerItem
-	JobQueue            []*jobs.JobItem
-	SelectedIndex       int
-	SelectedRunnerIndex int
-	// SelectedJobIndex indexes into buildJobQueueRows(m.JobQueue) — the
-	// OVERALL JOB QUEUE panel's full row list, which includes initiator and
-	// run header rows alongside job rows — not into JobQueue directly. Use
-	// m.selectedJobRow()/m.selectedJob() to resolve it.
-	SelectedJobIndex       int
+	Detail             bool
+	ShowHelp           bool
+	Search             textinput.Model
+	Filtering          bool
+	Help               help.Model
+	ScreenCursor       [3]string
+	JobCursor          string
+	OpenRun            *jobs.RunItem
+	OpenJobID          string
+	ActionsFilter      int
+	QueueView          bool
+	HelpOffset         int
+	MenuOpen           bool
+	MenuIndex          int
+	PendingAction      string
+	ActionTarget       *git.RepoItem
+	ActionURL          string
+	BusyAction         string
+	LastActionsRefresh time.Time
+	RunLoading         bool
+	RepoDetailLoading  string
+	LogLoading         string
+
+	TargetDir              string
+	TargetOrg              string
+	Concurrency            int
+	Repos                  []*git.RepoItem
+	Runners                []*jobs.RunnerItem
+	JobQueue               []*jobs.JobItem
+	SelectedIndex          int
+	SelectedRunnerIndex    int
 	SelectedTagIndex       int
 	ActiveFocus            FocusType
 	ActiveTab              TabType
@@ -297,24 +279,13 @@ type Model struct {
 	IsRunnersLoading       bool
 	TotalCount             int
 	ToastMsg               string
-	FocusedRunID           int64  // When non-zero, a specific workflow run is focused
-	FocusedInitiatorKey    string // When non-empty, a specific initiator (PR/branch) is focused — see jobInitiatorKey
-	ToastPriority          int    // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	ToastPriority          int // higher priority overrides lower; 0 = none, 1 = info, 2 = error
 	ConsecutiveErrors      map[string]int
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
-	// JobDurationHistory holds recent completed-run durations keyed by run
-	// name (see parseJobHierarchy), used to estimate a running job's total
-	// time. Samples accumulate across refreshes — see processJobQueueUpdate.
+	// JobDurationHistory retains historical timing samples, never used as completion progress.
 	JobDurationHistory map[string][]time.Duration
-
-	// pendingDeletePath holds the Path of the archived repo awaiting a second
-	// 'd' press to confirm deletion; "" means no pending delete. It is keyed
-	// on Path rather than a Repos index because a background refresh can
-	// rebuild and re-sort m.Repos between the two presses, which would leave
-	// an index pointing at a different repo than the one just confirmed.
-	pendingDeletePath string
 
 	Spinner     spinner.Model
 	ProgressBar progress.Model
@@ -345,9 +316,15 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 	)
 
 	vp := viewport.New(60, 15)
+	vp.KeyMap = viewport.KeyMap{} // Screen navigation and detail scrolling have one owner.
+	search := textinput.New()
+	search.Prompt = "/ "
+	search.Placeholder = "Filter by name, repository, branch or status"
+	search.CharLimit = 100
 
 	return Model{
-		TargetDir:           targetDir,
+		TargetDir: targetDir,
+		Search:    search, Help: help.New(),
 		TargetOrg:           targetOrg,
 		Concurrency:         concurrency,
 		Repos:               make([]*git.RepoItem, 0),
@@ -355,8 +332,6 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		JobQueue:            make([]*jobs.JobItem, 0),
 		SelectedIndex:       0,
 		SelectedRunnerIndex: 0,
-		SelectedJobIndex:    0,
-		pendingDeletePath:   "",
 		ActiveFocus:         FocusRepos,
 		ActiveTab:           TabLogs,
 		IsOrgSyncing:        true,
@@ -376,11 +351,11 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 
 func (m Model) Init() tea.Cmd {
 	if m.TargetOrg == "" {
-		return tea.Batch(m.Spinner.Tick, m.loadOrgReposCmd(true), repoTickCmd())
+		return tea.Batch(m.Spinner.Tick, m.loadOrgReposCmd(false), repoTickCmd())
 	}
 	return tea.Batch(
 		m.Spinner.Tick,
-		m.loadOrgReposCmd(true),
+		m.loadOrgReposCmd(false),
 		m.loadRunnersCmd(),
 		m.loadJobQueueCmd(),
 		repoTickCmd(),

@@ -41,7 +41,7 @@ Timeouts use `context.WithTimeout` + `exec.CommandContext` (6s for issues/PRs).
 
 - Repo sync uses a semaphore channel (`make(chan struct{}, concurrency)`) with `sync.WaitGroup`
 - Current concurrency is 4
-- TUI model uses `sync.Mutex` (`mu`) for thread safety on shared state
+- TUI model changes only in `Update`; workers use private snapshots and return messages
 
 ### Error handling
 
@@ -56,12 +56,12 @@ Timeouts use `context.WithTimeout` + `exec.CommandContext` (6s for issues/PRs).
 - **Functions**: PascalCase for exported, camelCase for unexported
 - **Types**: PascalCase (`RepoItem`, `JobItem`, `RunnerItem`)
 - **Files**: lowercase, single word or hyphenated (`git.go`, `jobs.go`, `tui.go`)
-- **NerdFont icons**: Used extensively — `iconLeaf`, `iconGithub`, `iconBranch`, `iconPR`, `iconSuccess`, `iconError`, etc.
+- **NerdFont icons**: Used extensively — `iconGithub`, `iconBranch`, `iconPR`, `iconSuccess`, `iconError`, etc.
 
 ### Style/Lip Gloss
 
 - Color palette defined as constants: Electric Purple primary, Bright Mint secondary, Emerald green, Amber yellow, Coral red, Bright blue, Muted slate
-- Styles defined as package-level `var` blocks at the top of `tui.go`
+- Styles defined as package-level `var` blocks in `pkg/tui/model.go`
 - Column widths use explicit `.Width(N)` for table alignment
 - All dynamic sizing uses `m.Width`/`m.Height` from `tea.WindowSizeMsg`
 
