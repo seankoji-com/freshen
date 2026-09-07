@@ -1,9 +1,5 @@
 # freshen 🍃
 
-<p align="center">
-  <img width="1728" height="1045" alt="screenshot of freshen TUI" src="https://github.com/user-attachments/assets/40e6c704-3f34-4d2f-a4ed-b898f799a529" />
-</p>
-
 **freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
 
 > **Contributing?** See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, build/test commands, and the CI-critical `scripts/` directory.
@@ -13,10 +9,10 @@
 ## 🌟 Key Features
 
 - **Concurrent Parallel Syncing**: Syncs 20+ repositories simultaneously in seconds using Go worker pools.
-- **Split-Pane TUI Dashboard**: Real-time status indicators on the left, live git/gh execution logs and PR links on the right.
-- **Optional GitHub owner sync**: Automatically clones missing active repositories and highlights archived repositories.
+- **Dedicated screens**: Repositories, Actions and Runners, with searchable lists and details opened on demand.
+- **Explicit repository sync**: Startup loads metadata. Sync or clone only when requested; archived repositories are highlighted.
 - **Alias Mappings**: Hardcoded mapping support for custom repo folder names (e.g. `.github` ➔ `github`, `careynas.net` ➔ `wiki.robot.house`).
-- **GitHub Actions Monitoring**: Live-polled runner and job-queue panels showing self-hosted runner status and in-flight/queued CI jobs, with per-job log streaming.
+- **GitHub Actions monitoring**: Workflow runs, a separate job queue, completed-job and step counts, runner assignments, and a log tail for the selected job.
 - **Interactive Controls**:
   - Re-sync / retry individual repositories.
   - Safely confirm deletion of archived repositories (`rm -rf`).
@@ -70,43 +66,41 @@ Launch the TUI interface:
 ./freshen
 ```
 
-**Global**
-
 | Key | Action |
 |---|---|
-| <kbd>w</kbd> | Cycle panel focus: Repos → Runners → Jobs |
-| <kbd>1</kbd> / <kbd>2</kbd> / <kbd>3</kbd> | Jump directly to the Repos / Runners / Jobs panel |
-| <kbd>Tab</kbd> / <kbd>Shift+Tab</kbd> | Cycle forward/back (repo tabs, runner tag filter, or panel focus, depending on context) |
-| <kbd>↑</kbd> / <kbd>↓</kbd> | Move selection within the focused panel |
-| <kbd>j</kbd> / <kbd>k</kbd> | Scroll the detail viewport (right pane) down/up |
-| <kbd>a</kbd> / <kbd>s</kbd> | Sync All — start a parallel sync across every loaded non-archived repository |
-| <kbd>c</kbd> / <kbd>y</kbd> | Copy the selected item's path/PR URL/ID to clipboard |
-| <kbd>q</kbd> or <kbd>Ctrl+C</kbd> | Quit application |
+| `1` / `2` / `3` | Repositories / Actions / Runners |
+| `Tab` / `Shift+Tab` | Next / previous screen |
+| `↑↓` or `j/k` | Move within a list, or scroll open details |
+| `Enter` / `→` | Open details; Actions opens run → jobs → steps and log tail |
+| `Esc` / `←` | Back; clear a list filter when at the top level |
+| `/` | Filter the current list; Enter applies, Esc clears |
+| `Home` / `End`, `PgUp` / `PgDn` | First/last item or page through the current view |
+| `Space` | Contextual action menu |
+| `r` | Refresh data, without syncing repositories |
+| `v` | Toggle Actions workflow runs / job queue |
+| `f` | Filter runs: Active / Needs attention / Recent |
+| `[` / `]` | Repository detail tabs: Logs / Branches / Issues / PRs |
+| `o` / `y` | Open GitHub / copy link or runner ID (local path without an owner) |
+| `s` / `a` | Sync selected repository / confirm sync all |
+| `b` | Switch selected repository between original and default branch |
+| `p` | Confirm commit all changes, push, create PR and switch to default |
+| `X` | Confirm force-removing worktrees and deleting non-default branches |
+| `d` | Confirm deleting an archived local clone |
+| `?` | Scrollable help |
+| `q` / `Ctrl+C` | Quit (`Ctrl+C` works inside search and confirmations) |
 
-**Repos panel**
+Repository actions run in the background with busy and result feedback. Destructive
+confirmations retain the exact target across refreshes. Navigation never moves to
+another screen merely because you reach the end of a list.
 
-| Key | Action |
-|---|---|
-| <kbd>←</kbd> / <kbd>→</kbd> / <kbd>h</kbd> / <kbd>l</kbd> | Cycle detail tabs (Logs / Branches / Issues / PRs) |
-| <kbd>4</kbd> | Jump straight to the PRs tab |
-| <kbd>r</kbd> | Re-sync / retry the selected repository |
-| <kbd>b</kbd> | Switch between the original and default branch |
-| <kbd>p</kbd> | Commit, push, open a PR, and switch to the default branch |
-| <kbd>X</kbd> | Prune remote refs, worktrees, and merged local branches |
-| <kbd>d</kbd> <kbd>d</kbd> | Delete the selected archived repository from disk (press twice: first press arms a confirmation, second press while still selected deletes) |
-
-**Runners panel**
-
-| Key | Action |
-|---|---|
-| <kbd>←</kbd> / <kbd>→</kbd> / <kbd>h</kbd> / <kbd>l</kbd> | Cycle the runner tag filter |
-
-**Jobs panel**
-
-| Key | Action |
-|---|---|
-| <kbd>Enter</kbd> | Focus/unfocus the selected job's live run logs |
-| <kbd>Esc</kbd> | Unfocus the currently focused run |
+Actions retains all job results. Bars count completed jobs or steps, including
+skipped/cancelled steps; they do not estimate remaining time. The recent view covers
+30 runs per repository. Active runs are additionally queried when that window fills,
+and job lists are paginated. Missing job details and partial repository failures are
+labelled. Fleet access failures show observed assignments with unknown availability.
+The organisation poll starts at 20 seconds and slows with workspace size to budget
+API requests; the footer shows the interval. Selected running-job logs refresh with
+the runner tick. GitHub may provide only step status while logs are unavailable.
 
 ### Command Line Options
 

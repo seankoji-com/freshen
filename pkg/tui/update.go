@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -17,6 +18,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 
+	case repoDetailsLoadedMsg:
+		m.RepoDetailLoading = ""
+		for _, r := range m.Repos {
+			if r.Path == msg.repo.Path {
+				r.BranchDetails = msg.repo.BranchDetails
+				break
+			}
+		}
+		m.updateViewport()
+	case runJobsLoadedMsg:
+		m.receiveRunJobs(msg)
+		if m.OpenRun != nil && !m.OpenRun.JobsKnown && m.OpenRun.JobsError == "" {
+			cmds = append(cmds, m.loadOpenRun())
+		}
+	case actionResultMsg:
+		m.receiveAction(msg)
 	case tea.KeyMsg:
 		cmd, early := m.handleKeyMsg(msg)
 		if early {
@@ -50,6 +67,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case loadedJobLogsMsg:
 		m.handleLoadedJobLogsMsg(msg)
+		if m.OpenJobID != "" && m.OpenJobID != msg.jobID {
+			cmds = append(cmds, m.fetchOpenJobLogs())
+		}
 
 	case orgSyncedMsg:
 		cmd, early := m.handleOrgSyncedMsg(msg)
@@ -64,9 +84,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case syncFinishedMsg:
 		m.handleSyncFinishedMsg(msg)
 
-	case pushFinishedMsg:
-		m.handlePushFinishedMsg(msg)
-
 	case tea.WindowSizeMsg:
 		m.handleWindowSizeMsg(msg)
 	}
@@ -75,18 +92,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
 	cmds = append(cmds, spinnerCmd)
 
-	var vpCmd tea.Cmd
-	m.Viewport, vpCmd = m.Viewport.Update(msg)
-	cmds = append(cmds, vpCmd)
-
 	return m, tea.Batch(cmds...)
 }
 
 func (m *Model) handleLoadedIssuesMsg(msg loadedIssuesMsg) {
+	if msg.err != nil {
+		m.setToast(fmt.Sprintf("Issues unavailable: %v. Press r to retry.", msg.err), 2)
+	}
 	for _, item := range m.Repos {
 		if item.Name == msg.repoName {
 			item.IsLoadingIssues = false
-			item.HasLoadedIssues = true
+			item.HasLoadedIssues = msg.err == nil
 			if msg.err == nil && msg.issues != nil {
 				item.IssuesList = msg.issues
 			}
@@ -97,10 +113,13 @@ func (m *Model) handleLoadedIssuesMsg(msg loadedIssuesMsg) {
 }
 
 func (m *Model) handleLoadedPRsMsg(msg loadedPRsMsg) {
+	if msg.err != nil {
+		m.setToast(fmt.Sprintf("Pull requests unavailable: %v. Press r to retry.", msg.err), 2)
+	}
 	for _, item := range m.Repos {
 		if item.Name == msg.repoName {
 			item.IsLoadingPRs = false
-			item.HasLoadedPRs = true
+			item.HasLoadedPRs = msg.err == nil
 			if msg.err == nil && msg.prs != nil {
 				item.PRsList = msg.prs
 			}
@@ -110,96 +129,7 @@ func (m *Model) handleLoadedPRsMsg(msg loadedPRsMsg) {
 	m.updateViewport()
 }
 
-func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd {
-	var cmd tea.Cmd
-	if msg.Button == tea.MouseButtonWheelUp {
-		m.Viewport.ScrollUp(3)
-	} else if msg.Button == tea.MouseButtonWheelDown {
-		m.Viewport.ScrollDown(3)
-	} else if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-		// Click in Left Column Panes
-		if msg.X < m.Width/2 {
-			// Use panel heights from View() layout instead of content lengths
-			rightBoxHeight := m.Height - 4
-			if rightBoxHeight < 12 {
-				rightBoxHeight = 12
-			}
-			totalInner := rightBoxHeight - 4
-			if totalInner < 8 {
-				totalInner = 8
-			}
-			runnersBoxHeight := 4
-			repoBoxHeight := (totalInner - runnersBoxHeight) * 60 / 100
-			if repoBoxHeight < 4 {
-				repoBoxHeight = 4
-			}
-
-			// Y=0 is header, Y=1 starts the first panel
-			// Each bordered panel: 1 top border + innerHeight + 1 bottom border = innerHeight + 2
-			repoPaneStart := 1 + 1 // header + top border
-			repoPaneEnd := repoPaneStart + repoBoxHeight
-			runnersPaneStart := repoPaneEnd + 1 // bottom border of repo + top border of runners
-			runnersPaneEnd := runnersPaneStart + runnersBoxHeight
-
-			if msg.Y >= repoPaneStart && msg.Y <= repoPaneEnd {
-				m.ActiveFocus = FocusRepos
-				clickedIdx := msg.Y - repoPaneStart - 1 // -1 for header row
-				if clickedIdx >= 0 && clickedIdx < len(m.Repos) {
-					m.SelectedIndex = clickedIdx
-				}
-				m.updateViewport()
-			} else if msg.Y > repoPaneEnd && msg.Y <= runnersPaneEnd {
-				m.ActiveFocus = FocusRunners
-				clickedIdx := msg.Y - runnersPaneStart
-				if clickedIdx >= 0 && clickedIdx < len(m.Runners) {
-					m.SelectedRunnerIndex = clickedIdx
-				}
-				m.updateViewport()
-			} else if msg.Y > runnersPaneEnd {
-				m.ActiveFocus = FocusJobs
-				jobsPaneStart := runnersPaneEnd + 1
-				jobsBoxHeight := totalInner - repoBoxHeight - runnersBoxHeight
-				if jobsBoxHeight < 3 {
-					jobsBoxHeight = 3
-				}
-				maxJobRows := jobsBoxHeight - 2
-				if maxJobRows < 1 {
-					maxJobRows = 1
-				}
-				// Mirror renderJobsPanel's row layout exactly: initiator/run
-				// headers add lines with no JobQueue entry of their own, so a
-				// click's Y position must be resolved against the same
-				// expanded row list rather than a flat offset into m.JobQueue.
-				visibleRows, windowStart := jobQueueVisibleWindow(buildJobQueueRows(m.JobQueue), m.SelectedJobIndex, maxJobRows)
-				clickedLine := msg.Y - jobsPaneStart - 2
-				if clickedLine >= 0 && clickedLine < len(visibleRows) {
-					m.SelectedJobIndex = windowStart + clickedLine
-				}
-				m.updateViewport()
-			}
-		}
-		// Click in Right Detail View Pane
-		if msg.X >= m.Width/2 && (msg.Y == 4 || msg.Y == 5) {
-			relX := msg.X - (m.Width / 2)
-			if relX >= 0 && relX < 10 {
-				m.ActiveTab = TabLogs
-				m.updateViewport()
-			} else if relX >= 10 && relX < 35 {
-				m.ActiveTab = TabBranches
-				m.updateViewport()
-			} else if relX >= 35 && relX < 47 {
-				m.ActiveTab = TabIssues
-				m.updateViewport()
-				cmd = m.triggerTabFetch()
-			} else if relX >= 47 {
-				m.ActiveTab = TabPRs
-				m.updateViewport()
-				cmd = m.triggerTabFetch()
-			}
-		}
-	}
-	return cmd
-}
+func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd { return m.screenMouse(msg) }
 
 func (m Model) handleRepoTickMsg() tea.Cmd {
 	return tea.Batch(
@@ -218,7 +148,10 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 	}
 	var cmdsToAdd []tea.Cmd
 	if !m.RunnerPermissionDenied {
-		cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
+		if !m.IsRunnersLoading {
+			m.IsRunnersLoading = true
+			cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
+		}
 	}
 	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
 	// Refresh logs for selected running job
@@ -236,7 +169,11 @@ func (m *Model) handleJobQueueTickMsg() tea.Cmd {
 	if m.TargetOrg == "" {
 		return nil
 	}
-	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(jobQueueTickInterval, m.ConsecutiveErrors[fetchSourceJobQueue])))
+	if m.IsJobQueueLoading {
+		return jobQueueTickCmd(m.actionsPollInterval())
+	}
+	m.IsJobQueueLoading = true
+	return tea.Batch(m.loadJobQueueCmd(), jobQueueTickCmd(backoffInterval(m.actionsPollInterval(), m.ConsecutiveErrors[fetchSourceJobQueue])))
 }
 
 func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
@@ -263,8 +200,22 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
 		m.Runners = merged
+		if key := m.ScreenCursor[FocusRunners]; key != "" {
+			found := false
+			for i, r := range m.getMatchingRunners() {
+				if r.ID == key {
+					m.SelectedRunnerIndex = i
+					found = true
+					break
+				}
+			}
+			if !found && m.ActiveFocus == FocusRunners {
+				m.Detail = false
+				m.SelectedRunnerIndex = 0
+			}
+		}
 
-		m.JobQueue = reconcileRunnerJobs(m.Runners, m.JobQueue, m.TargetOrg)
+		// Runner capacity never invents jobs or run identities.
 		m.updateViewport()
 	}
 }
@@ -273,9 +224,18 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	m.IsJobQueueLoading = false
 	if msg.err != nil {
 		m.JobQueueFetchFailed = true
-		m.noteFetchFailure(fetchSourceJobQueue, jobQueueTickInterval)
-		slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
-		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
+		var partial *jobs.QueueFetchError
+		m.ActionsCoverage = msg.err.Error()
+		if errors.As(msg.err, &partial) {
+			slog.Warn("Actions coverage incomplete", "unavailable", partial.Failed, "total", partial.Total, "error", partial.Cause)
+		}
+		if partial != nil && partial.Partial && partial.Total > 0 && partial.Failed*4 < partial.Total {
+			m.noteFetchSuccess(fetchSourceJobQueue)
+		} else {
+			m.noteFetchFailure(fetchSourceJobQueue, m.actionsPollInterval())
+			slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf("Actions fetch failed: %v", msg.err), 2)
+		}
 		var cmd tea.Cmd
 		if len(msg.queue) > 0 {
 			m.processJobQueueUpdate(msg.queue, msg.history)
@@ -289,17 +249,25 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	}
 
 	m.JobQueueFetchFailed = false
+	m.ActionsCoverage = ""
+	m.LastActionsRefresh = time.Now()
 	m.noteFetchSuccess(fetchSourceJobQueue)
 	m.processJobQueueUpdate(msg.queue, msg.history)
 	if len(m.Runners) == 0 || m.RunnerPermissionDenied {
 		m.Runners = extractRunnersFromJobQueue(msg.queue, m.Runners)
 	}
 	cmd := m.triggerLogFetchForSelectedJob()
+	if m.OpenRun != nil && !m.OpenRun.JobsKnown {
+		cmd = tea.Batch(cmd, m.loadOpenRun())
+	}
 	m.updateViewport()
 	return cmd
 }
 
 func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
+	if m.LogLoading == msg.jobID {
+		m.LogLoading = ""
+	}
 	if msg.err != nil {
 		slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
 	}
@@ -353,14 +321,42 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			}
 		}
 	}
+	for _, fresh := range msg.repos {
+		for _, old := range m.Repos {
+			if fresh.Path == old.Path {
+				fresh.Logs = old.Logs
+				fresh.OriginalBranch = old.OriginalBranch
+				if fresh.CurrentBranch == old.CurrentBranch {
+					fresh.BranchDetails = old.BranchDetails
+				}
+				break
+			}
+		}
+	}
 	m.Repos = msg.repos
 	sort.Slice(m.Repos, func(i, j int) bool {
 		return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
 	})
 	m.TotalCount = len(m.Repos)
+	if selected := m.ScreenCursor[FocusRepos]; selected != "" {
+		found := false
+		for i, r := range m.Repos {
+			if r.Path+"/"+r.Name == selected {
+				m.SelectedIndex = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			m.SelectedIndex = 0
+			if m.ActiveFocus == FocusRepos {
+				m.Detail = false
+			}
+		}
+	}
+
 	// The list the user confirmed against is gone; make them re-arm rather
 	// than let a stale token delete whatever now sits under the selection.
-	m.pendingDeletePath = ""
 	var cmd tea.Cmd
 	if msg.autoSync && len(m.Repos) > 0 {
 		m.IsSyncing = true
@@ -385,6 +381,10 @@ func (m *Model) handleRepoSyncMsg(msg repoSyncMsg) tea.Cmd {
 // handleSyncFinishedMsg clears the syncing banner only for the bulk sync; a
 // single-repo re-sync must leave it alone.
 func (m *Model) handleSyncFinishedMsg(msg syncFinishedMsg) {
+	if !msg.bulk {
+		m.BusyAction = ""
+		m.setToast("Repository sync finished. See Logs for the result.", 1)
+	}
 	if msg.bulk {
 		m.IsSyncing = false
 	}
@@ -395,23 +395,11 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Width = msg.Width
 	m.Height = msg.Height
 
-	// Mirror the same height budget as View()
-	rightBoxH := msg.Height - 4
-	if rightBoxH < 12 {
-		rightBoxH = 12
-	}
-	halfWidth := msg.Width / 2
-	leftWidth := halfWidth - 1
-	rightWidth := msg.Width - leftWidth - 2
-	// Floor at 2 so updateViewport()'s unguarded `m.Viewport.Width-2`
-	// strings.Repeat calls (the divider rules in the runners/job-detail
-	// panes) never see a negative count at very small terminal widths.
-	viewportWidth := rightWidth - 4
-	if viewportWidth < 2 {
-		viewportWidth = 2
-	}
-	m.Viewport.Width = viewportWidth
-	m.Viewport.Height = rightBoxH - 2 // inner content = outer - 2 (borders)
+	m.Viewport.Width = max(2, msg.Width-6)
+	m.Viewport.Height = max(1, msg.Height-7)
+	m.Search.Width = max(1, msg.Width-6)
+	m.Help.Width = max(1, msg.Width)
+
 	m.updateViewport()
 }
 
@@ -442,13 +430,22 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 			oldJobs[j.ID] = j
 		}
 
-		newJobsMap := make(map[string]*jobs.JobItem)
-		for _, j := range queue {
-			newJobsMap[j.ID] = j
-		}
-
 		// Status changes — failure toasts (priority 2) survive info toasts (priority 1)
 		for _, newJ := range queue {
+			if newJ.IsRunHeader {
+				if old, ok := oldJobs[newJ.ID]; ok && old.Status != newJ.Status && newJ.Run != nil {
+					label := fmt.Sprintf("Run %s / %s #%d", newJ.Repo, newJ.Run.Workflow, newJ.Run.Number)
+					switch newJ.Status {
+					case jobs.JobFailed:
+						m.setToast(label+" failed", 2)
+					case jobs.JobPassed:
+						m.setToast(label+" passed", 1)
+					case jobs.JobCancelled:
+						m.setToast(label+" cancelled", 1)
+					}
+				}
+				continue
+			}
 			if oldJ, ok := oldJobs[newJ.ID]; ok {
 				if oldJ.Status != newJ.Status {
 					switch newJ.Status {
@@ -482,14 +479,6 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 			}
 		}
 
-		// Jobs that finished and left the queue
-		for _, oldJ := range m.JobQueue {
-			if _, stillThere := newJobsMap[oldJ.ID]; !stillThere {
-				if oldJ.Status == jobs.JobRunning {
-					m.setToast(fmt.Sprintf(" ✅ Job %s completed (%s)", oldJ.ID, oldJ.Name), 1)
-				}
-			}
-		}
 	}
 
 	// Preserve existing logs
@@ -507,17 +496,34 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 			j.GHJobID = existingGHJobID[j.ID]
 		}
 	}
-	m.JobQueue = reconcileRunnerJobs(m.Runners, queue, m.TargetOrg)
+	// Preserve fetched details only for the same completed attempt. Active polls
+	// are authoritative, including a new attempt with different job IDs.
+	for _, header := range queue {
+		if !header.IsRunHeader || header.Run == nil || header.Run.JobsKnown || !terminalStatus(header.Run.Status) {
+			continue
+		}
+		for _, old := range m.JobQueue {
+			if old.Run == nil || old.IsRunHeader || old.RunID != header.RunID || old.Repo != header.Repo || old.Run.Attempt != header.Run.Attempt {
+				continue
+			}
+			copyJob := *old
+			copyJob.Run = header.Run
+			if header.Run.JobsError != "" || old.Run.JobsStale {
+				header.Run.JobsStale = true
+			}
+			queue = append(queue, &copyJob)
+			if header.Run.JobsError == "" {
+				if terminalStatus(old.Run.Status) {
+					header.Run.JobsKnown = old.Run.JobsKnown
+				} else {
+					header.Run.JobsStale = true
+				}
+			}
+		}
+	}
+	m.JobQueue = queue
+	m.refreshOpenRun()
 
-	// Bounds validation after queue update — against the row count (which
-	// includes header rows), not len(m.JobQueue), since SelectedJobIndex
-	// indexes into buildJobQueueRows(m.JobQueue).
-	if rowCount := len(buildJobQueueRows(m.JobQueue)); rowCount > 0 && m.SelectedJobIndex >= rowCount {
-		m.SelectedJobIndex = rowCount - 1
-	}
-	if len(m.Runners) > 0 && m.SelectedRunnerIndex >= len(m.Runners) {
-		m.SelectedRunnerIndex = len(m.Runners) - 1
-	}
 }
 
 // triggerLogFetchForSelectedJob returns a log-fetch command if a running job is selected.
@@ -533,11 +539,11 @@ func (m *Model) triggerTabFetch() tea.Cmd {
 		return nil
 	}
 	item := m.Repos[m.SelectedIndex]
-	if m.ActiveTab == TabIssues {
+	if m.ActiveTab == TabIssues && !item.IsLoadingIssues && m.TargetOrg != "" {
 		item.IsLoadingIssues = true
 		return m.fetchIssuesCmd(item.Name, item.GHRepoName)
 	}
-	if m.ActiveTab == TabPRs {
+	if m.ActiveTab == TabPRs && !item.IsLoadingPRs && m.TargetOrg != "" {
 		item.IsLoadingPRs = true
 		return m.fetchPRsCmd(item.Name, item.GHRepoName)
 	}
@@ -583,68 +589,13 @@ func clearConfiguredOwner(owner string) error {
 	return config.Save(cfg)
 }
 
-func reconcileRunnerJobs(runners []*jobs.RunnerItem, queue []*jobs.JobItem, targetOrg string) []*jobs.JobItem {
-	var realJobs []*jobs.JobItem
-	for _, j := range queue {
-		if j.RunID != 0 {
-			realJobs = append(realJobs, j)
-		}
-	}
-
-	result := make([]*jobs.JobItem, 0, len(queue))
-	if len(realJobs) > 0 {
-		result = append(result, realJobs...)
-	} else {
-		result = append(result, queue...)
-	}
-
-	for _, r := range runners {
-		if r.Status == jobs.RunnerRunning {
-			found := false
-			for _, j := range result {
-				if j.RunnerName == r.Name || j.RunnerID == r.ID || strings.EqualFold(j.RunnerName, r.Name) {
-					found = true
-					break
-				}
-				if j.Name != "" && r.CurrentJob != "" && r.CurrentJob != "-" && (strings.Contains(j.Name, r.CurrentJob) || strings.Contains(r.CurrentJob, j.Name)) {
-					found = true
-					if j.RunnerName == "" {
-						j.RunnerName = r.Name
-						j.RunnerID = r.ID
-					}
-					break
-				}
-			}
-			if !found && len(realJobs) == 0 {
-				jobTitle := r.CurrentJob
-				if jobTitle == "" || jobTitle == "-" {
-					jobTitle = fmt.Sprintf("%s active workflow job", r.Name)
-				}
-				jobID := r.CurrentJobID
-				if jobID == "" || jobID == "-" {
-					jobID = fmt.Sprintf("#%s", strings.TrimPrefix(r.ID, "runner-"))
-				}
-				result = append(result, &jobs.JobItem{
-					ID:         jobID,
-					Name:       jobTitle,
-					Repo:       "", // unknown — synthetic entry; URL construction guarded by RunID==0
-					Status:     jobs.JobRunning,
-					RunnerName: r.Name,
-					RunnerID:   r.ID,
-					Duration:   "active",
-				})
-			}
-		}
-	}
-	return result
-}
-
-func extractRunnersFromJobQueue(queue []*jobs.JobItem, existing []*jobs.RunnerItem) []*jobs.RunnerItem {
+func extractRunnersFromJobQueue(queue []*jobs.JobItem, _ []*jobs.RunnerItem) []*jobs.RunnerItem {
 	runnerMap := make(map[string]*jobs.RunnerItem)
-	for _, r := range existing {
-		runnerMap[r.Name] = r
-	}
+
 	for _, j := range queue {
+		if j.IsRunHeader || terminalStatus(j.Status) {
+			continue
+		}
 		if j.RunnerName == "" || j.RunnerName == "worker" {
 			continue
 		}
@@ -656,7 +607,7 @@ func extractRunnersFromJobQueue(queue []*jobs.JobItem, existing []*jobs.RunnerIt
 				r.LastHeartbeat = time.Now()
 			}
 		} else {
-			st := jobs.RunnerIdle
+			st := jobs.RunnerUnknown
 			currJob := "-"
 			currJobID := "-"
 			if j.Status == jobs.JobRunning {

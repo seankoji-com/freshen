@@ -4,290 +4,395 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
-// renderAt renders m at the given terminal size, driving the resize through
-// the real Update path (tea.WindowSizeMsg) rather than a direct field
-// assignment — a direct m.Width/m.Height/m.Viewport.Width assignment would
-// bypass handleWindowSizeMsg entirely, including the negative-width floor
-// clamps it applies (see update.go), so it would never exercise the code
-// path those clamps protect.
 func renderAt(m Model, w, h int) string {
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
-	m = updated.(Model)
-	return m.View()
+	return updated.(Model).View()
 }
-
-// stripped normalizes a rendered frame for exact-match comparison: it strips
-// real ANSI/SGR escape codes and OSC 8 hyperlink wrappers (see Hyperlink)
-// via github.com/charmbracelet/x/ansi's terminal-state-machine-based Strip,
-// leaving visible text — including PUA/Nerd-Font glyphs, which live well
-// outside the escape-sequence byte ranges Strip recognizes — untouched.
-func stripped(s string) string {
-	return ansi.Strip(s)
-}
-
-// smokeFixtureModel builds a Model populated with representative Repos,
-// Runners, and JobQueue data so every focus/tab combination — and each of
-// the OVERALL JOB QUEUE panel's detail-viewport sub-states — has real
-// content to render.
-//
-// JobQueue is shaped to produce, via buildJobQueueRows:
-//
-//	row 0: initiator header for "alpha#pr:5"      (2 jobs, shared RunID 100)
-//	row 1: run header for RunID 100
-//	row 2: job #1 (alpha / ci / build, running)
-//	row 3: job #2 (alpha / ci / test, passed)
-//	row 4: initiator header for "beta#branch:dev"  (1 job, RunID 200)
-//	row 5: job #3 (beta / ci / lint, queued)
+func stripped(s string) string { return ansi.Strip(s) }
 func smokeFixtureModel() Model {
-	m := newTestModel("/tmp/smoke", "smoke-org")
+	m := newTestModel("/tmp/freshen-fixture", "fixture-org")
 	m.IsOrgSyncing = false
+	m.IsJobQueueLoading = false
+	m.IsRunnersLoading = false
 	m.Repos = []*git.RepoItem{
-		{
-			Name: "alpha", GHRepoName: "alpha", CurrentBranch: "feat/x", DefaultBranch: "main",
-			Status: git.StatusUpdated, StatusMsg: "Updated", OpenPRsCount: 1, OpenIssuesCount: 1,
-			HasLoadedCounts: true,
-			HasLoadedIssues: true,
-			IssuesList:      []git.IssueItem{{Number: 1, Title: "fix thing", URL: "https://github.com/acme/alpha/issues/1"}},
-			HasLoadedPRs:    true,
-			PRsList:         []git.PRItem{{Number: 2, Title: "add thing", HeadRefName: "feat/x", URL: "https://github.com/acme/alpha/pull/2"}},
-			Logs:            []string{"[12:00:00] git pull", "Up to date"},
-			BranchDetails: git.BranchWorktreeDetails{
-				LocalBranches:  []string{"main", "feat/x"},
-				RemoteBranches: []string{"origin/main"},
-				Worktrees:      []string{"/tmp/smoke/alpha"},
-				ChangedFiles:   []string{"README.md"},
-			},
-		},
-		{Name: "beta", GHRepoName: "beta", CurrentBranch: "dev", DefaultBranch: "main", Status: git.StatusPending, HasLoadedCounts: true},
+		{Name: "alpha", GHRepoName: "alpha", Path: "/tmp/freshen-fixture/alpha", CurrentBranch: "feat/screens", DefaultBranch: "main", Status: git.StatusUpdated, StatusMsg: "Updated", HasLoadedCounts: true, OpenPRsCount: 2, OpenIssuesCount: 4, Logs: []string{"git pull", "Up to date"}},
+		{Name: "beta", GHRepoName: "beta", Path: "/tmp/freshen-fixture/beta", CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusPending},
 	}
-	m.SelectedIndex = 0
-
-	m.Runners = []*jobs.RunnerItem{
-		{ID: "r1", Name: "mac-alpha", Status: jobs.RunnerRunning, Platform: "macOS/ARM64", Tags: []string{"self-hosted"}, CurrentJob: "alpha / ci / build"},
-		{ID: "r2", Name: "mac-beta", Status: jobs.RunnerIdle, Platform: "macOS/ARM64", Tags: []string{"self-hosted"}},
-	}
-	m.SelectedRunnerIndex = 0
-
+	m.Runners = []*jobs.RunnerItem{{ID: "runner-1", Name: "mac-builder", Platform: "macOS/ARM64", Status: jobs.RunnerRunning, Tags: []string{"self-hosted", "ARM64"}}}
+	r := &jobs.RunItem{ID: 100, Number: 42, Attempt: 1, Repo: "alpha", Workflow: "CI", Title: "Build the new screens", Branch: "feat/screens", Event: "pull_request", Status: jobs.JobRunning, JobsKnown: true}
 	m.JobQueue = []*jobs.JobItem{
-		{ID: "#1", Name: "alpha / ci / build", Repo: "alpha", Status: jobs.JobRunning, RunID: 100, PRNumber: 5, PRTitle: "add thing", RunnerName: "mac-alpha", Duration: "1m 0s", Seconds: 60},
-		{ID: "#2", Name: "alpha / ci / test", Repo: "alpha", Status: jobs.JobPassed, RunID: 100, PRNumber: 5, PRTitle: "add thing", RunnerName: "mac-alpha", Duration: "45s", Seconds: 45},
-		{ID: "#3", Name: "beta / ci / lint", Repo: "beta", Status: jobs.JobQueued, RunID: 200, Branch: "dev", Duration: "-"},
+		{ID: "run:100", RunID: 100, Repo: "alpha", Run: r, IsRunHeader: true, Status: jobs.JobRunning},
+		{ID: "#1", GHJobID: 1, RunID: 100, Repo: "alpha", Run: r, Name: "alpha / build", Status: jobs.JobPassed, Duration: "24s", Steps: []jobs.GHJobStep{{Number: 1, Name: "Build", Status: "completed", Conclusion: "success"}}},
+		{ID: "#2", GHJobID: 2, RunID: 100, Repo: "alpha", Run: r, Name: "alpha / test", Status: jobs.JobRunning, RunnerName: "mac-builder", Duration: "18s", Steps: []jobs.GHJobStep{{Number: 1, Name: "Set up", Status: "completed", Conclusion: "success"}, {Number: 2, Name: "Run tests", Status: "in_progress"}}},
+		{ID: "#3", GHJobID: 3, RunID: 100, Repo: "alpha", Run: r, Name: "alpha / deploy", Status: jobs.JobQueued, Labels: []string{"self-hosted", "ARM64"}},
 	}
-	m.SelectedJobIndex = 2 // a plain job row: exercises the single-job-detail sub-state
-
-	m.Width = 120
-	m.Height = 40
+	m.Width = 100
+	m.Height = 28
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 100, Height: 28})
 	return m
 }
-
-// assertRendersWithoutPanic renders m at its own Width/Height through the
-// real resize path (renderAt -> tea.WindowSizeMsg -> handleWindowSizeMsg ->
-// updateViewport -> View) and fails the (sub)test on panic or empty output.
-// It deliberately does not call updateViewport() directly on a
-// field-assigned model: that combination leaves Viewport.Width/Height at
-// their NewModel defaults (60x15) while m.Width/m.Height say something else,
-// i.e. a frame the running app can never actually produce.
-func assertRendersWithoutPanic(t *testing.T, name string, m Model) string {
-	t.Helper()
-	var view string
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("%s: panic: %v", name, r)
-			}
-		}()
-		view = renderAt(m, m.Width, m.Height)
-	}()
-	if strings.TrimSpace(view) == "" {
-		t.Fatalf("%s: View() returned empty output", name)
+func press(m *Model, k string) tea.Cmd {
+	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+	keys := map[string]tea.KeyType{"enter": tea.KeyEnter, "esc": tea.KeyEsc, "up": tea.KeyUp, "down": tea.KeyDown, "tab": tea.KeyTab, "shift+tab": tea.KeyShiftTab, "pgdown": tea.KeyPgDown, "home": tea.KeyHome, "end": tea.KeyEnd}
+	if typ, ok := keys[k]; ok {
+		msg = tea.KeyMsg{Type: typ}
 	}
-	return view
+	next, cmd := m.Update(msg)
+	*m = next.(Model)
+	return cmd
 }
-
-// TestSmokeAllViewsRenderWithoutPanic drives every ActiveFocus x ActiveTab
-// combination (the FocusRepos|FocusRunners|FocusJobs x TabLogs|TabBranches|
-// TabIssues|TabPRs matrix), crossed with toast visible/hidden, through
-// View() — plus, separately, each of the OVERALL JOB QUEUE panel's 4
-// detail-viewport sub-states (runner-tag-match list, run summary, initiator
-// summary, single-job detail) at least once — asserting non-empty output and
-// no panic throughout.
-func TestSmokeAllViewsRenderWithoutPanic(t *testing.T) {
-	focuses := []FocusType{FocusRepos, FocusRunners, FocusJobs}
-	tabs := []TabType{TabLogs, TabBranches, TabIssues, TabPRs}
-
-	for _, focus := range focuses {
-		for _, tab := range tabs {
-			for _, toastOn := range []bool{false, true} {
-				name := fmt.Sprintf("focus=%d/tab=%d/toast=%v", focus, tab, toastOn)
-				t.Run(name, func(t *testing.T) {
-					m := smokeFixtureModel()
-					m.ActiveFocus = focus
-					m.ActiveTab = tab
-					if toastOn {
-						m.setToast(" test toast", 1)
+func TestScreenFrameBounds(t *testing.T) {
+	for _, size := range [][2]int{{1, 1}, {20, 6}, {40, 12}, {60, 18}, {80, 24}, {120, 40}, {200, 50}} {
+		for _, focus := range []FocusType{FocusRepos, FocusJobs, FocusRunners} {
+			for _, detail := range []bool{false, true} {
+				m := smokeFixtureModel()
+				m.ActiveFocus = focus
+				m.Detail = detail
+				if focus == FocusJobs && detail {
+					m.OpenRun = m.JobQueue[0].Run
+					m.OpenJobID = "#2"
+				}
+				frame := renderAt(m, size[0], size[1])
+				lines := strings.Split(frame, "\n")
+				if len(lines) != size[1] {
+					t.Fatalf("%v: height %d", size, len(lines))
+				}
+				for _, line := range lines {
+					if ansi.StringWidth(line) > size[0] {
+						t.Fatalf("%v: overflow %q", size, line)
 					}
-					assertRendersWithoutPanic(t, name, m)
-				})
+				}
 			}
 		}
 	}
-
-	// --- Detail-viewport sub-states (FocusJobs), each exercised at least once ---
-
-	t.Run("substate=runner-tag-match-list", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.ActiveFocus = FocusRunners
-		assertRendersWithoutPanic(t, "runner-tag-match-list", m)
-
-		// Assert against the detail viewport, not the whole frame: the left
-		// RUNNERS panel prints "mac-alpha" too, so a full-frame Contains check
-		// passes even when the tag-match list is empty. Resize through the
-		// real Update path first (same as renderAt/assertRendersWithoutPanic
-		// above) — a direct m.updateViewport() call on the outer m here would
-		// read Viewport.Width/Height still at NewModel's 60x15 default, not
-		// the 120x40 frame just rendered above.
-		updated, _ := m.Update(tea.WindowSizeMsg{Width: m.Width, Height: m.Height})
-		m = updated.(Model)
-		vp := m.Viewport.View()
-		if !strings.Contains(vp, "RUNNERS MATCHING") || !strings.Contains(vp, "mac-alpha") {
-			t.Errorf("expected tag-match list in the detail viewport, got:\n%s", vp)
+}
+func TestNavigationIsLocalAndReversible(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "end")
+	press(&m, "down")
+	if m.ActiveFocus != FocusRepos || m.SelectedIndex != 1 {
+		t.Fatal("list boundary changed screen")
+	}
+	press(&m, "2")
+	if m.ActiveFocus != FocusJobs {
+		t.Fatal("2 should open Actions")
+	}
+	press(&m, "enter")
+	if m.OpenRun == nil || m.OpenRun.ID != 100 || m.OpenJobID != "" {
+		t.Fatal("run was not opened")
+	}
+	press(&m, "down")
+	press(&m, "enter")
+	if m.OpenJobID != "#2" {
+		t.Fatal("job was not opened")
+	}
+	if !strings.Contains(stripped(m.Viewport.View()), "Run tests") {
+		t.Fatal("missing current step")
+	}
+	press(&m, "esc")
+	if m.OpenRun == nil || m.OpenJobID != "" {
+		t.Fatal("Esc did not return to jobs")
+	}
+	press(&m, "esc")
+	if m.OpenRun != nil {
+		t.Fatal("Esc did not return to runs")
+	}
+	press(&m, "tab")
+	if m.ActiveFocus != FocusRunners {
+		t.Fatal("Tab order")
+	}
+	press(&m, "shift+tab")
+	if m.ActiveFocus != FocusJobs {
+		t.Fatal("reverse Tab order")
+	}
+}
+func TestProgressUsesAllJobsAndRealSteps(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	if !strings.Contains(stripped(m.listContent()), "1/3 jobs complete") {
+		t.Fatal(m.listContent())
+	}
+	press(&m, "enter")
+	content := stripped(m.listContent())
+	for _, want := range []string{"PASSED", "RUNNING", "QUEUED", "1/2 steps complete", "Run tests", "self-hosted"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("missing %q in %s", want, content)
 		}
-	})
+	}
+}
+func TestSelectionSurvivesPollAndConfirmationPinsTarget(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "down")
+	press(&m, "X")
+	if m.PendingAction != "prune" || m.ActionTarget.Name != "beta" {
+		t.Fatal("missing explicit confirmation")
+	}
+	m.handleOrgSyncedMsg(orgSyncedMsg{repos: []*git.RepoItem{{Name: "aardvark", Path: "/tmp/a"}, m.Repos[0], m.Repos[1]}})
+	if m.ActionTarget.Name != "beta" {
+		t.Fatal("poll retargeted confirmation")
+	}
+	press(&m, "esc")
+	if m.PendingAction != "" {
+		t.Fatal("confirmation not cancelled")
+	}
+	press(&m, "2")
+	press(&m, "enter")
+	press(&m, "down")
+	queue := append([]*jobs.JobItem(nil), m.JobQueue...)
+	queue[1], queue[2] = queue[2], queue[1]
+	m.processJobQueueUpdate(queue, nil)
+	if m.entries()[m.entryIndex(m.entries())].key != "#2" {
+		t.Fatal("poll moved job selection")
+	}
+}
+func TestSearchAndMouseShareVisibleEntries(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "/")
+	press(&m, "beta")
+	press(&m, "enter")
+	if len(m.entries()) != 1 || m.entries()[0].key != "/tmp/freshen-fixture/beta/beta" {
+		t.Fatal("search did not filter")
+	}
+	m.screenMouse(tea.MouseMsg{X: 5, Y: 4, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if m.SelectedIndex != 1 {
+		t.Fatal("mouse selected unfiltered index")
+	}
+	press(&m, "esc")
+	for i := 0; i < 30; i++ {
+		m.Repos = append(m.Repos, &git.RepoItem{Name: fmt.Sprintf("repo-%02d", i), Path: fmt.Sprintf("/tmp/%d", i)})
+	}
+	press(&m, "end")
+	visible, _, _ := m.visibleEntries()
+	m.screenMouse(tea.MouseMsg{X: 5, Y: 4, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	if m.selectionKey() != visible[0].key {
+		t.Fatal("mouse ignored scroll window")
+	}
+}
+func TestDetailScrollHasOneOwner(t *testing.T) {
+	m := smokeFixtureModel()
+	for i := 0; i < 100; i++ {
+		m.Repos[0].Logs = append(m.Repos[0].Logs, fmt.Sprint(i))
+	}
+	press(&m, "enter")
+	press(&m, "down")
+	if m.Viewport.YOffset != 1 || m.SelectedIndex != 0 {
+		t.Fatalf("detail key affected list or double scrolled: %d", m.Viewport.YOffset)
+	}
+	m.screenMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if m.Viewport.YOffset != 4 {
+		t.Fatal("wheel scrolled more than once")
+	}
+}
+func TestMissingJobNeverBecomesSuccess(t *testing.T) {
+	m := smokeFixtureModel()
+	m.processJobQueueUpdate(nil, nil)
+	if strings.Contains(m.ToastMsg, "completed") || strings.Contains(m.ToastMsg, "passed") {
+		t.Fatal("disappearance fabricated result")
+	}
+}
+func TestLateRunResponseCannotReplaceAnotherRun(t *testing.T) {
+	m := smokeFixtureModel()
+	run := m.JobQueue[0].Run
+	m.OpenRun = &jobs.RunItem{ID: 999, Repo: "beta"}
+	m.receiveRunJobs(runJobsLoadedMsg{run: run, infos: []jobs.GHJobInfo{{ID: 42, Name: "wrong"}}})
+	if m.OpenRun.ID != 999 || len(m.JobQueue) != 4 {
+		t.Fatal("late response replaced current detail")
+	}
+}
+func TestRepositoryShortcutsAreScopedAndNonblocking(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "p")
+	if m.PendingAction != "" || m.BusyAction != "" {
+		t.Fatal("Actions shortcut triggered repository mutation")
+	}
+	press(&m, "1")
+	m.BusyAction = "test operation"
 
-	t.Run("substate=initiator-summary", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.ActiveFocus = FocusJobs
-		m.SelectedJobIndex = 0 // initiator header row for "alpha#pr:5"
-		view := assertRendersWithoutPanic(t, "initiator-summary", m)
-		if !strings.Contains(view, "FOCUSED INITIATOR") {
-			t.Errorf("expected initiator-summary view, got:\n%s", view)
-		}
-	})
-
-	t.Run("substate=run-summary", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.ActiveFocus = FocusJobs
-		m.SelectedJobIndex = 1 // run header row for RunID 100
-		view := assertRendersWithoutPanic(t, "run-summary", m)
-		if !strings.Contains(view, "FOCUSED RUN") {
-			t.Errorf("expected run-summary view, got:\n%s", view)
-		}
-	})
-
-	t.Run("substate=single-job-detail", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.ActiveFocus = FocusJobs
-		m.SelectedJobIndex = 5 // beta's lone job row (no run header above it)
-		view := assertRendersWithoutPanic(t, "single-job-detail", m)
-		if !strings.Contains(view, "#3") {
-			t.Errorf("expected single-job-detail view for job #3, got:\n%s", view)
-		}
-	})
-
-	// --- Branches the fixture above pins false/populated, exercised here ---
-
-	t.Run("width-zero-early-return", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.Width = 0
-		m.Height = 0
-		view := assertRendersWithoutPanic(t, "width-zero-early-return", m)
-		if !strings.Contains(view, "Initializing") {
-			t.Errorf("expected the m.Width==0 early-return placeholder, got:\n%s", view)
-		}
-	})
-
-	t.Run("org-syncing", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.IsOrgSyncing = true
-		assertRendersWithoutPanic(t, "org-syncing", m)
-	})
-
-	t.Run("runners-fetch-failed", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.Runners = nil
-		m.IsRunnersLoading = false
-		m.RunnerFetchFailed = true
-		m.RunnerPermissionDenied = false
-		view := assertRendersWithoutPanic(t, "runners-fetch-failed", m)
-		if !strings.Contains(view, "Failed to fetch registered runners") {
-			t.Errorf("expected the runner-fetch-failed message, got:\n%s", view)
-		}
-	})
-
-	t.Run("runners-permission-denied", func(t *testing.T) {
-		m := smokeFixtureModel()
-		m.Runners = nil
-		m.IsRunnersLoading = false
-		m.RunnerFetchFailed = true
-		m.RunnerPermissionDenied = true
-		// RunnerPermissionDenied suppresses the fetch-failed message (view.go's
-		// `if m.RunnerFetchFailed && !m.RunnerPermissionDenied` guard) in favor
-		// of the generic no-runners message — assert no-panic only, matching
-		// the smoke table's own stated purpose.
-		assertRendersWithoutPanic(t, "runners-permission-denied", m)
-	})
+	press(&m, "p")
+	if m.PendingAction != "" {
+		t.Fatal("allowed concurrent repository mutation")
+	}
+	press(&m, "2")
+	if m.ActiveFocus != FocusJobs {
+		t.Fatal("busy operation blocked navigation")
+	}
 }
 
-// TestWidthSweepNeverPanicsAndFillsWhenSpaceAllows renders across a sweep of
-// widths — including widths well below the layout's practical floor — for
-// each ActiveFocus, driving resize via m.Update(tea.WindowSizeMsg{...}) (the
-// same real resize path renderAt uses) rather than direct field assignment,
-// since a direct assignment would bypass the update.go floor clamps entirely
-// and never exercise the negative-width strings.Repeat panic they fix. For
-// w >= 80, every rendered line must exactly fill the requested width; below
-// that, view.go's own paneInnerWidth 30-column floor makes exact-fill
-// mathematically unfalsifiable, so only "no panic" is asserted.
-func TestWidthSweepNeverPanicsAndFillsWhenSpaceAllows(t *testing.T) {
-	widths := []int{1, 5, 10, 20, 30, 50, 80, 120, 200}
-	focuses := []FocusType{FocusRepos, FocusRunners, FocusJobs}
-	// ActiveTab is swept too: TabIssues/TabPRs render through their own
-	// m.Viewport.Width-6 title wrappers and TabBranches through its own list
-	// paths, none of which the FocusRepos default tab (TabLogs) reaches.
-	tabs := []TabType{TabLogs, TabBranches, TabIssues, TabPRs}
-
-	for _, w := range widths {
-		for _, focus := range focuses {
-			for _, tab := range tabs {
-				t.Run(fmt.Sprintf("w=%d/focus=%d/tab=%d", w, focus, tab), func(t *testing.T) {
-					m := smokeFixtureModel()
-					m.ActiveFocus = focus
-					m.ActiveTab = tab
-
-					var view string
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								t.Fatalf("panic at width %d, focus %d, tab %d: %v", w, focus, tab, r)
-							}
-						}()
-						view = renderAt(m, w, 40)
-					}()
-
-					if view == "" {
-						t.Fatalf("width %d focus %d tab %d: empty view", w, focus, tab)
-					}
-
-					if w >= 80 {
-						maxWidth := 0
-						for _, line := range strings.Split(view, "\n") {
-							if lw := lipgloss.Width(line); lw > maxWidth {
-								maxWidth = lw
-							}
-						}
-						if maxWidth != w {
-							t.Errorf("width %d focus %d tab %d: max rendered line width %d, want exact fill %d", w, focus, tab, maxWidth, w)
-						}
-					}
-				})
-			}
+func TestQueueViewOpensExactJob(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "v")
+	entries := m.entries()
+	if len(entries) != 2 {
+		t.Fatalf("queue should contain running and queued jobs, got %d", len(entries))
+	}
+	press(&m, "down")
+	press(&m, "enter")
+	if m.OpenRun == nil || m.OpenRun.ID != 100 || m.OpenJobID != "#3" {
+		t.Fatal("queue selected wrong job")
+	}
+	if !strings.Contains(m.selectedURL(), "/job/3") {
+		t.Fatal("queue copy target is not selected job")
+	}
+}
+func TestSmallConfirmationCannotExecuteUnseenAction(t *testing.T) {
+	m := smokeFixtureModel()
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 40, Height: 12})
+	press(&m, "X")
+	cmd := press(&m, "enter")
+	if cmd != nil || m.PendingAction != "prune" || m.BusyAction != "" {
+		t.Fatal("executed a clipped confirmation")
+	}
+	if !strings.Contains(m.ToastMsg, "Enlarge") {
+		t.Fatal("missing resize instruction")
+	}
+}
+func TestLateAttemptResponseIsDiscarded(t *testing.T) {
+	m := smokeFixtureModel()
+	old := *m.JobQueue[0].Run
+	current := old
+	current.Attempt++
+	m.OpenRun = &current
+	m.receiveRunJobs(runJobsLoadedMsg{run: &old, infos: []jobs.GHJobInfo{{ID: 999}}})
+	for _, j := range m.JobQueue {
+		if j.GHJobID == 999 {
+			t.Fatal("old attempt injected a job")
 		}
+	}
+}
+func TestDemoCannotStartRepositoryOperations(t *testing.T) {
+	m := terminalDemo{smokeFixtureModel()}
+	for _, key := range []string{"s", "b", "o", "y"} {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		if next.(terminalDemo).BusyAction != "" {
+			t.Fatal("demo started an operation")
+		}
+	}
+	m.PendingAction = "sync-all"
+	m.ActionTarget = m.Repos[0].Clone()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if next.(terminalDemo).IsSyncing {
+		t.Fatal("demo started bulk sync")
+	}
+}
+
+func TestActionsRegisterWithShutdownBeforeCommandRuns(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActionURL = ""
+	release := make(chan struct{})
+	cmd := m.actionCmd(func() actionResultMsg { <-release; return actionResultMsg{err: fmt.Errorf("test result")} })
+	finished := make(chan struct{})
+	go func() { m.bgWG.Wait(); close(finished) }()
+	select {
+	case <-finished:
+		t.Fatal("shutdown saw no work before command started")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	result := cmd().(actionResultMsg)
+	if result.err == nil {
+		t.Fatal("expected empty-target error")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("action did not release shutdown guard")
+	}
+}
+func TestTerminalTransitionRetainsJobsAndReportsFailure(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "enter")
+	m.OpenJobID = "#2"
+	r := *m.OpenRun
+	r.Status = jobs.JobFailed
+	r.JobsKnown = false
+	r.JobsError = "temporary jobs endpoint failure"
+	m.processJobQueueUpdate([]*jobs.JobItem{{ID: "run:100", RunID: 100, Repo: "alpha", Run: &r, IsRunHeader: true, Status: jobs.JobFailed}}, nil)
+	if len(m.runJobs()) != 3 || m.openJob() == nil {
+		t.Fatal("terminal transition dropped job detail")
+	}
+	if !strings.Contains(m.ToastMsg, "failed") {
+		t.Fatal("terminal run failure was silent")
+	}
+	if !strings.Contains(m.jobDetailContent(), "Cached job state") {
+		t.Fatal("stale job result was not labelled")
+	}
+}
+func TestLargeBudgetIsNeverShortenedByBackoff(t *testing.T) {
+	base := 12 * time.Minute
+	for _, errors := range []int{0, 1, 4} {
+		if got := backoffInterval(base, errors); got < base {
+			t.Fatalf("budget shortened to %s", got)
+		}
+	}
+}
+func TestPartialCoverageDoesNotBackOffHealthyRepositories(t *testing.T) {
+	m := smokeFixtureModel()
+	err := &jobs.QueueFetchError{Partial: true, Failed: 1, Total: 20, Cause: fmt.Errorf("one repo unavailable")}
+	m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: m.JobQueue, err: err})
+	if !m.JobQueueFetchFailed || m.ConsecutiveErrors[fetchSourceJobQueue] != 0 || m.ToastMsg != "" {
+		t.Fatal("partial coverage treated as total outage")
+	}
+}
+
+func TestWidespreadCoverageLossWarnsEveryScreen(t *testing.T) {
+	m := smokeFixtureModel()
+	err := &jobs.QueueFetchError{Partial: true, Failed: 19, Total: 20, Cause: fmt.Errorf("19 of 20 repositories unavailable")}
+	m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: m.JobQueue, err: err})
+	if m.ConsecutiveErrors[fetchSourceJobQueue] != 1 || m.ToastPriority != 2 {
+		t.Fatal("widespread outage did not back off and warn")
+	}
+	for _, focus := range []FocusType{FocusRepos, FocusJobs, FocusRunners} {
+		m.ActiveFocus = focus
+		if !strings.Contains(stripped(m.View()), "Actions incomplete") {
+			t.Fatal("coverage warning hidden on screen", focus)
+		}
+	}
+}
+func TestPendingFinalResultsAreDistinctFromFetchFailure(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "enter")
+	m.OpenJobID = "#2"
+	r := *m.OpenRun
+	r.Status = jobs.JobFailed
+	r.JobsKnown = false
+	m.processJobQueueUpdate([]*jobs.JobItem{{ID: "run:100", RunID: 100, Repo: "alpha", Run: &r, IsRunHeader: true, Status: jobs.JobFailed}}, nil)
+	if !m.OpenRun.JobsStale || m.OpenRun.JobsError != "" {
+		t.Fatal("pending refresh was represented as a fetch error")
+	}
+	content := m.jobDetailContent()
+	if strings.Contains(content, "refresh failed") || !strings.Contains(content, "previous poll") {
+		t.Fatal(content)
+	}
+}
+func TestDerivedRunnersOnlyReflectActiveAssignments(t *testing.T) {
+	old := []*jobs.RunnerItem{{ID: "runner-old", Name: "old", Status: jobs.RunnerRunning}}
+	queue := []*jobs.JobItem{{ID: "1", RunnerName: "finished", Status: jobs.JobPassed}, {ID: "2", RunnerName: "active", Status: jobs.JobRunning}}
+	got := extractRunnersFromJobQueue(queue, old)
+	if len(got) != 1 || got[0].Name != "active" {
+		t.Fatalf("phantom runners retained: %+v", got)
+	}
+}
+func TestDiscardedActionCommandDoesNotStrandShutdown(t *testing.T) {
+	m := smokeFixtureModel()
+	m.actionCmd(func() actionResultMsg { <-m.ctx.Done(); return actionResultMsg{} })
+	m.cancel()
+	done := make(chan struct{})
+	go func() { m.bgWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("discarded result command stranded shutdown")
 	}
 }
