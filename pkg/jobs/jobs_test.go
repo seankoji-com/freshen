@@ -684,3 +684,38 @@ func TestFullRecentPageStillFindsOldQueuedRun(t *testing.T) {
 		t.Fatal("recent completed runs hid old queued run")
 	}
 }
+
+func TestRecentlyActiveRunFetchesItsFinalJobs(t *testing.T) {
+	stubGH(t, func(path string) ([]byte, error) {
+		if strings.Contains(path, "/runs/10/jobs") {
+			return mustJSON(t, GHJobsResponse{Jobs: []GHJobInfo{{ID: 1, Status: "completed", Conclusion: "failure"}}}), nil
+		}
+		return mustJSON(t, GHWorkflowRunsResponse{WorkflowRuns: []GHWorkflowRun{{ID: 10, Status: "completed", Conclusion: "failure"}}}), nil
+	})
+	queue, _, err := FetchOrgJobQueue("org", []string{"repo"}, 10)
+	if err != nil || len(queue) != 2 {
+		t.Fatalf("final jobs missing: %d %v", len(queue), err)
+	}
+	for _, j := range queue {
+		if !j.IsRunHeader && (j.Status != JobFailed || !j.Run.JobsKnown) {
+			t.Fatal("final job result not authoritative")
+		}
+	}
+}
+func TestExtraStatusFailureRetainsRecentPage(t *testing.T) {
+	recent := GHWorkflowRunsResponse{}
+	for i := 0; i < 30; i++ {
+		recent.WorkflowRuns = append(recent.WorkflowRuns, GHWorkflowRun{ID: int64(i + 1), Status: "completed", Conclusion: "success"})
+	}
+	stubGH(t, func(path string) ([]byte, error) {
+		if strings.Contains(path, "status=") {
+			return nil, fmt.Errorf("temporary status endpoint failure")
+		}
+		return mustJSON(t, recent), nil
+	})
+	queue, _, err := FetchOrgJobQueue("org", []string{"repo"})
+	partial, ok := err.(*QueueFetchError)
+	if !ok || !partial.Partial || len(queue) != 30 {
+		t.Fatalf("lost partial page: %d %v", len(queue), err)
+	}
+}

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -199,6 +200,20 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
 		m.Runners = merged
+		if key := m.ScreenCursor[FocusRunners]; key != "" {
+			found := false
+			for i, r := range m.getMatchingRunners() {
+				if r.ID == key {
+					m.SelectedRunnerIndex = i
+					found = true
+					break
+				}
+			}
+			if !found && m.ActiveFocus == FocusRunners {
+				m.Detail = false
+				m.SelectedRunnerIndex = 0
+			}
+		}
 
 		// Runner capacity never invents jobs or run identities.
 		m.updateViewport()
@@ -209,9 +224,14 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	m.IsJobQueueLoading = false
 	if msg.err != nil {
 		m.JobQueueFetchFailed = true
-		m.noteFetchFailure(fetchSourceJobQueue, jobQueueTickInterval)
-		slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
-		m.setToast(fmt.Sprintf(" ⚠ Job queue may be incomplete: %v", msg.err), 2)
+		var partial *jobs.QueueFetchError
+		if errors.As(msg.err, &partial) && partial.Partial {
+			m.noteFetchSuccess(fetchSourceJobQueue)
+		} else {
+			m.noteFetchFailure(fetchSourceJobQueue, m.actionsPollInterval())
+			slog.Error("job queue fetch failed", "org", m.TargetOrg, "error", msg.err)
+			m.setToast(fmt.Sprintf("Actions fetch failed: %v", msg.err), 2)
+		}
 		var cmd tea.Cmd
 		if len(msg.queue) > 0 {
 			m.processJobQueueUpdate(msg.queue, msg.history)
@@ -408,6 +428,17 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 		// Status changes — failure toasts (priority 2) survive info toasts (priority 1)
 		for _, newJ := range queue {
 			if newJ.IsRunHeader {
+				if old, ok := oldJobs[newJ.ID]; ok && old.Status != newJ.Status && newJ.Run != nil {
+					label := fmt.Sprintf("Run %s / %s #%d", newJ.Repo, newJ.Run.Workflow, newJ.Run.Number)
+					switch newJ.Status {
+					case jobs.JobFailed:
+						m.setToast(label+" failed", 2)
+					case jobs.JobPassed:
+						m.setToast(label+" passed", 1)
+					case jobs.JobCancelled:
+						m.setToast(label+" cancelled", 1)
+					}
+				}
 				continue
 			}
 			if oldJ, ok := oldJobs[newJ.ID]; ok {
@@ -463,17 +494,23 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 	// Preserve fetched details only for the same completed attempt. Active polls
 	// are authoritative, including a new attempt with different job IDs.
 	for _, header := range queue {
-		if !header.IsRunHeader || header.Run == nil || !terminalStatus(header.Run.Status) {
+		if !header.IsRunHeader || header.Run == nil || header.Run.JobsKnown || !terminalStatus(header.Run.Status) {
 			continue
 		}
 		for _, old := range m.JobQueue {
-			if old.Run == nil || !terminalStatus(old.Run.Status) || old.IsRunHeader || old.RunID != header.RunID || old.Repo != header.Repo || old.Run.Attempt != header.Run.Attempt {
+			if old.Run == nil || old.IsRunHeader || old.RunID != header.RunID || old.Repo != header.Repo || old.Run.Attempt != header.Run.Attempt {
 				continue
 			}
 			copyJob := *old
 			copyJob.Run = header.Run
 			queue = append(queue, &copyJob)
-			header.Run.JobsKnown = old.Run.JobsKnown
+			if header.Run.JobsError == "" {
+				if terminalStatus(old.Run.Status) {
+					header.Run.JobsKnown = old.Run.JobsKnown
+				} else {
+					header.Run.JobsError = "Final job results pending refresh"
+				}
+			}
 		}
 	}
 	m.JobQueue = queue

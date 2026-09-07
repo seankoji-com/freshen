@@ -59,11 +59,12 @@ const (
 // pollBackoffCap. With no failures recorded it returns base unchanged.
 func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
 	d := base
-	for i := 0; i < consecutiveErrors && d < pollBackoffCap; i++ {
+	capInterval := max(base, pollBackoffCap)
+	for i := 0; i < consecutiveErrors && d < capInterval; i++ {
 		d *= 2
 	}
-	if d > pollBackoffCap {
-		d = pollBackoffCap
+	if d > capInterval {
+		d = capInterval
 	}
 	return d
 }

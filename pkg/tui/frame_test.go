@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -226,5 +227,121 @@ func TestRepositoryShortcutsAreScopedAndNonblocking(t *testing.T) {
 	press(&m, "2")
 	if m.ActiveFocus != FocusJobs {
 		t.Fatal("busy operation blocked navigation")
+	}
+}
+
+func TestQueueViewOpensExactJob(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "v")
+	entries := m.entries()
+	if len(entries) != 2 {
+		t.Fatalf("queue should contain running and queued jobs, got %d", len(entries))
+	}
+	press(&m, "down")
+	press(&m, "enter")
+	if m.OpenRun == nil || m.OpenRun.ID != 100 || m.OpenJobID != "#3" {
+		t.Fatal("queue selected wrong job")
+	}
+	if !strings.Contains(m.selectedURL(), "/job/3") {
+		t.Fatal("queue copy target is not selected job")
+	}
+}
+func TestSmallConfirmationCannotExecuteUnseenAction(t *testing.T) {
+	m := smokeFixtureModel()
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 40, Height: 12})
+	press(&m, "X")
+	cmd := press(&m, "enter")
+	if cmd != nil || m.PendingAction != "prune" || m.BusyAction != "" {
+		t.Fatal("executed a clipped confirmation")
+	}
+	if !strings.Contains(m.ToastMsg, "Enlarge") {
+		t.Fatal("missing resize instruction")
+	}
+}
+func TestLateAttemptResponseIsDiscarded(t *testing.T) {
+	m := smokeFixtureModel()
+	old := *m.JobQueue[0].Run
+	current := old
+	current.Attempt++
+	m.OpenRun = &current
+	m.receiveRunJobs(runJobsLoadedMsg{run: &old, infos: []jobs.GHJobInfo{{ID: 999}}})
+	for _, j := range m.JobQueue {
+		if j.GHJobID == 999 {
+			t.Fatal("old attempt injected a job")
+		}
+	}
+}
+func TestDemoCannotStartRepositoryOperations(t *testing.T) {
+	m := terminalDemo{smokeFixtureModel()}
+	for _, key := range []string{"s", "b", "o", "y"} {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		if next.(terminalDemo).BusyAction != "" {
+			t.Fatal("demo started an operation")
+		}
+	}
+	m.PendingAction = "sync-all"
+	m.ActionTarget = m.Repos[0].Clone()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if next.(terminalDemo).IsSyncing {
+		t.Fatal("demo started bulk sync")
+	}
+}
+
+func TestActionsRegisterWithShutdownBeforeCommandRuns(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActionURL = ""
+	cmd := m.executeAction("copy") // Empty target fails locally, without clipboard access.
+	finished := make(chan struct{})
+	go func() { m.bgWG.Wait(); close(finished) }()
+	select {
+	case <-finished:
+		t.Fatal("shutdown saw no work before command started")
+	case <-time.After(20 * time.Millisecond):
+	}
+	result := cmd().(actionResultMsg)
+	if result.err == nil {
+		t.Fatal("expected empty-target error")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("action did not release shutdown guard")
+	}
+}
+func TestTerminalTransitionRetainsJobsAndReportsFailure(t *testing.T) {
+	m := smokeFixtureModel()
+	press(&m, "2")
+	press(&m, "enter")
+	m.OpenJobID = "#2"
+	r := *m.OpenRun
+	r.Status = jobs.JobFailed
+	r.JobsKnown = false
+	r.JobsError = "temporary jobs endpoint failure"
+	m.processJobQueueUpdate([]*jobs.JobItem{{ID: "run:100", RunID: 100, Repo: "alpha", Run: &r, IsRunHeader: true, Status: jobs.JobFailed}}, nil)
+	if len(m.runJobs()) != 3 || m.openJob() == nil {
+		t.Fatal("terminal transition dropped job detail")
+	}
+	if !strings.Contains(m.ToastMsg, "failed") {
+		t.Fatal("terminal run failure was silent")
+	}
+	if !strings.Contains(m.jobDetailContent(), "Cached job state") {
+		t.Fatal("stale job result was not labelled")
+	}
+}
+func TestLargeBudgetIsNeverShortenedByBackoff(t *testing.T) {
+	base := 12 * time.Minute
+	for _, errors := range []int{0, 1, 4} {
+		if got := backoffInterval(base, errors); got < base {
+			t.Fatalf("budget shortened to %s", got)
+		}
+	}
+}
+func TestPartialCoverageDoesNotBackOffHealthyRepositories(t *testing.T) {
+	m := smokeFixtureModel()
+	err := &jobs.QueueFetchError{Partial: true, Cause: fmt.Errorf("one repo unavailable")}
+	m.handleLoadedJobQueueMsg(loadedJobQueueMsg{queue: m.JobQueue, err: err})
+	if !m.JobQueueFetchFailed || m.ConsecutiveErrors[fetchSourceJobQueue] != 0 || m.ToastMsg != "" {
+		t.Fatal("partial coverage treated as total outage")
 	}
 }

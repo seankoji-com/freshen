@@ -406,10 +406,10 @@ func parseDuration(timestamp string) (string, time.Time, int) {
 		return "-", time.Time{}, 0
 	}
 	t, err := time.Parse(time.RFC3339, timestamp)
-	if err != nil {
+	if err != nil || t.IsZero() {
 		return "-", time.Time{}, 0
 	}
-	secs := int(time.Since(t).Seconds())
+	secs := max(0, int(time.Since(t).Seconds()))
 	return formatDuration(secs), t, secs
 }
 
@@ -614,11 +614,25 @@ type repoQueueResult struct {
 // unfiltered runs listing every repo already pages through, so estimating a
 // running job's total time needs no extra API calls. Callers accumulate
 // these across polls (each fetch only has a handful of samples per key).
-func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, map[string][]time.Duration, error) {
+// QueueFetchError distinguishes incomplete coverage from a failed sweep.
+// Partial data should remain visible without backing off healthy repositories.
+type QueueFetchError struct {
+	Partial bool
+	Cause   error
+}
+
+func (e *QueueFetchError) Error() string { return e.Cause.Error() }
+func (e *QueueFetchError) Unwrap() error { return e.Cause }
+
+func FetchOrgJobQueue(org string, repos []string, refreshRunIDs ...int64) ([]*JobItem, map[string][]time.Duration, error) {
 	if len(repos) == 0 {
 		return nil, nil, nil
 	}
 
+	refresh := make(map[int64]bool, len(refreshRunIDs))
+	for _, id := range refreshRunIDs {
+		refresh[id] = true
+	}
 	results := make([]repoQueueResult, len(repos))
 	sem := make(chan struct{}, jobQueueConcurrency)
 	var wg sync.WaitGroup
@@ -630,7 +644,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, map[string][]time
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			repoJobs, history, err := fetchRepoJobQueue(org, repoName)
+			repoJobs, history, err := fetchRepoJobQueue(org, repoName, refresh)
 			results[idx] = repoQueueResult{jobs: repoJobs, history: history, err: err}
 		}(i, repo)
 	}
@@ -668,7 +682,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, map[string][]time
 		return sorted, history, fmt.Errorf("GitHub API rate limit exceeded")
 	}
 	if len(failures) > 0 {
-		return sorted, history, fmt.Errorf("actions incomplete: %d of %d repositories failed (%v)", len(failures), len(repos), failures[0])
+		return sorted, history, &QueueFetchError{Partial: len(allJobs) > 0, Cause: fmt.Errorf("actions incomplete: %d of %d repositories had fetch errors (%v)", len(failures), len(repos), failures[0])}
 	}
 	return sorted, history, nil
 }
@@ -676,7 +690,7 @@ func FetchOrgJobQueue(org string, repos []string) ([]*JobItem, map[string][]time
 // fetchRepoJobQueue returns the active job items for a single repository,
 // plus completed-run durations observed on the same unfiltered runs page —
 // see FetchOrgJobQueue for how that history is used.
-func fetchRepoJobQueue(org, repo string) ([]*JobItem, map[string][]time.Duration, error) {
+func fetchRepoJobQueue(org, repo string, refresh map[int64]bool) ([]*JobItem, map[string][]time.Duration, error) {
 	out, err := runGH(
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=%d", org, repo, jobQueueRunsPerRepo),
@@ -690,17 +704,21 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, map[string][]time.Duration
 		return nil, nil, fmt.Errorf("failed to parse workflow runs JSON: %w", err)
 	}
 
+	var coverageErr error
 	// A full recent page can hide old queued runs. Fetch active states separately.
 	if len(resp.WorkflowRuns) >= jobQueueRunsPerRepo {
+	activeStates:
 		for _, status := range []string{"queued", "in_progress", "waiting", "pending", "requested"} {
 			for page := 1; ; page++ {
 				out, err := runGH("api", fmt.Sprintf("/repos/%s/%s/actions/runs?status=%s&per_page=100&page=%d", org, repo, status, page))
 				if err != nil {
-					return nil, nil, err
+					coverageErr = err
+					break activeStates
 				}
 				var active GHWorkflowRunsResponse
 				if err := json.Unmarshal(out, &active); err != nil {
-					return nil, nil, err
+					coverageErr = err
+					break activeStates
 				}
 				resp.WorkflowRuns = append(resp.WorkflowRuns, active.WorkflowRuns...)
 				if len(active.WorkflowRuns) < 100 || page*100 >= active.TotalCount {
@@ -724,7 +742,9 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, map[string][]time.Duration
 			if d, ok := runDuration(run); ok {
 				history[run.Name] = append(history[run.Name], d)
 			}
-			continue
+			if !refresh[run.ID] {
+				continue
+			}
 		}
 		infos, err := FetchRunJobs(org, repo, run.ID)
 		if err != nil {
@@ -738,7 +758,7 @@ func fetchRepoJobQueue(org, repo string) ([]*JobItem, map[string][]time.Duration
 		}
 	}
 
-	return repoJobs, history, nil
+	return repoJobs, history, coverageErr
 }
 
 // runDuration returns a completed run's wall-clock duration, or false if

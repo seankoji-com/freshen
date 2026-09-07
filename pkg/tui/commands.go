@@ -42,6 +42,16 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 			repos = append(repos, repoName)
 		}
 	}
+	// Re-fetch terminal results once for runs we were watching as active, and
+	// retry failed detail requests. Unopened historical runs remain lazy.
+	var refreshRunIDs []int64
+	seen := map[int64]bool{}
+	for _, j := range m.JobQueue {
+		if j.Run != nil && (!terminalStatus(j.Run.Status) || j.Run.JobsError != "") && !seen[j.RunID] {
+			refreshRunIDs = append(refreshRunIDs, j.RunID)
+			seen[j.RunID] = true
+		}
+	}
 	return func() tea.Msg {
 		// If repos not loaded yet, fetch from org API inside the closure
 		// to avoid blocking the main goroutine (was a main-thread-blocking bug).
@@ -59,7 +69,7 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 				}
 			}
 		}
-		queue, history, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList)
+		queue, history, err := jobs.FetchOrgJobQueue(m.TargetOrg, repoList, refreshRunIDs...)
 		return loadedJobQueueMsg{queue: queue, history: history, err: err}
 	}
 }

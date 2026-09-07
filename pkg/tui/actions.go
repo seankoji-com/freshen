@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
 )
 
@@ -65,14 +66,17 @@ func (m Model) menuContent() string {
 		title += " / " + m.ActionTarget.Name
 	}
 	lines := []string{title, ""}
-	for i, a := range m.menuActions() {
+	actions := m.menuActions()
+	count := max(1, m.bodyHeight()-5)
+	start := max(0, m.MenuIndex-count+1)
+	for i := start; i < min(len(actions), start+count); i++ {
+		a := actions[i]
 		prefix := "  "
 		if i == m.MenuIndex {
 			prefix = "› "
 		}
 		lines = append(lines, prefix+a.label)
 	}
-	actions := m.menuActions()
 	if m.MenuIndex < len(actions) {
 		lines = append(lines, "", actions[m.MenuIndex].detail)
 	}
@@ -185,11 +189,10 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		}
 		return result
 	}
-	return func() tea.Msg {
-		var result actionResultMsg
-		m.bgGuard(func() { result = work() })()
-		return result
-	}
+	var result actionResultMsg
+	run := m.bgGuard(func() { result = work() })
+	// Register before returning the command so shutdown cannot observe zero work.
+	return func() tea.Msg { run(); return result }
 }
 func (m *Model) receiveAction(msg actionResultMsg) {
 	if msg.id != "copy" && msg.id != "open" {
@@ -214,4 +217,8 @@ func (m *Model) receiveAction(msg actionResultMsg) {
 		m.applyRepoSnapshot(msg.repo)
 	}
 	m.updateViewport()
+}
+
+func (m Model) confirmationFits() bool {
+	return m.Width >= 30 && len(strings.Split(ansi.Wrap(m.menuContent(), max(1, m.Width-4), ""), "\n")) <= m.bodyHeight()
 }

@@ -420,7 +420,7 @@ func (m Model) screenView() string {
 		body = strings.Join(lines[min(m.HelpOffset, len(lines)-1):], "\n")
 	}
 	if m.MenuOpen || m.PendingAction != "" {
-		body = m.menuContent()
+		body = ansi.Wrap(m.menuContent(), m.Width-4, "")
 	}
 	box := borderFocusedStyle.Width(m.Width - 2).Height(m.bodyHeight()).Render(fitFrame(body, m.Width-4, m.bodyHeight()))
 	status := m.statusLine()
@@ -490,6 +490,9 @@ func (m Model) jobDetailContent() string {
 		return "This job is no longer in the snapshot. Esc returns to the run."
 	}
 	var sb strings.Builder
+	if j.Run != nil && j.Run.JobsError != "" {
+		sb.WriteString("Cached job state; refresh failed: " + j.Run.JobsError + "\n\n")
+	}
 	fmt.Fprintf(&sb, "%s  %s\n%s\n\n", stateBadge(j.Status), j.Name, Hyperlink("Open job in GitHub", m.jobURL(j)))
 	if j.RunnerName != "" {
 		fmt.Fprintf(&sb, "Runner: %s\n", j.RunnerName)

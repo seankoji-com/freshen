@@ -247,8 +247,8 @@ func TestHandleLoadedJobQueueMsg(t *testing.T) {
 		if m.ConsecutiveErrors[fetchSourceRunners] != 0 {
 			t.Errorf("expected runners ConsecutiveErrors untouched at 0, got %d", m.ConsecutiveErrors[fetchSourceRunners])
 		}
-		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Job queue may be incomplete") {
-			t.Errorf("expected error toast about the incomplete job queue, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
+		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Actions fetch failed") {
+			t.Errorf("expected error toast about the failed Actions fetch, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
 		}
 		if cmd != nil {
 			t.Errorf("expected nil cmd when the errored fetch returned no partial data")

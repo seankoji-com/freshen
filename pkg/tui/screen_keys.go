@@ -55,6 +55,10 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		}
 		if k == "enter" {
+			if !m.confirmationFits() {
+				m.setToast("Enlarge the terminal to read the full confirmation, or Esc to cancel.", 2)
+				return nil
+			}
 			action := m.PendingAction
 			m.PendingAction = ""
 			return m.executeAction(action)
