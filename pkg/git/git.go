@@ -4,12 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/seankoji-com/freshen/pkg/jobs"
@@ -44,12 +52,17 @@ var runner CommandRunner = &execRunner{}
 
 // API pagination limits and timeouts
 const (
-	defaultRepoLimit   = 1000
-	graphQLRepoLimit   = 100
-	defaultIssueLimit  = 50
-	defaultPRLimit     = 50
-	fetchTimeout       = 6 * time.Second
-	rebaseAbortTimeout = 10 * time.Second
+	defaultRepoLimit     = 1000
+	graphQLRepoLimit     = 100
+	countsMaxPages       = (defaultRepoLimit + graphQLRepoLimit - 1) / graphQLRepoLimit
+	defaultIssueLimit    = 50
+	defaultPRLimit       = 50
+	fetchTimeout         = 6 * time.Second
+	countsFetchTimeout   = 15 * time.Second
+	countsSweepTimeout   = countsMaxPages*countsFetchTimeout + 5*time.Second
+	orgFetchTimeout      = 30 * time.Second
+	branchResolveTimeout = 10 * time.Second
+	rebaseAbortTimeout   = 10 * time.Second
 )
 
 type RepoStatus string
@@ -154,7 +167,7 @@ func (d BranchWorktreeDetails) GetRemoteBranches() []string {
 
 type GraphQLOwnerResponse struct {
 	Data struct {
-		RepositoryOwner struct {
+		RepositoryOwner *struct {
 			Repositories struct {
 				Nodes []struct {
 					Name   string `json:"name"`
@@ -165,6 +178,10 @@ type GraphQLOwnerResponse struct {
 						TotalCount int `json:"totalCount"`
 					} `json:"pullRequests"`
 				} `json:"nodes"`
+				PageInfo struct {
+					HasNextPage bool   `json:"hasNextPage"`
+					EndCursor   string `json:"endCursor"`
+				} `json:"pageInfo"`
 			} `json:"repositories"`
 		} `json:"repositoryOwner"`
 	} `json:"data"`
@@ -191,6 +208,9 @@ type RepoItem struct {
 	IsLoadingIssues    bool
 	IsLoadingPRs       bool
 	HasLoadedCounts    bool
+	CountsStale        bool
+	CountsUpdatedAt    time.Time
+	LocalMetadataStale bool
 	BranchDetails      BranchWorktreeDetails
 	Status             RepoStatus
 	StatusMsg          string
@@ -304,8 +324,10 @@ func GetGHRepoName(localDir string) string {
 }
 
 // FetchOrgRepos queries GitHub CLI for all repositories in the specified organization.
-func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
-	out, err := runner.Run(context.Background(), "gh", "repo", "list", org, "--limit", fmt.Sprintf("%d", defaultRepoLimit), "--json", "name,isArchived,url,sshUrl")
+func FetchOrgRepos(parent context.Context, org string) ([]GHRepoInfo, error) {
+	ctx, cancel := context.WithTimeout(parent, orgFetchTimeout)
+	defer cancel()
+	out, err := runner.Run(ctx, "gh", "repo", "list", org, "--limit", fmt.Sprintf("%d", defaultRepoLimit), "--json", "name,isArchived,url,sshUrl")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch gh repos for org %s: %w", org, err)
 	}
@@ -319,26 +341,59 @@ func FetchOrgRepos(org string) ([]GHRepoInfo, error) {
 }
 
 // FetchOrgRepoCounts queries GraphQL API for open issue and PR counts per repo.
-func FetchOrgRepoCounts(org string) (map[string]RepoCounts, error) {
-	query := fmt.Sprintf(`query($login: String!) { repositoryOwner(login: $login) { repositories(first: %d) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } } } }`, graphQLRepoLimit)
-	out, err := runner.Run(context.Background(), "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query), "-F", fmt.Sprintf("login=%s", org))
-	if err != nil {
-		return nil, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
+func FetchOrgRepoCounts(parent context.Context, org string) (map[string]RepoCounts, error) {
+	if err := parent.Err(); err != nil {
+		return map[string]RepoCounts{}, err
 	}
+	sweepCtx, sweepCancel := context.WithTimeout(parent, countsSweepTimeout)
+	defer sweepCancel()
 
-	var resp GraphQLOwnerResponse
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return nil, err
-	}
-
+	query := fmt.Sprintf(`query($login: String!, $endCursor: String) { repositoryOwner(login: $login) { repositories(first: %d, after: $endCursor) { nodes { name issues(states: OPEN) { totalCount } pullRequests(states: OPEN) { totalCount } } pageInfo { hasNextPage endCursor } } } }`, graphQLRepoLimit)
 	result := make(map[string]RepoCounts)
-	for _, node := range resp.Data.RepositoryOwner.Repositories.Nodes {
-		result[node.Name] = RepoCounts{
-			Issues: node.Issues.TotalCount,
-			PRs:    node.PullRequests.TotalCount,
+	cursor := ""
+	fetched := 0
+	for page := 0; page < countsMaxPages; page++ {
+		args := []string{"api", "graphql", "-f", fmt.Sprintf("query=%s", query), "-F", fmt.Sprintf("login=%s", org)}
+		if cursor != "" {
+			args = append(args, "-F", "endCursor="+cursor)
 		}
+		pageCtx, cancel := context.WithTimeout(sweepCtx, countsFetchTimeout)
+		out, err := runner.Run(pageCtx, "gh", args...)
+		cancel()
+		if err != nil {
+			return result, fmt.Errorf("gh api graphql failed for org %s: %w", org, err)
+		}
+
+		var resp GraphQLOwnerResponse
+		if err := json.Unmarshal(out, &resp); err != nil {
+			return result, err
+		}
+		if resp.Data.RepositoryOwner == nil {
+			return result, fmt.Errorf("gh api graphql returned no repository owner for org %s", org)
+		}
+		repositories := resp.Data.RepositoryOwner.Repositories
+		if repositories.PageInfo.HasNextPage && len(repositories.Nodes) == 0 {
+			return result, fmt.Errorf("gh api graphql returned an empty repository page with another page pending for org %s", org)
+		}
+		for _, node := range repositories.Nodes {
+			result[node.Name] = RepoCounts{
+				Issues: node.Issues.TotalCount,
+				PRs:    node.PullRequests.TotalCount,
+			}
+		}
+		fetched += len(repositories.Nodes)
+		if !repositories.PageInfo.HasNextPage {
+			return result, nil
+		}
+		if repositories.PageInfo.EndCursor == "" || repositories.PageInfo.EndCursor == cursor {
+			return result, fmt.Errorf("gh api graphql returned an invalid repository cursor for org %s", org)
+		}
+		if page == countsMaxPages-1 || fetched >= defaultRepoLimit {
+			return result, fmt.Errorf("gh api graphql repository counts truncated at %d repositories for org %s", defaultRepoLimit, org)
+		}
+		cursor = repositories.PageInfo.EndCursor
 	}
-	return result, nil
+	return result, fmt.Errorf("gh api graphql repository counts exceeded the page limit for org %s", org)
 }
 
 // GetRepoBranchDetails fetches branches, worktrees, and changed file details.
@@ -404,11 +459,53 @@ func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) Branc
 	return details
 }
 
-// PruneBranchesAndWorktrees fetches & prunes remote tracking branches, removes secondary worktrees, and deletes non-default local branches.
-func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) (int, error) {
-	if ctx.Err() != nil {
-		return 0, ctx.Err()
+type PruneResult struct {
+	RemovedWorktrees     []string
+	PrunedWorktrees      []string
+	DirtyWorktrees       []string
+	UnavailableWorktrees []string
+	ProtectedBranches    []string
+	UnpushedBranches     []string
+	DeletedBranches      []string
+	Failures             []string
+}
+
+// worktreePruneExpire gives temporarily unavailable mounts a recovery window
+// before Git may classify their registrations as stale.
+var worktreePruneExpire = "3.months.ago"
+
+// PruneBranchesAndWorktrees fetches and prunes remote tracking branches,
+// removes clean secondary worktrees, and deletes non-default local branches.
+// It verifies every destructive target before removing anything.
+func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult, error) {
+	var result PruneResult
+	if item == nil {
+		return result, fmt.Errorf("repository is required")
 	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
+	defaultBranch, err := ResolveDefaultBranch(ctx, item.Path)
+	if err != nil {
+		return result, err
+	}
+	knownDefault := strings.TrimSpace(item.DefaultBranch)
+	if knownDefault == "" || strings.EqualFold(knownDefault, "HEAD") {
+		return result, fmt.Errorf("displayed default branch is unresolved; sync the repository and review it before pruning")
+	}
+	if knownDefault != defaultBranch {
+		return result, fmt.Errorf("default branch changed from %q to %q; sync the repository and confirm pruning again", knownDefault, defaultBranch)
+	}
+	if !localBranchExists(ctx, item.Path, defaultBranch) {
+		return result, fmt.Errorf("verified default branch %q has no local branch; fetch or sync it before pruning", defaultBranch)
+	}
+	currentBranch, err := resolveCurrentBranch(ctx, item.Path)
+	if err != nil {
+		return result, err
+	}
+	item.DefaultBranch = defaultBranch
+	item.CurrentBranch = currentBranch
+	path := item.Path
 
 	// 1. Fetch & prune deleted remote-tracking references from origin
 	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
@@ -417,33 +514,111 @@ func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) 
 	}
 
 	if ctx.Err() != nil {
-		return 0, ctx.Err()
+		return result, ctx.Err()
 	}
 
-	// 2. Force remove secondary git worktrees
-	cmdWorktree := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain")
+	// 2. Inventory every registered secondary worktree before removing any of
+	// them. Git's prunable marker observes its normal expiry grace period, so a
+	// newly unavailable mount stays protected while an expired stale
+	// registration can be cleaned up.
+	cmdWorktree := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain", "--expire="+worktreePruneExpire)
 	var wtOut bytes.Buffer
 	cmdWorktree.Stdout = &wtOut
-	if err := cmdWorktree.Run(); err == nil {
-		lines := strings.Split(wtOut.String(), "\n")
-		for _, line := range lines {
-			if strings.HasPrefix(line, "worktree ") {
-				wtPath := strings.TrimPrefix(line, "worktree ")
-				wtPath = strings.TrimSpace(wtPath)
-				if wtPath != "" && wtPath != path {
-					if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "remove", "--force", wtPath).Run(); err != nil {
-						slog.Warn("git worktree remove failed", "worktreePath", wtPath, "error", err)
+	if err := cmdWorktree.Run(); err != nil {
+		return result, fmt.Errorf("list worktrees: %w", err)
+	}
+	type worktreeRef struct {
+		path     string
+		branch   string
+		prunable bool
+	}
+	var worktrees []worktreeRef
+	var current worktreeRef
+	for _, line := range strings.Split(wtOut.String(), "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			if current.path != "" && !sameExistingPath(current.path, path) {
+				worktrees = append(worktrees, current)
+			}
+			current = worktreeRef{path: strings.TrimSpace(strings.TrimPrefix(line, "worktree "))}
+		} else if strings.HasPrefix(line, "branch refs/heads/") {
+			current.branch = strings.TrimSpace(strings.TrimPrefix(line, "branch refs/heads/"))
+		} else if strings.HasPrefix(line, "prunable") {
+			current.prunable = true
+		}
+	}
+	if current.path != "" && !sameExistingPath(current.path, path) {
+		worktrees = append(worktrees, current)
+	}
+	occupiedBranches := make(map[string]string)
+	var staleWorktrees []worktreeRef
+	for _, worktree := range worktrees {
+		if worktree.branch != "" {
+			occupiedBranches[worktree.branch] = worktree.path
+		}
+		if _, err := os.Stat(worktree.path); errors.Is(err, os.ErrNotExist) {
+			if worktree.prunable {
+				staleWorktrees = append(staleWorktrees, worktree)
+				continue
+			}
+			result.UnavailableWorktrees = append(result.UnavailableWorktrees, worktree.path)
+			continue
+		} else if err != nil {
+			result.UnavailableWorktrees = append(result.UnavailableWorktrees, worktree.path)
+			result.Failures = append(result.Failures, fmt.Sprintf("inspect worktree path %q before removal: %v", worktree.path, err))
+			continue
+		}
+		statusCmd := exec.CommandContext(ctx, "git", "-C", worktree.path, "status", "--porcelain", "--untracked-files=all")
+		var statusOut bytes.Buffer
+		statusCmd.Stdout = &statusOut
+		if err := statusCmd.Run(); err != nil {
+			result.UnavailableWorktrees = append(result.UnavailableWorktrees, worktree.path)
+			result.Failures = append(result.Failures, fmt.Sprintf("inspect worktree %q before removal: %v", worktree.path, err))
+			continue
+		}
+		if strings.TrimSpace(statusOut.String()) != "" {
+			result.DirtyWorktrees = append(result.DirtyWorktrees, worktree.path)
+		}
+	}
+	if len(staleWorktrees) > 0 {
+		if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "prune", "--expire="+worktreePruneExpire).Run(); err != nil {
+			result.Failures = append(result.Failures, fmt.Sprintf("prune expired worktree registrations: %v", err))
+		} else {
+			verifyCmd := exec.CommandContext(ctx, "git", "-C", path, "worktree", "list", "--porcelain", "--expire="+worktreePruneExpire)
+			verifyOut, err := verifyCmd.Output()
+			if err != nil {
+				result.Failures = append(result.Failures, fmt.Sprintf("verify pruned worktree registrations: %v", err))
+			} else {
+				registered := make(map[string]bool)
+				for _, line := range strings.Split(string(verifyOut), "\n") {
+					if strings.HasPrefix(line, "worktree ") {
+						registered[strings.TrimSpace(strings.TrimPrefix(line, "worktree "))] = true
 					}
+				}
+				for _, worktree := range staleWorktrees {
+					if registered[worktree.path] {
+						result.UnavailableWorktrees = append(result.UnavailableWorktrees, worktree.path)
+						continue
+					}
+					result.PrunedWorktrees = append(result.PrunedWorktrees, worktree.path)
+					delete(occupiedBranches, worktree.branch)
 				}
 			}
 		}
 	}
-	if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "prune").Run(); err != nil {
-		slog.Warn("git worktree prune failed", "path", path, "error", err)
+	for _, worktree := range worktrees {
+		if worktree.prunable || slices.Contains(result.UnavailableWorktrees, worktree.path) || slices.Contains(result.DirtyWorktrees, worktree.path) {
+			continue
+		}
+		if err := exec.CommandContext(ctx, "git", "-C", path, "worktree", "remove", worktree.path).Run(); err != nil {
+			result.Failures = append(result.Failures, fmt.Sprintf("remove clean worktree %q: %v", worktree.path, err))
+			continue
+		}
+		result.RemovedWorktrees = append(result.RemovedWorktrees, worktree.path)
+		delete(occupiedBranches, worktree.branch)
 	}
 
 	if ctx.Err() != nil {
-		return 0, ctx.Err()
+		return result, ctx.Err()
 	}
 
 	// 3. Delete local non-default branches
@@ -451,21 +626,57 @@ func PruneBranchesAndWorktrees(ctx context.Context, path, defaultBranch string) 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return 0, err
+		return result, err
 	}
 
-	currentBranch := GetOriginalBranch(ctx, path)
-	deletedCount := 0
 	for _, b := range strings.Split(out.String(), "\n") {
 		b = cleanBranchName(b)
 		if b != "" && b != defaultBranch && b != currentBranch {
-			delCmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-D", b)
-			if delCmd.Run() == nil {
-				deletedCount++
+			if _, occupied := occupiedBranches[b]; occupied {
+				result.ProtectedBranches = append(result.ProtectedBranches, b)
+				continue
 			}
+			countCmd := exec.CommandContext(ctx, "git", "-C", path, "rev-list", "--count", b, "--not", "--remotes")
+			countOut, err := countCmd.Output()
+			if err != nil {
+				result.Failures = append(result.Failures, fmt.Sprintf("inspect local-only commits on branch %q: %v", b, err))
+				continue
+			}
+			unpushed, err := strconv.Atoi(strings.TrimSpace(string(countOut)))
+			if err != nil {
+				result.Failures = append(result.Failures, fmt.Sprintf("parse local-only commit count for branch %q: %v", b, err))
+				continue
+			}
+			if unpushed > 0 {
+				result.UnpushedBranches = append(result.UnpushedBranches, b)
+				continue
+			}
+			delCmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-D", b)
+			if err := delCmd.Run(); err != nil {
+				result.Failures = append(result.Failures, fmt.Sprintf("delete local branch %q: %v", b, err))
+				continue
+			}
+			result.DeletedBranches = append(result.DeletedBranches, b)
 		}
 	}
-	return deletedCount, nil
+	if len(result.Failures) > 0 {
+		return result, fmt.Errorf("prune completed partially: %s", strings.Join(result.Failures, "; "))
+	}
+	return result, nil
+}
+
+func sameExistingPath(left, right string) bool {
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	if leftErr == nil && rightErr == nil {
+		return os.SameFile(leftInfo, rightInfo)
+	}
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
 }
 
 // FetchOpenIssuesList retrieves open GitHub issues with a 6-second timeout context.
@@ -554,6 +765,11 @@ func IsGitRepo(path string) bool {
 	return cmd.Run() == nil
 }
 
+func IsGitRepoContext(ctx context.Context, path string) bool {
+	_, err := runner.Run(ctx, "git", "-C", path, "rev-parse", "--is-inside-work-tree")
+	return err == nil
+}
+
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
 func GetOriginalBranch(ctx context.Context, path string) string {
 	if ctx.Err() != nil {
@@ -577,11 +793,32 @@ func GetOriginalBranch(ctx context.Context, path string) string {
 	return "HEAD"
 }
 
-// ghDefaultBranch resolves a repo's default branch via `gh repo view`, run with
-// its working directory set to path: gh takes [HOST/]OWNER/REPO or a URL, never
-// a filesystem path, and CommandRunner has no way to set cmd.Dir. It is a
+// ghDefaultBranch resolves a repo's default branch through each configured
+// remote before falling back to gh's working-directory resolution. It is a
 // package-level var so tests can fake this tier without spawning gh.
 var ghDefaultBranch = func(ctx context.Context, path string) (string, error) {
+	remoteOut, remoteErr := runner.Run(ctx, "git", "-C", path, "remote")
+	if remoteErr == nil {
+		names := strings.Fields(string(remoteOut))
+		if originIndex := slices.Index(names, "origin"); originIndex > 0 {
+			names[0], names[originIndex] = names[originIndex], names[0]
+		}
+		for _, name := range names {
+			remoteURL, err := runner.Run(ctx, "git", "-C", path, "remote", "get-url", name)
+			if err != nil {
+				continue
+			}
+			target, err := githubRepoTarget(string(remoteURL))
+			if err != nil {
+				continue
+			}
+			out, err := runner.Run(ctx, "gh", "repo", "view", target, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
+			if err == nil && strings.TrimSpace(string(out)) != "" {
+				return string(out), nil
+			}
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name")
 	cmd.Dir = path
 	var out, errOut bytes.Buffer
@@ -596,9 +833,102 @@ var ghDefaultBranch = func(ctx context.Context, path string) (string, error) {
 	return out.String(), nil
 }
 
+func githubRepoTarget(remote string) (string, error) {
+	remote = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(remote), ".git"))
+	if strings.HasPrefix(remote, "git@") {
+		parts := strings.SplitN(strings.TrimPrefix(remote, "git@"), ":", 2)
+		if len(parts) == 2 && parts[0] != "" && strings.Count(strings.Trim(parts[1], "/"), "/") == 1 {
+			path := strings.Trim(parts[1], "/")
+			if parts[0] == "github.com" {
+				return path, nil
+			}
+			return parts[0] + "/" + path, nil
+		}
+	}
+	if parsed, err := url.Parse(remote); err == nil && parsed.Host != "" {
+		path := strings.Trim(parsed.Path, "/")
+		if strings.Count(path, "/") == 1 {
+			if parsed.Host == "github.com" {
+				return path, nil
+			}
+			return parsed.Host + "/" + path, nil
+		}
+	}
+	return "", fmt.Errorf("remote %q is not a GitHub repository", remote)
+}
+
 // GetDefaultBranch determines default branch (main/master) for a git repository.
 // ctx allows the caller to abort the lookup, including the networked gh tier.
 func GetDefaultBranch(ctx context.Context, path string) string {
+	return getDefaultBranch(ctx, path, true)
+}
+
+// GetDefaultBranchLocal avoids the networked GitHub fallback during bulk workspace scans.
+func GetDefaultBranchLocal(ctx context.Context, path string) string {
+	return getDefaultBranch(ctx, path, false)
+}
+
+// ResolveDefaultBranch obtains GitHub's current default branch. Destructive
+// and publishing actions use this strict path instead of scan-time guesses.
+func ResolveDefaultBranch(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	resolveCtx, cancel := context.WithTimeout(ctx, branchResolveTimeout)
+	defer cancel()
+	branch, err := ghDefaultBranch(resolveCtx, path)
+	if err != nil {
+		return "", fmt.Errorf("could not query GitHub's default branch; check 'gh auth status' and network access, then retry: %w", err)
+	}
+	branch = strings.TrimSpace(branch)
+	if branch == "" || strings.EqualFold(branch, "HEAD") {
+		return "", fmt.Errorf("GitHub returned an invalid default branch %q", branch)
+	}
+	return branch, nil
+}
+
+func localBranchExists(ctx context.Context, path, branch string) bool {
+	ref := "refs/heads/" + branch
+	_, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", ref)
+	return err == nil
+}
+
+func ensureLocalDefaultBranch(ctx context.Context, path, branch string) error {
+	if localBranchExists(ctx, path, branch) {
+		return nil
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, orgFetchTimeout)
+	defer cancel()
+	refspec := branch + ":refs/heads/" + branch
+	if _, err := runner.Run(fetchCtx, "git", "-C", path, "fetch", "origin", refspec); err != nil {
+		return fmt.Errorf("GitHub default branch %q is not local and could not be fetched from origin: %w", branch, err)
+	}
+	if !localBranchExists(fetchCtx, path, branch) {
+		return fmt.Errorf("GitHub default branch %q is still unavailable locally after fetch", branch)
+	}
+	return nil
+}
+
+func resolveCurrentBranch(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("resolve current branch: %w", err)
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "" || strings.EqualFold(branch, "HEAD") {
+		return "", fmt.Errorf("invalid current branch %q", branch)
+	}
+	ref := "refs/heads/" + branch
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", ref); err != nil {
+		return "", fmt.Errorf("current branch %q has no local branch: %w", branch, err)
+	}
+	return branch, nil
+}
+
+func getDefaultBranch(ctx context.Context, path string, allowGitHub bool) string {
 	if ctx.Err() != nil {
 		return "HEAD"
 	}
@@ -613,12 +943,14 @@ func GetDefaultBranch(ctx context.Context, path string) string {
 		}
 	}
 
-	if branch, err := ghDefaultBranch(ctx, path); err == nil {
-		if branch = strings.TrimSpace(branch); branch != "" {
-			return branch
+	if allowGitHub {
+		if branch, err := ghDefaultBranch(ctx, path); err == nil {
+			if branch = strings.TrimSpace(branch); branch != "" {
+				return branch
+			}
+		} else {
+			slog.Warn("gh repo view failed", "path", path, "error", err)
 		}
-	} else {
-		slog.Warn("gh repo view failed", "path", path, "error", err)
 	}
 
 	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
@@ -903,7 +1235,33 @@ func SwitchBranch(item *RepoItem, targetBranch string) error {
 
 // CommitPushPRAndSwitchDefault commits unstaged changes, pushes to origin, creates/updates PR, and switches back to default branch.
 func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
-	branch := item.OriginalBranch
+	if item == nil {
+		return fmt.Errorf("repository is required")
+	}
+	defaultBranch, err := ResolveDefaultBranch(ctx, item.Path)
+	if err != nil {
+		return err
+	}
+	knownDefault := strings.TrimSpace(item.DefaultBranch)
+	if knownDefault == "" || strings.EqualFold(knownDefault, "HEAD") {
+		return fmt.Errorf("displayed default branch is unresolved; sync the repository and review it before publishing")
+	}
+	if knownDefault != defaultBranch {
+		return fmt.Errorf("default branch changed from %q to %q; sync the repository and confirm publishing again", knownDefault, defaultBranch)
+	}
+	if err := ensureLocalDefaultBranch(ctx, item.Path, defaultBranch); err != nil {
+		return err
+	}
+	branch, err := resolveCurrentBranch(ctx, item.Path)
+	if err != nil {
+		return err
+	}
+	if item.OriginalBranch != branch {
+		item.ExistingPRURL = ""
+	}
+	item.DefaultBranch = defaultBranch
+	item.CurrentBranch = branch
+	item.OriginalBranch = branch
 	if branch == "" || branch == item.DefaultBranch {
 		return fmt.Errorf("cannot raise PR from default branch")
 	}
@@ -1031,16 +1389,134 @@ func ValidateWorkspacePath(workspace, path string) error {
 
 // ScanLocalDirectory returns names of all direct subdirectories in target path.
 func ScanLocalDirectory(targetDir string) ([]string, error) {
-	entries, err := os.ReadDir(targetDir)
+	return scanLocalDirectory(context.Background(), targetDir)
+}
+
+func scanLocalDirectory(ctx context.Context, targetDir string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dir, err := os.Open(targetDir)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if closeErr := dir.Close(); closeErr != nil {
+			slog.Debug("close local directory scan", "path", targetDir, "error", closeErr)
+		}
+	}()
 
 	var dirs []string
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			dirs = append(dirs, entry.Name())
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		entries, err := dir.ReadDir(64)
+		for _, entry := range entries {
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				dirs = append(dirs, entry.Name())
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			sort.Strings(dirs)
+			return dirs, nil
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
-	return dirs, nil
+}
+
+type directoryScan struct {
+	done    chan struct{}
+	entries []string
+	err     error
+	started time.Time
+}
+
+var directoryScans = struct {
+	sync.Mutex
+	active    map[string]*directoryScan
+	abandoned map[string]int
+}{active: make(map[string]*directoryScan), abandoned: make(map[string]int)}
+
+// ErrDirectoryScanInProgress means an earlier filesystem scan is still
+// blocked. Joining it would make an explicit retry wait for the same work.
+var ErrDirectoryScanInProgress = errors.New("local directory scan already in progress")
+
+// ErrDirectoryScanStuck means a filesystem scan exceeded the recovery window
+// and was abandoned so a later refresh can start a new attempt.
+var ErrDirectoryScanStuck = errors.New("local directory scan appears stuck")
+
+// ErrDirectoryScanUnresponsive means repeated filesystem scans have wedged;
+// no more are started for that path during this process.
+var ErrDirectoryScanUnresponsive = errors.New("workspace directory is unresponsive")
+
+const directoryScanStuckAfter = 5 * time.Minute
+const maxAbandonedDirectoryScans = 2
+
+// ResetLocalDirectoryScanFailures allows an explicit user retry after the
+// abandoned-scan cap has stopped automatic retries. It does not disturb a scan
+// that is still registered as active.
+func ResetLocalDirectoryScanFailures(targetDir string) {
+	directoryScans.Lock()
+	defer directoryScans.Unlock()
+	if directoryScans.active[targetDir] == nil {
+		delete(directoryScans.abandoned, targetDir)
+	}
+}
+
+func finishDirectoryScan(targetDir string, scan *directoryScan, entries []string, err error) {
+	directoryScans.Lock()
+	defer directoryScans.Unlock()
+	scan.entries = entries
+	scan.err = err
+	if directoryScans.active[targetDir] == scan {
+		delete(directoryScans.active, targetDir)
+	}
+	// A successful completion proves the path recovered, even if this was an
+	// older scan that had already been abandoned in favour of a new attempt.
+	if err == nil {
+		delete(directoryScans.abandoned, targetDir)
+	}
+	close(scan.done)
+}
+
+func ScanLocalDirectoryContext(ctx context.Context, targetDir string) ([]string, error) {
+	directoryScans.Lock()
+	scan := directoryScans.active[targetDir]
+	if scan == nil && directoryScans.abandoned[targetDir] >= maxAbandonedDirectoryScans {
+		directoryScans.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrDirectoryScanUnresponsive, targetDir)
+	}
+	if scan != nil {
+		stuck := time.Since(scan.started) >= directoryScanStuckAfter
+		if stuck {
+			delete(directoryScans.active, targetDir)
+			directoryScans.abandoned[targetDir]++
+		}
+		abandoned := directoryScans.abandoned[targetDir]
+		directoryScans.Unlock()
+		if stuck {
+			if abandoned >= maxAbandonedDirectoryScans {
+				return nil, fmt.Errorf("%w after %d abandoned scans: %s", ErrDirectoryScanUnresponsive, abandoned, targetDir)
+			}
+			return nil, fmt.Errorf("%w: %s", ErrDirectoryScanStuck, targetDir)
+		}
+		return nil, fmt.Errorf("%w: %s", ErrDirectoryScanInProgress, targetDir)
+	}
+	scan = &directoryScan{done: make(chan struct{}), started: time.Now()}
+	directoryScans.active[targetDir] = scan
+	go func() {
+		entries, err := scanLocalDirectory(ctx, targetDir)
+		finishDirectoryScan(targetDir, scan, entries, err)
+	}()
+	directoryScans.Unlock()
+	select {
+	case <-ctx.Done():
+		slog.Warn("local directory scan still in progress", "path", targetDir, "error", ctx.Err())
+		return nil, ctx.Err()
+	case <-scan.done:
+		return scan.entries, scan.err
+	}
 }

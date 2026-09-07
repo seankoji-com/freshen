@@ -26,20 +26,26 @@ const (
 	TabPRs
 )
 
-// --- Left-Pane Focus Panel ---
+// --- Top-level screens ---
 type FocusType int
 
 const (
 	FocusRepos FocusType = iota
 	FocusRunners
 	FocusJobs
+	FocusOverview
+	FocusConcerns
 )
 
 // --- Sync and Refresh Intervals ---
 const (
-	repoTickInterval      = 5 * time.Minute
-	runnerJobTickInterval = 10 * time.Second
-	jobQueueTickInterval  = 20 * time.Second
+	repoTickInterval       = 5 * time.Minute
+	repoCountsStaleTTL     = 30 * time.Minute
+	orgLocalRefreshTimeout = 2 * time.Minute
+	orgRemoteRefreshBudget = 3*time.Minute + 15*time.Second
+	orgRefreshStuckAfter   = orgRemoteRefreshBudget + orgLocalRefreshTimeout + 10*time.Second
+	runnerJobTickInterval  = 10 * time.Second
+	jobQueueTickInterval   = 20 * time.Second
 
 	// pollBackoffCap bounds the exponential backoff applied to the runner and
 	// job-queue polls after consecutive fetch failures, so a tripped API quota
@@ -84,19 +90,19 @@ var (
 	iconPending    = "•"
 	iconSkipped    = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
 	iconWorktree   = "󰉓"
-	colorPrimary   = lipgloss.Color("#7D56F4") // Electric Purple
-	colorSecondary = lipgloss.Color("#00F5D4") // Bright Mint / Cyan
-	colorGreen     = lipgloss.Color("#10B981") // Emerald Green
+	colorPrimary   = lipgloss.Color("#78B159") // Leaf green
+	colorSecondary = lipgloss.Color("#56BFA8") // Dew mint
+	colorGreen     = lipgloss.Color("#72C98B") // Fresh green
 	colorYellow    = lipgloss.Color("#F59E0B") // Warm Amber
-	colorRed       = lipgloss.Color("#EF4444") // Coral Red
+	colorRed       = lipgloss.Color("#F07178") // Coral red
 	colorBlue      = lipgloss.Color("#3B82F6") // Bright Blue
-	colorMuted     = lipgloss.Color("#6C7086") // Muted Slate Grey
+	colorMuted     = lipgloss.Color("#7F9087") // Muted sage
+	colorText      = lipgloss.Color("#DCE7E0") // Frosted white
+	colorSurface   = lipgloss.Color("#1E2923") // Deep leaf surface
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorPrimary).
-			Padding(0, 1)
+			Foreground(colorPrimary)
 
 	subtitleStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary).
@@ -104,13 +110,12 @@ var (
 
 	tabActiveStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("#FFFFFF")).
-			Background(colorPrimary).
+			Foreground(colorText).
+			Underline(true).
 			Padding(0, 1)
 
 	tabInactiveStyle = lipgloss.NewStyle().
 				Foreground(colorMuted).
-				Background(lipgloss.Color("#313244")).
 				Padding(0, 1)
 
 	badgeUpToDate = lipgloss.NewStyle().
@@ -149,14 +154,9 @@ var (
 			Foreground(colorMuted)
 
 	selectedRowStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#313244")).
-				Foreground(lipgloss.Color("#F5E0DC")).
+				Background(colorSurface).
+				Foreground(colorText).
 				Bold(true)
-
-	borderFocusedStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(colorSecondary).
-				Padding(0, 1)
 
 	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
 	reTimestamp         = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
@@ -217,8 +217,11 @@ type loadedRunnersMsg struct {
 }
 
 type orgSyncedMsg struct {
-	repos []*git.RepoItem
-	err   error
+	repos      []*git.RepoItem
+	err        error
+	countsErr  error
+	localErr   error
+	generation uint64
 	// autoSync is true only for the initial load; periodic refreshes only
 	// update displayed repo metadata and must not trigger a full
 	// stash/pull/apply sync of every dirty repo.
@@ -245,7 +248,7 @@ type Model struct {
 	Search             textinput.Model
 	Filtering          bool
 	Help               help.Model
-	ScreenCursor       [3]string
+	ScreenCursor       [5]string
 	JobCursor          string
 	OpenRun            *jobs.RunItem
 	OpenJobID          string
@@ -267,6 +270,7 @@ type Model struct {
 	TargetOrg              string
 	Concurrency            int
 	Repos                  []*git.RepoItem
+	RemovedRepoPaths       map[string]uint64
 	Runners                []*jobs.RunnerItem
 	JobQueue               []*jobs.JobItem
 	SelectedIndex          int
@@ -276,6 +280,12 @@ type Model struct {
 	ActiveTab              TabType
 	IsSyncing              bool
 	IsOrgSyncing           bool
+	OrgSyncStartedAt       time.Time
+	OrgRefreshGeneration   uint64
+	NotifyOrgCountsError   bool
+	PendingOrgRefresh      bool
+	OrgRefreshFailed       bool
+	LastOrgRefresh         time.Time
 	IsJobQueueLoading      bool
 	IsRunnersLoading       bool
 	TotalCount             int
@@ -285,6 +295,11 @@ type Model struct {
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
 	JobQueueFetchFailed    bool
+	RepoCountsFetchFailed  bool
+	LocalScanFailed        bool
+	LocalScanInProgress    bool
+	LocalScanStuck         bool
+	LocalScanUnresponsive  bool
 	ActionsCoverage        string
 	// JobDurationHistory retains historical timing samples, never used as completion progress.
 	JobDurationHistory map[string][]time.Duration
@@ -327,16 +342,19 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 	return Model{
 		TargetDir: targetDir,
 		Search:    search, Help: help.New(),
-		TargetOrg:           targetOrg,
-		Concurrency:         concurrency,
-		Repos:               make([]*git.RepoItem, 0),
-		Runners:             make([]*jobs.RunnerItem, 0),
-		JobQueue:            make([]*jobs.JobItem, 0),
-		SelectedIndex:       0,
-		SelectedRunnerIndex: 0,
-		ActiveFocus:         FocusRepos,
-		ActiveTab:           TabLogs,
-		IsOrgSyncing:        true,
+		TargetOrg:            targetOrg,
+		Concurrency:          concurrency,
+		Repos:                make([]*git.RepoItem, 0),
+		RemovedRepoPaths:     make(map[string]uint64),
+		Runners:              make([]*jobs.RunnerItem, 0),
+		JobQueue:             make([]*jobs.JobItem, 0),
+		SelectedIndex:        0,
+		SelectedRunnerIndex:  0,
+		ActiveFocus:          FocusOverview,
+		ActiveTab:            TabLogs,
+		IsOrgSyncing:         true,
+		OrgSyncStartedAt:     time.Now(),
+		OrgRefreshGeneration: 1,
 		// Runners and the job queue are only fetched when a GitHub owner is
 		// configured (see Init) — without one, these flags would never be
 		// cleared and their panels would show "Fetching..." forever.
@@ -352,12 +370,13 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 }
 
 func (m Model) Init() tea.Cmd {
+	previous := cloneRepoItems(m.Repos)
 	if m.TargetOrg == "" {
-		return tea.Batch(m.Spinner.Tick, m.loadOrgReposCmd(false), repoTickCmd())
+		return tea.Batch(m.Spinner.Tick, m.loadOrgReposCmd(false, m.OrgRefreshGeneration, previous), repoTickCmd())
 	}
 	return tea.Batch(
 		m.Spinner.Tick,
-		m.loadOrgReposCmd(false),
+		m.loadOrgReposCmd(false, m.OrgRefreshGeneration, previous),
 		m.loadRunnersCmd(),
 		m.loadJobQueueCmd(),
 		repoTickCmd(),

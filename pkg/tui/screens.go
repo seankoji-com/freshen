@@ -23,6 +23,29 @@ type actionRun struct {
 	jobs []*jobs.JobItem
 }
 
+type screenTab struct {
+	key   string
+	name  string
+	focus FocusType
+}
+
+func screenTabs(width int) []screenTab {
+	if width < 48 {
+		return []screenTab{{"0", "O", FocusOverview}, {"1", "R", FocusRepos}, {"2", "A", FocusJobs}, {"3", "N", FocusRunners}, {"4", "C", FocusConcerns}}
+	}
+	if width < 72 {
+		return []screenTab{{"0", "Org", FocusOverview}, {"1", "Repos", FocusRepos}, {"2", "CI", FocusJobs}, {"3", "Run", FocusRunners}, {"4", "Concerns", FocusConcerns}}
+	}
+	return []screenTab{{"0", "Overview", FocusOverview}, {"1", "Repositories", FocusRepos}, {"2", "Actions", FocusJobs}, {"3", "Runners", FocusRunners}, {"4", "Concerns", FocusConcerns}}
+}
+
+func countPhrase(count int, singular, plural string) string {
+	if count == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	}
+	return fmt.Sprintf("%d %s", count, plural)
+}
+
 func runKey(r *jobs.RunItem) string { return fmt.Sprintf("%s/%d", r.Repo, r.ID) }
 func terminalStatus(s jobs.JobStatus) bool {
 	return s == jobs.JobPassed || s == jobs.JobFailed || s == jobs.JobCancelled || s == jobs.JobSkipped
@@ -143,11 +166,56 @@ func (m Model) countBar(done, total int, noun string) string {
 func (m Model) entries() []screenEntry {
 	var entries []screenEntry
 	switch m.ActiveFocus {
+	case FocusConcerns:
+		for _, i := range m.concernScreenRepoIndices() {
+			r := m.Repos[i]
+			if !r.HasLoadedCounts {
+				detail := r.CurrentBranch
+				if detail == "" {
+					detail = "not cloned"
+				}
+				entries = append(entries, screenEntry{
+					key: r.Path + "/" + r.Name, index: i,
+					title: r.Name + "  " + badgeSkipped.Render("counts unknown"), subtitle: detail + " · not ranked",
+				})
+				continue
+			}
+			badges := make([]string, 0, 2)
+			if r.OpenPRsCount > 0 {
+				badges = append(badges, badgePR.Render(countPhrase(r.OpenPRsCount, "open PR", "open PRs")))
+			}
+			if r.OpenIssuesCount > 0 {
+				badges = append(badges, badgeIssue.Render(countPhrase(r.OpenIssuesCount, "open issue", "open issues")))
+			}
+			detail := r.CurrentBranch
+			if detail == "" {
+				detail = "not cloned"
+			}
+			if r.StatusMsg != "" {
+				detail += " · " + r.StatusMsg
+			}
+			if r.LocalMetadataStale {
+				detail += " · local metadata from last snapshot"
+			}
+			if r.CountsStale {
+				detail += " · counts from last successful refresh"
+			}
+			entries = append(entries, screenEntry{
+				key: r.Path + "/" + r.Name, index: i,
+				title: r.Name + "  " + strings.Join(badges, "  "), subtitle: detail,
+			})
+		}
 	case FocusRepos:
 		for i, r := range m.Repos {
 			counts := "counts not loaded"
 			if r.HasLoadedCounts {
 				counts = fmt.Sprintf("%d PRs · %d issues", r.OpenPRsCount, r.OpenIssuesCount)
+				if r.CountsStale {
+					counts += " · last successful refresh"
+				}
+			}
+			if r.LocalMetadataStale {
+				counts += " · local metadata from last snapshot"
 			}
 			entries = append(entries, screenEntry{key: r.Path + "/" + r.Name, index: i,
 				title: r.Name + "  " + m.renderStatusBadge(r), subtitle: r.CurrentBranch + " · " + counts + " · " + r.StatusMsg})
@@ -236,6 +304,59 @@ func (m Model) entries() []screenEntry {
 	}
 	return filtered
 }
+
+func (m Model) concernRepoIndices() []int {
+	indices := make([]int, 0)
+	for i, r := range m.Repos {
+		if r.HasLoadedCounts && (r.OpenPRsCount > 0 || r.OpenIssuesCount > 0) {
+			indices = append(indices, i)
+		}
+	}
+	sort.SliceStable(indices, func(i, j int) bool {
+		a, b := m.Repos[indices[i]], m.Repos[indices[j]]
+		if (a.OpenPRsCount > 0) != (b.OpenPRsCount > 0) {
+			return a.OpenPRsCount > 0
+		}
+		if a.OpenPRsCount+a.OpenIssuesCount != b.OpenPRsCount+b.OpenIssuesCount {
+			return a.OpenPRsCount+a.OpenIssuesCount > b.OpenPRsCount+b.OpenIssuesCount
+		}
+		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+	})
+	return indices
+}
+func (m Model) concernScreenRepoIndices() []int {
+	indices := m.concernRepoIndices()
+	var unknown []int
+	for i, repo := range m.Repos {
+		if !repo.HasLoadedCounts {
+			unknown = append(unknown, i)
+		}
+	}
+	sort.SliceStable(unknown, func(i, j int) bool {
+		return strings.ToLower(m.Repos[unknown[i]].Name) < strings.ToLower(m.Repos[unknown[j]].Name)
+	})
+	return append(indices, unknown...)
+}
+func (m Model) concernsCoverageWarning() string {
+	if m.ActiveFocus != FocusConcerns {
+		return ""
+	}
+	summary := m.buildRepoCountSummary()
+	unknown := summary.repositories - summary.countsLoaded
+	if unknown <= 0 {
+		return ""
+	}
+	if unknown == 1 {
+		return "! 1 repository has unknown counts and is not ranked"
+	}
+	return fmt.Sprintf("! %d repositories have unknown counts and are not ranked", unknown)
+}
+func (m Model) listHeaderRows() int {
+	if m.concernsCoverageWarning() != "" {
+		return 2
+	}
+	return 0
+}
 func (m Model) selectionKey() string {
 	if m.ActiveFocus == FocusJobs && m.OpenRun != nil {
 		return m.JobCursor
@@ -256,7 +377,7 @@ func (m *Model) selectEntry(e screenEntry) {
 	} else {
 		m.ScreenCursor[m.ActiveFocus] = e.key
 	}
-	if m.ActiveFocus == FocusRepos {
+	if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
 		m.SelectedIndex = e.index
 	}
 	if m.ActiveFocus == FocusRunners {
@@ -268,19 +389,32 @@ func (m *Model) moveSelection(delta int) {
 	if len(es) == 0 {
 		return
 	}
-	m.selectEntry(es[max(0, min(len(es)-1, m.entryIndex(es)+delta))])
+	index := m.entryIndex(es)
+	if m.selectionKey() == "" {
+		index = 0
+		delta = 0
+	}
+	m.selectEntry(es[max(0, min(len(es)-1, index+delta))])
 }
-func (m Model) bodyHeight() int { return max(1, m.Height-7) }
+func (m Model) bodyHeight() int { return max(1, m.Height-5) }
 func (m Model) visibleEntries() (entries []screenEntry, start, selected int) {
 	es := m.entries()
-	selected = m.entryIndex(es)
-	count := max(1, m.bodyHeight()/2)
-	start = max(0, selected-count+1)
+	selected = -1
+	if m.selectionKey() != "" {
+		selected = m.entryIndex(es)
+	}
+	reservedRows := m.listHeaderRows()
+	count := max(1, (m.bodyHeight()-reservedRows)/2)
+	start = max(0, max(selected, 0)-count+1)
 	return es[start:min(len(es), start+count)], start, selected
 }
 func (m Model) detailVisible() bool { return m.Detail || m.OpenJobID != "" }
 func (m Model) screenName() string {
 	switch m.ActiveFocus {
+	case FocusOverview:
+		return "Overview"
+	case FocusConcerns:
+		return "Concerns"
 	case FocusJobs:
 		return "Actions"
 	case FocusRunners:
@@ -299,13 +433,49 @@ func (m Model) contextLine() string {
 	if m.OpenRun != nil {
 		return fmt.Sprintf("Actions / %s / %s · run #%d · attempt %d · %s", m.OpenRun.Repo, m.OpenRun.Workflow, m.OpenRun.Number, m.OpenRun.Attempt, stateBadge(m.OpenRun.Status))
 	}
-	if m.Detail && m.ActiveFocus == FocusRepos && m.SelectedIndex < len(m.Repos) {
-		return "Repositories / " + m.Repos[m.SelectedIndex].Name + "  " + m.renderTabBar() + "  [ ] change tab"
+	if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.SelectedIndex >= 0 && m.SelectedIndex < len(m.Repos) {
+		return m.screenName() + " / " + m.Repos[m.SelectedIndex].Name + "  " + m.renderTabBar() + "  [ ] change tab"
 	}
 	if m.Detail {
 		return "Runners / details"
 	}
 	s := m.screenName()
+	if m.ActiveFocus == FocusOverview {
+		if m.TargetOrg == "" {
+			if m.OrgRefreshFailed {
+				return "Overview · degraded local snapshot"
+			}
+			if m.LocalScanFailed {
+				return "Overview · local workspace · metadata incomplete"
+			}
+			return "Overview · local workspace"
+		}
+		if m.OrgRefreshFailed {
+			return "Overview · degraded organization snapshot"
+		}
+		if m.LocalScanFailed {
+			return "Overview · organization snapshot · local metadata incomplete"
+		}
+		return "Overview · live organization snapshot"
+	}
+	if m.ActiveFocus == FocusConcerns {
+		summary := m.buildRepoCountSummary()
+		known := summary.concernRepos
+		if m.TargetOrg == "" {
+			return "Concerns · GitHub owner not configured"
+		}
+		if summary.countsLoaded < summary.repositories {
+			context := fmt.Sprintf("Concerns · %s · counts loaded for %d/%d repositories", countPhrase(known, "known repository", "known repositories"), summary.countsLoaded, summary.repositories)
+			if summary.countsStale > 0 {
+				context += fmt.Sprintf(" · %d from last successful refresh", summary.countsStale)
+			}
+			return context
+		}
+		if summary.countsStale > 0 {
+			return fmt.Sprintf("Concerns · %d repositories · %d open PRs · %d open issues · last successful counts for %d", known, summary.openPRs, summary.openIssues, summary.countsStale)
+		}
+		return fmt.Sprintf("Concerns · %d repositories · %d open PRs · %d open issues", known, summary.openPRs, summary.openIssues)
+	}
 	if m.ActiveFocus == FocusJobs {
 		running, queued, waiting := 0, 0, 0
 		for _, r := range m.actionRuns() {
@@ -342,13 +512,33 @@ func (m Model) contextLine() string {
 	return s
 }
 func (m Model) listContent() string {
-	es, _, selected := m.visibleEntries()
+	es, start, selected := m.visibleEntries()
+	coverageWarning := m.concernsCoverageWarning()
 	if len(es) == 0 {
 		switch {
 		case m.Search.Value() != "":
+			if coverageWarning != "" {
+				return coverageWarning + "\n\nNo matches. Esc clears the filter."
+			}
 			return "No matches. Esc clears the filter."
 		case m.ActiveFocus == FocusRepos && m.IsOrgSyncing:
 			return m.Spinner.View() + " Loading repositories…"
+		case m.ActiveFocus == FocusConcerns && m.IsOrgSyncing:
+			return m.Spinner.View() + " Loading concern counts…"
+		case m.ActiveFocus == FocusConcerns && m.TargetOrg == "":
+			return "Set a GitHub owner to load open PR and issue counts."
+		case (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.LocalScanUnresponsive:
+			return "Workspace directory is unresponsive. Restore it and press r to retry."
+		case (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.LocalScanStuck:
+			return "Previous local repository scan was abandoned. Press r to retry."
+		case (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.LocalScanInProgress:
+			return "Local repository scan is still running. Automatic refresh will retry after it finishes."
+		case (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.LocalScanFailed:
+			return "Local repository metadata is incomplete. Press r to retry."
+		case m.ActiveFocus == FocusConcerns && coverageWarning != "":
+			return coverageWarning + "\n\nNo known concerns. Press r to retry unavailable counts."
+		case m.ActiveFocus == FocusConcerns:
+			return "No open PRs or issues."
 		case m.ActiveFocus == FocusJobs && (m.IsJobQueueLoading || m.RunLoading):
 			return m.Spinner.View() + " Loading Actions…"
 		case m.ActiveFocus == FocusJobs && m.OpenRun != nil && m.OpenRun.JobsError != "":
@@ -370,7 +560,9 @@ func (m Model) listContent() string {
 		}
 	}
 	var lines []string
-	_, start, _ := m.visibleEntries()
+	if coverageWarning != "" {
+		lines = append(lines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(coverageWarning), "")
+	}
 	for i, e := range es {
 		prefix := "  "
 		title := e.title
@@ -395,6 +587,16 @@ func fitFrame(content string, width, height int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+func insetFrame(content string, width, height int) string {
+	innerWidth := max(0, width-2)
+	lines := strings.Split(fitFrame(content, innerWidth, height), "\n")
+	for i := range lines {
+		lines[i] = " " + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (m Model) screenView() string {
 	if m.Width == 0 {
 		return "Starting freshen…"
@@ -402,22 +604,25 @@ func (m Model) screenView() string {
 	if m.Width < 30 || m.Height < 10 {
 		return fitFrame("freshen\nResize to at least 30 × 10\nq quit", m.Width, m.Height)
 	}
-	header := titleStyle.Render(" freshen ") + "  " + lipgloss.NewStyle().Foreground(colorSecondary).Render(m.TargetOrg)
+	header := " " + titleStyle.Render("freshen")
+	if m.TargetOrg != "" {
+		header += "  " + lipgloss.NewStyle().Foreground(colorMuted).Render(m.TargetOrg)
+	}
 	if m.JobQueueFetchFailed {
 		header += badgeError.Render(" · Actions incomplete")
 	}
 	tabs := ""
-	for i, tab := range []struct {
-		name  string
-		focus FocusType
-	}{{"Repositories", FocusRepos}, {"Actions", FocusJobs}, {"Runners", FocusRunners}} {
+	for _, tab := range screenTabs(m.Width) {
 		style := tabInactiveStyle
 		if tab.focus == m.ActiveFocus {
 			style = tabActiveStyle
 		}
-		tabs += style.Render(fmt.Sprintf("%d %s", i+1, tab.name)) + " "
+		tabs += style.Render(tab.key+" "+tab.name) + " "
 	}
 	body := m.listContent()
+	if m.ActiveFocus == FocusOverview {
+		body = m.summaryContent(max(1, m.Width-2), m.bodyHeight())
+	}
 	if m.detailVisible() {
 		body = m.Viewport.View()
 	}
@@ -426,11 +631,11 @@ func (m Model) screenView() string {
 		body = strings.Join(lines[min(m.HelpOffset, len(lines)-1):], "\n")
 	}
 	if m.MenuOpen || m.PendingAction != "" {
-		body = ansi.Wrap(m.menuContent(), m.Width-4, "")
+		body = ansi.Wrap(m.menuContent(), m.Width-2, "")
 	}
-	box := borderFocusedStyle.Width(m.Width - 2).Height(m.bodyHeight()).Render(fitFrame(body, m.Width-4, m.bodyHeight()))
+	body = insetFrame(body, m.Width, m.bodyHeight())
 	status := m.statusLine()
-	return fitFrame(header+"\n"+tabs+"\n"+m.contextLine()+"\n"+box+"\n"+status+"\n"+m.shortHelp(), m.Width, m.Height)
+	return fitFrame(header+"\n"+tabs+"\n "+m.contextLine()+"\n"+body+"\n "+status+"\n "+m.shortHelp(), m.Width, m.Height)
 }
 func (m Model) statusLine() string {
 	if m.BusyAction != "" {
@@ -438,6 +643,21 @@ func (m Model) statusLine() string {
 	}
 	if m.ToastMsg != "" {
 		return m.ToastMsg + "  (Esc dismiss)"
+	}
+	if m.OrgRefreshFailed && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
+		return "Repository snapshot unavailable · " + m.orgRefreshFailureDetail()
+	}
+	if m.LocalScanUnresponsive && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
+		return "Workspace directory unresponsive · restore it and press r to retry"
+	}
+	if m.LocalScanStuck && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
+		return "Previous local repository scan abandoned · press r to retry"
+	}
+	if m.LocalScanInProgress && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
+		return "Local repository scan still running · automatic refresh will retry after it finishes"
+	}
+	if m.LocalScanFailed && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
+		return "Local repository metadata incomplete · press r to retry"
 	}
 	if m.JobQueueFetchFailed {
 		return "Actions incomplete · " + m.ActionsCoverage
@@ -447,6 +667,18 @@ func (m Model) statusLine() string {
 	}
 	if m.IsSyncing {
 		return m.Spinner.View() + " Synchronising repositories"
+	}
+	if m.ActiveFocus == FocusOverview {
+		if m.TargetOrg == "" {
+			return "Local workspace · set an owner to load Actions and runners"
+		}
+		if m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading {
+			return m.Spinner.View() + " Refreshing organization snapshot"
+		}
+		if !m.LastActionsRefresh.IsZero() {
+			return fmt.Sprintf("Actions updated %s ago · auto-refresh %s", jobs.FormatDuration(time.Since(m.LastActionsRefresh)), jobs.FormatDuration(m.actionsPollInterval()))
+		}
+		return "Live snapshot · repositories 5m · Actions 20s · runners 10s"
 	}
 	if m.detailVisible() {
 		return fmt.Sprintf("%d%% scrolled", int(m.Viewport.ScrollPercent()*100))
@@ -473,6 +705,11 @@ func (m Model) shortHelp() string {
 	} else if m.ShowHelp {
 		add("↑↓ / pgdn", "scroll")
 		add("? / esc", "close help")
+	} else if m.ActiveFocus == FocusOverview {
+		add("tab", "screen")
+		add("1/2/3/4", "jump")
+		add("r", "refresh")
+		add("?", "help")
 	} else {
 		add("tab", "screen")
 		add("↑↓", "move")
@@ -488,7 +725,7 @@ func (m Model) shortHelp() string {
 	return m.Help.ShortHelpView(bindings)
 }
 func (m Model) helpContent() string {
-	return "Navigation\n\n1 Repositories   2 Actions   3 Runners\nTab / Shift+Tab change screen\n↑↓ or j/k move within a list; never change screens\nEnter / → open    Esc / ← back\n/ filter list    Home/End first/last    PgUp/PgDn page\n\nActions\nSpace opens actions for the selected item\nr refreshes the current screen or detail\nv toggles workflow runs / job queue\nf cycles Active / Needs attention / Recent runs\nEnter on a run opens jobs; Enter on a job opens steps and logs\no opens the selected run, job or repository in GitHub\ny copies the selected URL or runner ID\n\nRepository detail\n[ / ] switch Logs / Branches / Issues / PRs\ns sync selected repository    a sync all (confirmation)\nb switch branch    p commit, push and create PR (confirmation)\nX prune branches/worktrees (confirmation)    d delete archived clone\n\n↑↓ scroll details; PgUp/PgDn scroll a page\n? closes help    q quits    Ctrl+C quits everywhere"
+	return "Navigation\n\n0 Overview   1 Repositories   2 Actions   3 Runners   4 Concerns\nTab / Shift+Tab change screen\n↑↓ or j/k move within a list; never change screens\nEnter / → open    Esc / ← back\n/ filter list    Home/End first/last    PgUp/PgDn page\n\nOverview\nr refreshes repository, Actions and runner snapshots\nCounts marked unavailable or incomplete are never treated as zero\n\nConcerns\nRepositories with known open PRs or issues, ordered for review\nEnter opens the existing repository detail; r refreshes counts\n\nActions\nSpace opens actions for the selected item\nr refreshes the current screen or detail\nv toggles workflow runs / job queue\nf cycles Active / Needs attention / Recent runs\nEnter on a run opens jobs; Enter on a job opens steps and logs\no opens the selected run, job or repository in GitHub\ny copies the selected URL or runner ID\n\nRepository detail\n[ / ] switch Logs / Branches / Issues / PRs\ns sync selected repository    a sync all (confirmation)\nb switch branch    p commit, push and create PR (confirmation)\nX prune branches/worktrees (confirmation)    d delete archived clone\n\n↑↓ scroll details; PgUp/PgDn scroll a page\n? closes help    q quits    Ctrl+C quits everywhere"
 }
 func (m Model) jobDetailContent() string {
 	j := m.openJob()

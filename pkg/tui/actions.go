@@ -23,7 +23,7 @@ func (m Model) menuActions() []uiAction {
 	if isWebURL(m.ActionURL) {
 		actions = append(actions, uiAction{"open", "Open in GitHub", "Open this item in your browser", false})
 	}
-	if m.ActiveFocus != FocusRepos || m.ActionTarget == nil {
+	if (m.ActiveFocus != FocusRepos && m.ActiveFocus != FocusConcerns) || m.ActionTarget == nil {
 		return actions
 	}
 	if m.ActionTarget.IsNew {
@@ -37,15 +37,29 @@ func (m Model) menuActions() []uiAction {
 		uiAction{"sync-all", "Sync all repositories", "Run sync across every active repository", true},
 		uiAction{"switch", "Switch branch", "Toggle between the original and default branch", false},
 		uiAction{"push", "Commit, push and create PR", "Commit all changes, push, create a PR and switch to the default branch", true},
-		uiAction{"prune", "Prune branches and worktrees", "Force-remove worktrees and delete non-default local branches. Uncommitted work may be lost.", true})
+		uiAction{"prune", "Prune branches and worktrees", "Remove clean secondary worktrees, prune expired registrations, and delete non-default branches already reachable from a remote. Changed or unavailable worktrees and branches with local-only commits are kept.", true})
 }
 func (m *Model) captureActionTarget() {
-	if !m.detailVisible() {
-		m.moveSelection(0)
-	}
 	m.ActionTarget = nil
-	if m.ActiveFocus == FocusRepos && m.SelectedIndex >= 0 && m.SelectedIndex < len(m.Repos) {
-		m.ActionTarget = m.Repos[m.SelectedIndex].Clone()
+	if !m.detailVisible() && m.OpenRun == nil && m.selectionKey() == "" {
+		m.ActionURL = ""
+		return
+	}
+	if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
+		index := m.SelectedIndex
+		if !m.detailVisible() {
+			entries := m.entries()
+			if len(entries) == 0 {
+				m.ActionURL = ""
+				return
+			}
+			entry := entries[m.entryIndex(entries)]
+			m.selectEntry(entry)
+			index = entry.index
+		}
+		if index >= 0 && index < len(m.Repos) {
+			m.ActionTarget = m.Repos[index].Clone()
+		}
 	}
 	m.ActionURL = m.selectedURL()
 }
@@ -54,10 +68,14 @@ func (m Model) menuContent() string {
 		for _, a := range m.menuActions() {
 			if a.id == m.PendingAction {
 				target := "all active repositories"
+				detail := a.detail
 				if m.ActionTarget != nil && a.id != "sync-all" {
 					target = m.ActionTarget.Name + "\n" + m.ActionTarget.Path
 				}
-				return "Confirm: " + a.label + "\n\n" + target + "\n\n" + a.detail + "\n\nEnter confirms · Esc cancels"
+				if m.ActionTarget != nil && a.id == "prune" {
+					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
+				}
+				return "Confirm: " + a.label + "\n\n" + target + "\n\n" + detail + "\n\nEnter confirms · Esc cancels"
 			}
 		}
 	}
@@ -177,9 +195,33 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		case "push":
 			result.err = git.CommitPushPRAndSwitchDefault(ctx, target)
 		case "prune":
-			var n int
-			n, result.err = git.PruneBranchesAndWorktrees(ctx, target.Path, target.DefaultBranch)
-			target.Logs = append(target.Logs, fmt.Sprintf("Prune removed %d branches; error: %v", n, result.err))
+			var pruned git.PruneResult
+			pruned, result.err = git.PruneBranchesAndWorktrees(ctx, target)
+			for _, path := range pruned.RemovedWorktrees {
+				target.Logs = append(target.Logs, "Removed worktree: "+path)
+			}
+			for _, path := range pruned.PrunedWorktrees {
+				target.Logs = append(target.Logs, "Pruned expired worktree registration: "+path)
+			}
+			for _, path := range pruned.DirtyWorktrees {
+				target.Logs = append(target.Logs, "Kept worktree with local changes: "+path)
+			}
+			for _, path := range pruned.UnavailableWorktrees {
+				target.Logs = append(target.Logs, "Kept registered worktree whose path is unavailable: "+path)
+			}
+			for _, branch := range pruned.ProtectedBranches {
+				target.Logs = append(target.Logs, "Kept branch registered to a worktree: "+branch)
+			}
+			for _, branch := range pruned.UnpushedBranches {
+				target.Logs = append(target.Logs, "Kept branch with local-only commits: "+branch)
+			}
+			for _, branch := range pruned.DeletedBranches {
+				target.Logs = append(target.Logs, "Deleted local branch: "+branch)
+			}
+			for _, failure := range pruned.Failures {
+				target.Logs = append(target.Logs, "Prune step failed: "+failure)
+			}
+			target.Logs = append(target.Logs, fmt.Sprintf("Prune removed %d worktrees, pruned %d stale registrations, and deleted %d branches; error: %v", len(pruned.RemovedWorktrees), len(pruned.PrunedWorktrees), len(pruned.DeletedBranches), result.err))
 		case "delete":
 			result.err = git.DeleteLocalRepo(dir, target.Path)
 		}
@@ -201,6 +243,10 @@ func (m *Model) receiveAction(msg actionResultMsg) {
 		m.setToast(msg.label+" complete", 1)
 	}
 	if msg.id == "delete" && msg.err == nil {
+		if m.RemovedRepoPaths == nil {
+			m.RemovedRepoPaths = make(map[string]uint64)
+		}
+		m.RemovedRepoPaths[msg.path] = m.OrgRefreshGeneration
 		for i, r := range m.Repos {
 			if r.Path == msg.path {
 				m.Repos = append(m.Repos[:i], m.Repos[i+1:]...)
@@ -208,7 +254,11 @@ func (m *Model) receiveAction(msg actionResultMsg) {
 			}
 		}
 		m.TotalCount = len(m.Repos)
-		m.SelectedIndex = max(0, min(m.SelectedIndex, len(m.Repos)-1))
+		if len(m.Repos) == 0 {
+			m.SelectedIndex = -1
+		} else {
+			m.SelectedIndex = max(0, min(m.SelectedIndex, len(m.Repos)-1))
+		}
 		m.Detail = false
 	} else if msg.id != "copy" && msg.id != "open" {
 		m.applyRepoSnapshot(msg.repo)

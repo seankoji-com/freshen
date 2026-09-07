@@ -338,7 +338,7 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 	var orgRepos []git.GHRepoInfo
 	var err error
 	if targetOrg != "" {
-		orgRepos, err = git.FetchOrgRepos(targetOrg)
+		orgRepos, err = git.FetchOrgRepos(ctx, targetOrg)
 	}
 	if err != nil {
 		fmt.Printf("Warning: failed to query GitHub org: %v\n", err)

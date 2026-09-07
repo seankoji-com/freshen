@@ -9,7 +9,8 @@
 ## 🌟 Key Features
 
 - **Concurrent Parallel Syncing**: Syncs 20+ repositories simultaneously in seconds using Go worker pools.
-- **Dedicated screens**: Repositories, Actions and Runners, with searchable lists and details opened on demand.
+- **Organization overview**: Starts with repository, Actions and runner health at a glance, then opens dedicated searchable screens for each area.
+- **Concern queue**: Ranks repositories with open PRs or issues and opens their existing detail view for review.
 - **Explicit repository sync**: Startup loads metadata. Sync or clone only when requested; archived repositories are highlighted.
 - **Alias Mappings**: Hardcoded mapping support for custom repo folder names (e.g. `.github` ➔ `github`, `careynas.net` ➔ `wiki.robot.house`).
 - **GitHub Actions monitoring**: Workflow runs, a separate job queue, completed-job and step counts, runner assignments, and a log tail for the selected job.
@@ -53,7 +54,7 @@ Prebuilt release archives for **macOS (ARM64 / Intel)**, **Linux (ARM64 / x86_64
 ```bash
 git clone https://github.com/seankoji-com/freshen.git
 cd freshen
-go build -o freshen main.go
+go build -o freshen .
 ```
 
 ---
@@ -68,7 +69,7 @@ Launch the TUI interface:
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` | Repositories / Actions / Runners |
+| `0` / `1` / `2` / `3` / `4` | Overview / Repositories / Actions / Runners / Concerns |
 | `Tab` / `Shift+Tab` | Next / previous screen |
 | `↑↓` or `j/k` | Move within a list, or scroll open details |
 | `Enter` / `→` | Open details; Actions opens run → jobs → steps and log tail |
