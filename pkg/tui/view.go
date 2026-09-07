@@ -28,8 +28,8 @@ func (m *Model) updateViewport() {
 	case FocusRunners:
 		m.Viewport.SetContent(m.runnerDetailContent())
 		return
-	case FocusRepos:
-		if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+	case FocusRepos, FocusConcerns:
+		if len(m.Repos) == 0 || m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 			if m.IsOrgSyncing {
 				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching GitHub repositories...", m.Spinner.View()))
 			} else {

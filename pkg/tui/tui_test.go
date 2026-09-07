@@ -341,13 +341,25 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		if !handled {
 			t.Errorf("expected handled=true on error")
 		}
+		if !m.OrgRefreshFailed || !m.LastOrgRefresh.IsZero() {
+			t.Errorf("expected sticky failed state without a successful refresh, failed=%v last=%v", m.OrgRefreshFailed, m.LastOrgRefresh)
+		}
+		if headline := stripped(m.summaryHeadline(m.buildOrgSummary())); !strings.Contains(headline, "known snapshot") || !strings.Contains(headline, "no successful refresh") {
+			t.Errorf("failed repository snapshot looked current: %q", headline)
+		}
 		if m.ToastPriority != 2 || !strings.Contains(m.ToastMsg, "Fetch failed") || !strings.Contains(m.ToastMsg, "gh auth expired") {
 			t.Errorf("expected error toast about the fetch failure, got %q (priority %d)", m.ToastMsg, m.ToastPriority)
+		}
+		m.ToastMsg = ""
+		m.ToastPriority = 0
+		if status := stripped(m.statusLine()); !strings.Contains(status, "Repository snapshot unavailable") {
+			t.Errorf("status omitted sticky repository failure: %q", status)
 		}
 	})
 
 	t.Run("success without autoSync does not trigger a parallel sync", func(t *testing.T) {
 		m := newTestModel("/tmp/test", "test-org")
+		m.OrgRefreshFailed = true
 		cmd, handled := m.handleOrgSyncedMsg(orgSyncedMsg{repos: []*git.RepoItem{{Name: "repo1"}}, autoSync: false})
 
 		if handled {
@@ -358,6 +370,9 @@ func TestHandleOrgSyncedMsg(t *testing.T) {
 		}
 		if m.IsSyncing {
 			t.Errorf("expected IsSyncing to remain false when autoSync is false")
+		}
+		if m.OrgRefreshFailed || m.LastOrgRefresh.IsZero() {
+			t.Errorf("successful refresh did not replace sticky failure state: failed=%v last=%v", m.OrgRefreshFailed, m.LastOrgRefresh)
 		}
 	})
 

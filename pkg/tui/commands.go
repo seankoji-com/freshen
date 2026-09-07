@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -57,7 +58,7 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 		// to avoid blocking the main goroutine (was a main-thread-blocking bug).
 		repoList := repos
 		if len(repoList) == 0 {
-			orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+			orgRepos, err := git.FetchOrgRepos(m.ctx, m.TargetOrg)
 			if err != nil {
 				return loadedJobQueueMsg{err: err}
 			}
@@ -113,35 +114,70 @@ func (m Model) loadLogsIfSelectedJobRunning() tea.Cmd {
 	return nil
 }
 
-func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
+var scanLocalDirectoryContext = git.ScanLocalDirectoryContext
+
+func localRepoBranches(ctx context.Context, path string) (current, defaultBranch string, ok bool) {
+	if ctx.Err() != nil || !git.IsGitRepoContext(ctx, path) {
+		return "", "", false
+	}
+	current = git.GetOriginalBranch(ctx, path)
+	defaultBranch = git.GetDefaultBranchLocal(ctx, path)
+	if ctx.Err() != nil {
+		return "", "", true
+	}
+	if current == "HEAD" {
+		current = ""
+	}
+	if defaultBranch == "HEAD" {
+		defaultBranch = ""
+	}
+	return current, defaultBranch, true
+}
+
+func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git.RepoItem) tea.Cmd {
 	return func() tea.Msg {
 		if m.TargetOrg == "" {
-			entries, err := git.ScanLocalDirectory(m.TargetDir)
+			localCtx, cancel := context.WithTimeout(m.ctx, orgLocalRefreshTimeout)
+			defer cancel()
+			entries, err := scanLocalDirectoryContext(localCtx, m.TargetDir)
 			if err != nil {
-				return orgSyncedMsg{err: err, autoSync: autoSync}
+				return orgSyncedMsg{repos: cloneRepoItems(previous), localErr: err, autoSync: autoSync, generation: generation}
 			}
 			repos := make([]*git.RepoItem, 0, len(entries))
 			for _, name := range entries {
+				if localCtx.Err() != nil {
+					break
+				}
 				path := filepath.Join(m.TargetDir, name)
-				if git.IsGitRepo(path) {
-					repos = append(repos, &git.RepoItem{Name: name, Path: path, CurrentBranch: git.GetOriginalBranch(m.ctx, path), OriginalBranch: git.GetOriginalBranch(m.ctx, path), DefaultBranch: git.GetDefaultBranch(m.ctx, path), Status: git.StatusPending, Logs: []string{}})
+				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
+					repos = append(repos, &git.RepoItem{Name: name, Path: path, CurrentBranch: current, OriginalBranch: current, DefaultBranch: defaultBranch, Status: git.StatusPending, Logs: []string{}})
 				}
 			}
-			return orgSyncedMsg{repos: repos, autoSync: false}
+			if err := localCtx.Err(); err != nil {
+				return orgSyncedMsg{repos: appendMissingRepos(repos, previous), localErr: err, autoSync: autoSync, generation: generation}
+			}
+			return orgSyncedMsg{repos: repos, autoSync: false, generation: generation}
 		}
-		orgRepos, err := git.FetchOrgRepos(m.TargetOrg)
+		remoteCtx, remoteCancel := context.WithTimeout(m.ctx, orgRemoteRefreshBudget)
+		orgRepos, err := git.FetchOrgRepos(remoteCtx, m.TargetOrg)
 		if err != nil {
-			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
+			remoteCancel()
+			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync, generation: generation}
 		}
 
-		orgCounts, countsErr := git.FetchOrgRepoCounts(m.TargetOrg)
+		orgCounts, countsErr := git.FetchOrgRepoCounts(remoteCtx, m.TargetOrg)
+		remoteCancel()
+		countsFetchedAt := time.Now()
 		if countsErr != nil {
-			slog.Debug("org repo counts fetch failed", "org", m.TargetOrg, "error", countsErr)
+			slog.Warn("org repo counts fetch failed", "org", m.TargetOrg, "error", countsErr)
 		}
 
-		entries, err := git.ScanLocalDirectory(m.TargetDir)
-		if err != nil {
-			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync}
+		localCtx, cancel := context.WithTimeout(m.ctx, orgLocalRefreshTimeout)
+		defer cancel()
+		entries, localErr := scanLocalDirectoryContext(localCtx, m.TargetDir)
+		if localErr != nil {
+			slog.Warn("local repository scan incomplete", "path", m.TargetDir, "error", localErr)
+			entries = nil
 		}
 
 		repoMap := make(map[string]*git.RepoItem)
@@ -177,16 +213,17 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 				Logs:       make([]string, 0),
 			}
 
-			if git.IsGitRepo(localPath) {
-				item.CurrentBranch = git.GetOriginalBranch(m.ctx, localPath)
-				item.OriginalBranch = item.CurrentBranch
-				item.DefaultBranch = git.GetDefaultBranch(m.ctx, localPath)
+			if current, defaultBranch, ok := localRepoBranches(localCtx, localPath); ok {
+				item.CurrentBranch = current
+				item.OriginalBranch = current
+				item.DefaultBranch = defaultBranch
 			}
 
 			if counts, found := orgCounts[ghRepo.Name]; found {
 				item.OpenIssuesCount = counts.Issues
 				item.OpenPRsCount = counts.PRs
 				item.HasLoadedCounts = true
+				item.CountsUpdatedAt = countsFetchedAt
 			}
 
 			if ghRepo.IsArchived {
@@ -198,17 +235,20 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 		}
 
 		for _, name := range entries {
+			if localCtx.Err() != nil {
+				break
+			}
 			if _, exists := repoMap[name]; !exists {
 				path := filepath.Join(m.TargetDir, name)
-				if git.IsGitRepo(path) {
+				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
 					item := &git.RepoItem{
 						Name:           name,
 						GHRepoName:     git.GetGHRepoName(name),
 						Path:           path,
 						URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch:  git.GetOriginalBranch(m.ctx, path),
-						DefaultBranch:  git.GetDefaultBranch(m.ctx, path),
-						OriginalBranch: git.GetOriginalBranch(m.ctx, path),
+						CurrentBranch:  current,
+						DefaultBranch:  defaultBranch,
+						OriginalBranch: current,
 						Status:         git.StatusPending,
 						Logs:           make([]string, 0),
 					}
@@ -217,24 +257,74 @@ func (m Model) loadOrgReposCmd(autoSync bool) tea.Cmd {
 						item.OpenIssuesCount = counts.Issues
 						item.OpenPRsCount = counts.PRs
 						item.HasLoadedCounts = true
+						item.CountsUpdatedAt = countsFetchedAt
 					}
 
 					repoMap[name] = item
 				}
 			}
 		}
+		if err := localCtx.Err(); err != nil && localErr == nil {
+			localErr = err
+		}
 
 		result := make([]*git.RepoItem, 0, len(repoMap))
 		for _, item := range repoMap {
 			result = append(result, item)
+		}
+		if localErr != nil {
+			result = appendMissingRepos(result, previous)
 		}
 
 		sort.Slice(result, func(i, j int) bool {
 			return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
 		})
 
-		return orgSyncedMsg{repos: result, err: nil, autoSync: autoSync}
+		return orgSyncedMsg{repos: result, err: nil, countsErr: countsErr, localErr: localErr, autoSync: autoSync, generation: generation}
 	}
+}
+
+func (m *Model) startOrgRefresh(autoSync, notifyCountsErr bool) tea.Cmd {
+	if notifyCountsErr {
+		m.NotifyOrgCountsError = true
+	}
+	now := time.Now()
+	if m.IsOrgSyncing && (m.OrgSyncStartedAt.IsZero() || now.Sub(m.OrgSyncStartedAt) < orgRefreshStuckAfter) {
+		if notifyCountsErr {
+			m.PendingOrgRefresh = true
+			m.setToast("Repository refresh already in progress; another refresh is queued.", 1)
+		}
+		return nil
+	}
+	m.IsOrgSyncing = true
+	m.OrgSyncStartedAt = now
+	m.OrgRefreshGeneration++
+	previous := cloneRepoItems(m.Repos)
+	return m.loadOrgReposCmd(autoSync, m.OrgRefreshGeneration, previous)
+}
+
+func cloneRepoItems(items []*git.RepoItem) []*git.RepoItem {
+	clones := make([]*git.RepoItem, 0, len(items))
+	for _, item := range items {
+		clones = append(clones, item.Clone())
+	}
+	return clones
+}
+
+func appendMissingRepos(items, previous []*git.RepoItem) []*git.RepoItem {
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		seen[item.Path] = true
+	}
+	for _, item := range previous {
+		if !seen[item.Path] {
+			clone := item.Clone()
+			clone.LocalMetadataStale = true
+			clone.CountsStale = clone.HasLoadedCounts
+			items = append(items, clone)
+		}
+	}
+	return items
 }
 
 func (m Model) fetchIssuesCmd(repoName, ghRepoName string) tea.Cmd {
@@ -463,7 +553,7 @@ func (m Model) actionsPollInterval() time.Duration {
 type repoDetailsLoadedMsg struct{ repo *git.RepoItem }
 
 func (m *Model) loadRepoDetails() tea.Cmd {
-	if m.SelectedIndex >= len(m.Repos) || m.RepoDetailLoading != "" {
+	if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) || m.RepoDetailLoading != "" {
 		return nil
 	}
 	repo := m.Repos[m.SelectedIndex].Clone()

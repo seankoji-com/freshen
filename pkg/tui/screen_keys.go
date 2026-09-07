@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
@@ -89,14 +90,18 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 		return cmd
 	case "?":
 		m.ShowHelp = true
+	case "0":
+		m.changeScreen(FocusOverview)
 	case "1":
 		m.changeScreen(FocusRepos)
 	case "2":
 		m.changeScreen(FocusJobs)
 	case "3":
 		m.changeScreen(FocusRunners)
+	case "4":
+		m.changeScreen(FocusConcerns)
 	case "tab", "shift+tab":
-		screens := []FocusType{FocusRepos, FocusJobs, FocusRunners}
+		screens := []FocusType{FocusOverview, FocusRepos, FocusJobs, FocusRunners, FocusConcerns}
 		i := 0
 		for n, f := range screens {
 			if f == m.ActiveFocus {
@@ -104,9 +109,9 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		}
 		if k == "tab" {
-			i = (i + 1) % 3
+			i = (i + 1) % len(screens)
 		} else {
-			i = (i + 2) % 3
+			i = (i + len(screens) - 1) % len(screens)
 		}
 		m.changeScreen(screens[i])
 	case "esc", "left", "h":
@@ -119,6 +124,15 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			m.Search.SetValue("")
 		case m.Detail:
 			m.Detail = false
+			if m.ActiveFocus == FocusConcerns {
+				entries := m.entries()
+				if len(entries) == 0 {
+					m.ScreenCursor[FocusConcerns] = ""
+					m.SelectedIndex = -1
+				} else {
+					m.selectEntry(entries[m.entryIndex(entries)])
+				}
+			}
 		case m.Search.Value() != "":
 			m.Search.SetValue("")
 		default:
@@ -126,7 +140,7 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			m.ToastPriority = 0
 		}
 	case "/":
-		if !m.detailVisible() {
+		if m.ActiveFocus != FocusOverview && !m.detailVisible() {
 			m.Filtering = true
 			return m.Search.Focus()
 		}
@@ -166,7 +180,7 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 	case "enter", "right", "l":
 		return m.openEntry()
 	case "[", "]":
-		if m.Detail && m.ActiveFocus == FocusRepos {
+		if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
 			if k == "]" {
 				m.ActiveTab = (m.ActiveTab + 1) % 4
 			} else {
@@ -189,10 +203,16 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 	case "r":
 		return m.refreshScreen()
 	case " ":
+		if m.ActiveFocus == FocusOverview {
+			return nil
+		}
 		m.captureActionTarget()
 		m.MenuIndex = 0
 		m.MenuOpen = true
 	case "o", "y", "c", "s", "a", "b", "p", "X", "d":
+		if m.ActiveFocus == FocusOverview {
+			return nil
+		}
 		ids := map[string]string{"o": "open", "y": "copy", "c": "copy", "s": "sync", "a": "sync-all", "b": "switch", "p": "push", "X": "prune", "d": "delete"}
 		m.captureActionTarget()
 		return m.requestAction(ids[k])
@@ -216,6 +236,10 @@ func (m *Model) openEntry() tea.Cmd {
 	}
 	es := m.entries()
 	if len(es) == 0 {
+		return nil
+	}
+	if m.selectionKey() == "" {
+		m.selectEntry(es[0])
 		return nil
 	}
 	e := es[m.entryIndex(es)]
@@ -243,6 +267,7 @@ func (m *Model) openEntry() tea.Cmd {
 			if !m.OpenRun.JobsKnown {
 				return m.loadOpenRun()
 			}
+			m.moveSelection(0)
 		} else {
 			m.OpenJobID = e.key
 			m.updateViewport()
@@ -251,7 +276,7 @@ func (m *Model) openEntry() tea.Cmd {
 	default:
 		m.Detail = true
 		m.updateViewport()
-		if m.ActiveFocus == FocusRepos {
+		if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
 			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
 		}
 	}
@@ -259,6 +284,26 @@ func (m *Model) openEntry() tea.Cmd {
 }
 func (m *Model) refreshScreen() tea.Cmd {
 	switch m.ActiveFocus {
+	case FocusOverview:
+		if m.LocalScanUnresponsive {
+			git.ResetLocalDirectoryScanFailures(m.TargetDir)
+			m.LocalScanUnresponsive = false
+		}
+		var cmds []tea.Cmd
+		if refresh := m.startOrgRefresh(false, true); refresh != nil {
+			cmds = append(cmds, refresh)
+		}
+		if m.TargetOrg != "" && !m.IsJobQueueLoading {
+			m.IsJobQueueLoading = true
+			cmds = append(cmds, m.loadJobQueueCmd())
+		}
+		if m.TargetOrg != "" && !m.IsRunnersLoading {
+			m.IsRunnersLoading = true
+			cmds = append(cmds, m.loadRunnersCmd())
+		}
+		if len(cmds) > 0 {
+			return tea.Batch(cmds...)
+		}
 	case FocusJobs:
 		if m.OpenJobID != "" {
 			return tea.Batch(m.loadOpenRun(), m.fetchOpenJobLogs())
@@ -275,14 +320,15 @@ func (m *Model) refreshScreen() tea.Cmd {
 			m.IsRunnersLoading = true
 			return m.loadRunnersCmd()
 		}
-	case FocusRepos:
+	case FocusRepos, FocusConcerns:
 		if m.Detail {
 			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
 		}
-		if !m.IsOrgSyncing {
-			m.IsOrgSyncing = true
-			return m.loadOrgReposCmd(false)
+		if m.LocalScanUnresponsive {
+			git.ResetLocalDirectoryScanFailures(m.TargetDir)
+			m.LocalScanUnresponsive = false
 		}
+		return m.startOrgRefresh(false, true)
 	}
 	return nil
 }
@@ -350,6 +396,9 @@ func (m *Model) receiveRunJobs(msg runJobsLoadedMsg) {
 		queue = append(queue, j)
 	}
 	m.JobQueue = queue
+	if m.JobCursor == "" {
+		m.moveSelection(0)
+	}
 	m.updateViewport()
 }
 func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
@@ -377,11 +426,8 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	if msg.Y == 1 {
 		x := 0
-		for i, tab := range []struct {
-			name  string
-			focus FocusType
-		}{{"Repositories", FocusRepos}, {"Actions", FocusJobs}, {"Runners", FocusRunners}} {
-			w := len(fmt.Sprintf("%d %s", i+1, tab.name)) + 3
+		for _, tab := range screenTabs(m.Width) {
+			w := len(tab.key+" "+tab.name) + 3
 			if msg.X >= x && msg.X < x+w {
 				m.changeScreen(tab.focus)
 				return nil
@@ -389,9 +435,14 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 			x += w
 		}
 	}
-	if !m.detailVisible() && msg.Y >= 4 && msg.Y < 4+m.bodyHeight() && msg.X >= 2 && msg.X < m.Width-2 {
+	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= 3 && msg.Y < 3+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
 		entries, _, _ := m.visibleEntries()
-		i := (msg.Y - 4) / 2
+		bodyRow := msg.Y - 3
+		headerRows := m.listHeaderRows()
+		if bodyRow < headerRows {
+			return nil
+		}
+		i := (bodyRow - headerRows) / 2
 		if i < len(entries) {
 			m.selectEntry(entries[i])
 		}
@@ -414,7 +465,7 @@ func (m Model) selectedURL() string {
 	}
 	e := es[m.entryIndex(es)]
 	switch m.ActiveFocus {
-	case FocusRepos:
+	case FocusRepos, FocusConcerns:
 		r := m.Repos[e.index]
 		repo := r.GHRepoName
 		if repo == "" {

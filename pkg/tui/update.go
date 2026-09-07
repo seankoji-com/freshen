@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/config"
+	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
@@ -131,11 +132,12 @@ func (m *Model) handleLoadedPRsMsg(msg loadedPRsMsg) {
 
 func (m *Model) handleMouseMsg(msg tea.MouseMsg) tea.Cmd { return m.screenMouse(msg) }
 
-func (m Model) handleRepoTickMsg() tea.Cmd {
-	return tea.Batch(
-		m.loadOrgReposCmd(false),
-		repoTickCmd(),
-	)
+func (m *Model) handleRepoTickMsg() tea.Cmd {
+	cmds := []tea.Cmd{repoTickCmd()}
+	if refresh := m.startOrgRefresh(false, false); refresh != nil {
+		cmds = append([]tea.Cmd{refresh}, cmds...)
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
@@ -292,10 +294,23 @@ func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
 }
 
 func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
+	if msg.generation != 0 && msg.generation != m.OrgRefreshGeneration {
+		return nil, true
+	}
 	m.IsOrgSyncing = false
+	m.OrgSyncStartedAt = time.Time{}
+	pendingRefresh := m.PendingOrgRefresh
+	m.PendingOrgRefresh = false
+	notifyCountsErr := m.NotifyOrgCountsError && !pendingRefresh
+	if !pendingRefresh {
+		m.NotifyOrgCountsError = false
+	}
 	if msg.err != nil {
+		m.OrgRefreshFailed = true
 		slog.Error("org repos fetch failed", "org", m.TargetOrg, "error", msg.err)
 		if isUnknownOwnerError(msg.err) {
+			pendingRefresh = false
+			m.NotifyOrgCountsError = false
 			badOwner := m.TargetOrg
 			m.TargetOrg = ""
 			m.IsRunnersLoading = false
@@ -308,7 +323,40 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
 		}
 		m.updateViewport()
+		if pendingRefresh {
+			return m.startOrgRefresh(false, true), true
+		}
+		m.NotifyOrgCountsError = false
 		return tea.Batch(), true
+	}
+	m.OrgRefreshFailed = false
+	m.LastOrgRefresh = time.Now()
+	m.RepoCountsFetchFailed = msg.countsErr != nil
+	m.LocalScanFailed = msg.localErr != nil
+	m.LocalScanInProgress = errors.Is(msg.localErr, git.ErrDirectoryScanInProgress)
+	m.LocalScanStuck = errors.Is(msg.localErr, git.ErrDirectoryScanStuck)
+	m.LocalScanUnresponsive = errors.Is(msg.localErr, git.ErrDirectoryScanUnresponsive)
+	if notifyCountsErr {
+		switch {
+		case m.LocalScanUnresponsive && msg.countsErr != nil:
+			m.setToast("Review counts are incomplete and the workspace directory is unresponsive; keeping last-known data. Restore the directory and press r to retry.", 2)
+		case m.LocalScanUnresponsive:
+			m.setToast("The workspace directory is unresponsive; keeping last-known data. Restore the directory and press r to retry.", 2)
+		case m.LocalScanStuck && msg.countsErr != nil:
+			m.setToast("Review counts are incomplete and the previous local repository scan was abandoned; keeping last-known data. Press r to retry.", 2)
+		case m.LocalScanStuck:
+			m.setToast("The previous local repository scan was abandoned after it stopped responding; keeping last-known data. Press r to retry.", 2)
+		case m.LocalScanInProgress && msg.countsErr != nil:
+			m.setToast("Review counts are incomplete and the local repository scan is still running; keeping last-known data. Try again after it finishes.", 1)
+		case m.LocalScanInProgress:
+			m.setToast("Local repository scan is still running; keeping last-known data. Try again after it finishes.", 1)
+		case msg.countsErr != nil && msg.localErr != nil:
+			m.setToast("Review counts and local metadata are incomplete; keeping last known data where available. Press r to retry.", 1)
+		case msg.countsErr != nil:
+			m.setToast("Review counts refresh failed; keeping last known counts where available. Press r to retry.", 1)
+		case msg.localErr != nil:
+			m.setToast("Local repository metadata is incomplete; keeping last known data where available. Press r to retry.", 1)
+		}
 	}
 	if len(m.Repos) > 0 && len(msg.repos) > 0 {
 		oldRepoBranches := make(map[string]string)
@@ -321,11 +369,57 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			}
 		}
 	}
+	countsNow := time.Now()
+	filteredRepos := msg.repos[:0]
+	for _, fresh := range msg.repos {
+		if removedAt, removed := m.RemovedRepoPaths[fresh.Path]; removed {
+			if msg.generation == 0 || msg.generation <= removedAt || msg.localErr != nil {
+				continue
+			}
+			delete(m.RemovedRepoPaths, fresh.Path)
+		}
+		if fresh.LocalMetadataStale && fresh.HasLoadedCounts && (fresh.CountsUpdatedAt.IsZero() || countsNow.Sub(fresh.CountsUpdatedAt) > repoCountsStaleTTL) {
+			fresh.OpenIssuesCount = 0
+			fresh.OpenPRsCount = 0
+			fresh.HasLoadedCounts = false
+			fresh.CountsStale = false
+			fresh.CountsUpdatedAt = time.Time{}
+		}
+		filteredRepos = append(filteredRepos, fresh)
+	}
+	msg.repos = filteredRepos
 	for _, fresh := range msg.repos {
 		for _, old := range m.Repos {
 			if fresh.Path == old.Path {
 				fresh.Logs = old.Logs
 				fresh.OriginalBranch = old.OriginalBranch
+				if msg.localErr != nil && !fresh.IsNew {
+					if fresh.CurrentBranch == "" {
+						fresh.CurrentBranch = old.CurrentBranch
+					}
+					if fresh.DefaultBranch == "" {
+						fresh.DefaultBranch = old.DefaultBranch
+					}
+					fresh.HasUnstagedChanges = old.HasUnstagedChanges
+					if fresh.Status == git.StatusPending && old.Status != git.StatusArchived {
+						fresh.Status = old.Status
+						fresh.StatusMsg = old.StatusMsg
+						fresh.ErrorErr = old.ErrorErr
+					}
+				}
+				if !fresh.HasLoadedCounts && old.HasLoadedCounts && !fresh.LocalMetadataStale {
+					updatedAt := old.CountsUpdatedAt
+					if updatedAt.IsZero() {
+						updatedAt = countsNow
+					}
+					if countsNow.Sub(updatedAt) <= repoCountsStaleTTL {
+						fresh.OpenIssuesCount = old.OpenIssuesCount
+						fresh.OpenPRsCount = old.OpenPRsCount
+						fresh.HasLoadedCounts = true
+						fresh.CountsStale = true
+						fresh.CountsUpdatedAt = updatedAt
+					}
+				}
 				if fresh.CurrentBranch == old.CurrentBranch {
 					fresh.BranchDetails = old.BranchDetails
 				}
@@ -338,18 +432,38 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 		return strings.ToLower(m.Repos[i].Name) < strings.ToLower(m.Repos[j].Name)
 	})
 	m.TotalCount = len(m.Repos)
-	if selected := m.ScreenCursor[FocusRepos]; selected != "" {
-		found := false
-		for i, r := range m.Repos {
-			if r.Path+"/"+r.Name == selected {
-				m.SelectedIndex = i
-				found = true
-				break
+	repoKeys := make(map[string]int, len(m.Repos))
+	concernKeys := make(map[string]int)
+	for i, repo := range m.Repos {
+		repoKeys[repo.Path+"/"+repo.Name] = i
+	}
+	for _, i := range m.concernScreenRepoIndices() {
+		repo := m.Repos[i]
+		concernKeys[repo.Path+"/"+repo.Name] = i
+	}
+	for _, focus := range []FocusType{FocusRepos, FocusConcerns} {
+		selected := m.ScreenCursor[focus]
+		if selected == "" {
+			continue
+		}
+		keys := repoKeys
+		if focus == FocusConcerns {
+			keys = concernKeys
+			if m.ActiveFocus == FocusConcerns && m.Detail {
+				if index, found := repoKeys[selected]; found {
+					m.SelectedIndex = index
+					continue
+				}
 			}
 		}
-		if !found {
-			m.SelectedIndex = 0
-			if m.ActiveFocus == FocusRepos {
+		if index, found := keys[selected]; found {
+			if m.ActiveFocus == focus {
+				m.SelectedIndex = index
+			}
+		} else {
+			m.ScreenCursor[focus] = ""
+			if m.ActiveFocus == focus {
+				m.SelectedIndex = -1
 				m.Detail = false
 			}
 		}
@@ -365,6 +479,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 		// auto-rebase it. [a] Sync All and [r] Sync are explicit commands
 		// and keep the full behavior (see startSyncCmd call sites above).
 		cmd = m.startSyncCmd(m.Repos, true, true)
+	}
+	if pendingRefresh {
+		cmd = tea.Batch(cmd, m.startOrgRefresh(false, true))
 	}
 	m.updateViewport()
 	return cmd, false
@@ -395,8 +512,8 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Width = msg.Width
 	m.Height = msg.Height
 
-	m.Viewport.Width = max(2, msg.Width-6)
-	m.Viewport.Height = max(1, msg.Height-7)
+	m.Viewport.Width = max(2, msg.Width-2)
+	m.Viewport.Height = max(1, msg.Height-5)
 	m.Search.Width = max(1, msg.Width-6)
 	m.Help.Width = max(1, msg.Width)
 
@@ -535,7 +652,7 @@ func (m Model) triggerLogFetchForSelectedJob() tea.Cmd {
 }
 
 func (m *Model) triggerTabFetch() tea.Cmd {
-	if len(m.Repos) == 0 || m.SelectedIndex >= len(m.Repos) {
+	if len(m.Repos) == 0 || m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 		return nil
 	}
 	item := m.Repos[m.SelectedIndex]

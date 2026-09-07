@@ -4,7 +4,7 @@ Audited on 7 September 2026 against `f779f11`.
 
 | Finding | Implemented change |
 |---|---|
-| Up/down crosses panel boundaries, left/right changes meaning, keys also scroll the viewport | Three dedicated screens; one owner for input; Enter opens and Esc returns |
+| Up/down crosses panel boundaries, left/right changes meaning, keys also scroll the viewport | One overview and four dedicated screens; one owner for input; Enter opens and Esc returns |
 | Repositories, runners, queue and details compete for half-screen areas | Full-height lists and separate detail screens; search and page navigation |
 | PR/branch headers, run headers and jobs share one cursor | Run identity is explicit; Actions opens runs, then jobs, then steps/logs; `v` opens the cross-repository job queue |
 | Passed/skipped jobs are discarded; elapsed run averages imply job progress | Retain terminal results; bars count observed completed jobs/steps; elapsed duration is separate |

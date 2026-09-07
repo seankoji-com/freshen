@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeRunner is a test double for CommandRunner. fn receives the command
@@ -21,6 +22,14 @@ type fakeRunner struct {
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
 	return f.fn(name, args)
+}
+
+type contextFakeRunner struct {
+	fn func(ctx context.Context, name string, args []string) ([]byte, error)
+}
+
+func (f *contextFakeRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return f.fn(ctx, name, args)
 }
 
 // withFakeRunner installs a fakeRunner as the package runner for the
@@ -86,7 +95,7 @@ func TestFetchOrgRepos(t *testing.T) {
 			return body, nil
 		})
 
-		got, err := FetchOrgRepos("myorg")
+		got, err := FetchOrgRepos(context.Background(), "myorg")
 		if err != nil {
 			t.Fatalf("FetchOrgRepos() error = %v", err)
 		}
@@ -100,7 +109,7 @@ func TestFetchOrgRepos(t *testing.T) {
 			return nil, errors.New("exit status 1: gh: command not found")
 		})
 
-		_, err := FetchOrgRepos("myorg")
+		_, err := FetchOrgRepos(context.Background(), "myorg")
 		if err == nil {
 			t.Fatal("FetchOrgRepos() error = nil, want an error")
 		}
@@ -114,12 +123,27 @@ func TestFetchOrgRepos(t *testing.T) {
 			return []byte("not json"), nil
 		})
 
-		_, err := FetchOrgRepos("myorg")
+		_, err := FetchOrgRepos(context.Background(), "myorg")
 		if err == nil {
 			t.Fatal("FetchOrgRepos() error = nil, want a JSON parse error")
 		}
 		if !strings.Contains(err.Error(), "failed to parse gh JSON output") {
 			t.Errorf("FetchOrgRepos() error = %q, want a JSON parse error", err.Error())
+		}
+	})
+
+	t.Run("honors caller cancellation", func(t *testing.T) {
+		orig := runner
+		runner = &contextFakeRunner{fn: func(ctx context.Context, _ string, _ []string) ([]byte, error) {
+			return nil, ctx.Err()
+		}}
+		t.Cleanup(func() { runner = orig })
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := FetchOrgRepos(ctx, "myorg")
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("FetchOrgRepos() error = %v, want cancellation", err)
 		}
 	})
 }
@@ -151,7 +175,7 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 			return []byte(fixture), nil
 		})
 
-		got, err := FetchOrgRepoCounts("myorg")
+		got, err := FetchOrgRepoCounts(context.Background(), "myorg")
 		if err != nil {
 			t.Fatalf("FetchOrgRepoCounts() error = %v", err)
 		}
@@ -164,12 +188,115 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 		}
 	})
 
+	t.Run("paginates", func(t *testing.T) {
+		calls := 0
+		withFakeRunner(t, func(name string, args []string) ([]byte, error) {
+			calls++
+			if name != "gh" || len(args) < 2 || args[0] != "api" || args[1] != "graphql" {
+				t.Fatalf("unexpected command: %s %v", name, args)
+			}
+			cursor := ""
+			for _, arg := range args {
+				if strings.HasPrefix(arg, "endCursor=") {
+					cursor = strings.TrimPrefix(arg, "endCursor=")
+				}
+			}
+			switch calls {
+			case 1:
+				if cursor != "" {
+					t.Fatalf("first page sent cursor %q", cursor)
+				}
+				return []byte(`{"data":{"repositoryOwner":{"repositories":{"nodes":[{"name":"alpha","issues":{"totalCount":1},"pullRequests":{"totalCount":2}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`), nil
+			case 2:
+				if cursor != "cursor-1" {
+					t.Fatalf("second page sent cursor %q", cursor)
+				}
+				return []byte(`{"data":{"repositoryOwner":{"repositories":{"nodes":[{"name":"beta","issues":{"totalCount":3},"pullRequests":{"totalCount":4}}],"pageInfo":{"hasNextPage":false,"endCursor":"cursor-2"}}}}}`), nil
+			default:
+				t.Fatalf("unexpected page %d", calls)
+				return nil, nil
+			}
+		})
+
+		got, err := FetchOrgRepoCounts(context.Background(), "myorg")
+		if err != nil {
+			t.Fatalf("FetchOrgRepoCounts() error = %v", err)
+		}
+		want := map[string]RepoCounts{
+			"alpha": {Issues: 1, PRs: 2},
+			"beta":  {Issues: 3, PRs: 4},
+		}
+		if calls != 2 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("FetchOrgRepoCounts() calls = %d, result = %+v, want %+v", calls, got, want)
+		}
+	})
+
+	t.Run("returns completed pages when a later page fails", func(t *testing.T) {
+		calls := 0
+		withFakeRunner(t, func(_ string, _ []string) ([]byte, error) {
+			calls++
+			if calls == 1 {
+				return []byte(`{"data":{"repositoryOwner":{"repositories":{"nodes":[{"name":"alpha","issues":{"totalCount":1},"pullRequests":{"totalCount":2}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`), nil
+			}
+			return nil, errors.New("context deadline exceeded")
+		})
+
+		got, err := FetchOrgRepoCounts(context.Background(), "myorg")
+		if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Fatalf("FetchOrgRepoCounts() error = %v, want page failure", err)
+		}
+		want := map[string]RepoCounts{"alpha": {Issues: 1, PRs: 2}}
+		if calls != 2 || !reflect.DeepEqual(got, want) {
+			t.Fatalf("FetchOrgRepoCounts() calls = %d, partial result = %+v, want %+v", calls, got, want)
+		}
+	})
+
+	t.Run("rejects null owner", func(t *testing.T) {
+		withFakeRunner(t, func(_ string, _ []string) ([]byte, error) {
+			return []byte(`{"data":{"repositoryOwner":null}}`), nil
+		})
+
+		got, err := FetchOrgRepoCounts(context.Background(), "myorg")
+		if err == nil || !strings.Contains(err.Error(), "no repository owner") {
+			t.Fatalf("FetchOrgRepoCounts() = %+v, %v, want owner error", got, err)
+		}
+	})
+
+	t.Run("rejects empty intermediate page", func(t *testing.T) {
+		withFakeRunner(t, func(_ string, _ []string) ([]byte, error) {
+			return []byte(`{"data":{"repositoryOwner":{"repositories":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`), nil
+		})
+
+		_, err := FetchOrgRepoCounts(context.Background(), "myorg")
+		if err == nil || !strings.Contains(err.Error(), "empty repository page") {
+			t.Fatalf("FetchOrgRepoCounts() error = %v, want empty-page error", err)
+		}
+	})
+
+	t.Run("honors caller cancellation", func(t *testing.T) {
+		orig := runner
+		runner = &contextFakeRunner{fn: func(ctx context.Context, _ string, _ []string) ([]byte, error) {
+			if !errors.Is(ctx.Err(), context.Canceled) {
+				t.Fatalf("runner context error = %v, want canceled", ctx.Err())
+			}
+			return nil, ctx.Err()
+		}}
+		t.Cleanup(func() { runner = orig })
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := FetchOrgRepoCounts(ctx, "myorg")
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("FetchOrgRepoCounts() error = %v, want cancellation", err)
+		}
+	})
+
 	t.Run("runner error", func(t *testing.T) {
 		withFakeRunner(t, func(name string, args []string) ([]byte, error) {
 			return nil, errors.New("exit status 1: bad credentials")
 		})
 
-		_, err := FetchOrgRepoCounts("myorg")
+		_, err := FetchOrgRepoCounts(context.Background(), "myorg")
 		if err == nil {
 			t.Fatal("FetchOrgRepoCounts() error = nil, want an error")
 		}
@@ -183,7 +310,7 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 			return []byte("not json"), nil
 		})
 
-		_, err := FetchOrgRepoCounts("myorg")
+		_, err := FetchOrgRepoCounts(context.Background(), "myorg")
 		if err == nil {
 			t.Fatal("FetchOrgRepoCounts() error = nil, want a JSON parse error")
 		}
@@ -319,6 +446,21 @@ func TestGetDefaultBranch(t *testing.T) {
 		}
 	})
 
+	t.Run("local lookup skips gh repo view", func(t *testing.T) {
+		withScriptedRunner(t, map[string]cmdResponse{
+			symbolicRefKey: {err: errors.New("fatal: not a symbolic ref")},
+			showRefMainKey: {},
+		})
+		withFakeGHDefaultBranch(t, func(string) (string, error) {
+			t.Fatal("GetDefaultBranchLocal called the networked gh fallback")
+			return "", nil
+		})
+
+		if got := GetDefaultBranchLocal(context.Background(), path); got != "main" {
+			t.Errorf("GetDefaultBranchLocal() = %q, want %q", got, "main")
+		}
+	})
+
 	t.Run("falls back to show-ref main", func(t *testing.T) {
 		withScriptedRunner(t, map[string]cmdResponse{
 			symbolicRefKey:   {err: errors.New("fatal: not a symbolic ref")},
@@ -374,6 +516,600 @@ func TestGetDefaultBranch(t *testing.T) {
 			t.Errorf("GetDefaultBranch() = %q, want %q", got, "HEAD")
 		}
 	})
+}
+
+func TestResolveDefaultBranchValidatesGitHubValue(t *testing.T) {
+	const path = "/repo"
+
+	t.Run("verified", func(t *testing.T) {
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "develop\n", nil })
+
+		branch, err := ResolveDefaultBranch(context.Background(), path)
+		if err != nil || branch != "develop" {
+			t.Fatalf("ResolveDefaultBranch() = %q, %v", branch, err)
+		}
+	})
+
+	t.Run("rejects HEAD sentinel", func(t *testing.T) {
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "HEAD", nil })
+		withFakeRunner(t, func(name string, args []string) ([]byte, error) {
+			t.Fatalf("invalid branch reached local validation: %s", cmdKey(name, args))
+			return nil, nil
+		})
+
+		if _, err := ResolveDefaultBranch(context.Background(), path); err == nil {
+			t.Fatal("ResolveDefaultBranch accepted HEAD")
+		}
+	})
+
+	t.Run("does not confuse a missing local branch with GitHub resolution", func(t *testing.T) {
+		withFakeGHDefaultBranch(t, func(string) (string, error) { return "develop", nil })
+
+		if branch, err := ResolveDefaultBranch(context.Background(), path); err != nil || branch != "develop" {
+			t.Fatalf("ResolveDefaultBranch() = %q, %v", branch, err)
+		}
+	})
+}
+
+func TestGHDefaultBranchUsesUpstreamWhenOriginIsAbsent(t *testing.T) {
+	const path = "/repo"
+	withScriptedRunner(t, map[string]cmdResponse{
+		cmdKey("git", []string{"-C", path, "remote"}):                                                                        {out: []byte("upstream\n")},
+		cmdKey("git", []string{"-C", path, "remote", "get-url", "upstream"}):                                                 {out: []byte("git@github.com:owner/repo.git\n")},
+		cmdKey("gh", []string{"repo", "view", "owner/repo", "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"}): {out: []byte("develop\n")},
+	})
+
+	branch, err := ghDefaultBranch(context.Background(), path)
+	if err != nil || strings.TrimSpace(branch) != "develop" {
+		t.Fatalf("ghDefaultBranch() = %q, %v", branch, err)
+	}
+}
+
+func TestEnsureLocalDefaultBranchFetchesMissingRef(t *testing.T) {
+	const path = "/repo"
+	calls := 0
+	withFakeRunner(t, func(name string, args []string) ([]byte, error) {
+		calls++
+		switch calls {
+		case 1:
+			return nil, errors.New("missing ref")
+		case 2:
+			if got := cmdKey(name, args); got != "git -C /repo fetch origin develop:refs/heads/develop" {
+				t.Fatalf("unexpected fetch: %s", got)
+			}
+			return nil, nil
+		case 3:
+			return nil, nil
+		default:
+			t.Fatalf("unexpected command %d: %s", calls, cmdKey(name, args))
+			return nil, nil
+		}
+	})
+
+	if err := ensureLocalDefaultBranch(context.Background(), path, "develop"); err != nil || calls != 3 {
+		t.Fatalf("ensureLocalDefaultBranch() = %v, calls=%d", err, calls)
+	}
+}
+
+func TestGitHubRepoTargetAcceptsGitHubRemoteURLs(t *testing.T) {
+	tests := map[string]string{
+		"git@github.com:owner/repo.git":        "owner/repo",
+		"https://github.com/owner/repo.git":    "owner/repo",
+		"ssh://git@ghe.example/owner/repo.git": "ghe.example/owner/repo",
+		"https://ghe.example/owner/repo.git":   "ghe.example/owner/repo",
+	}
+	for remote, want := range tests {
+		got, err := githubRepoTarget(remote)
+		if err != nil || got != want {
+			t.Errorf("githubRepoTarget(%q) = %q, %v; want %q", remote, got, err, want)
+		}
+	}
+	if _, err := githubRepoTarget("/local/repo"); err == nil {
+		t.Fatal("githubRepoTarget accepted a local path")
+	}
+	if _, err := githubRepoTarget("owner/repo"); err == nil {
+		t.Fatal("githubRepoTarget accepted a relative filesystem remote as a GitHub slug")
+	}
+}
+
+func TestResolveDefaultBranchHonoursCallerDeadline(t *testing.T) {
+	original := ghDefaultBranch
+	ghDefaultBranch = func(ctx context.Context, _ string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	t.Cleanup(func() { ghDefaultBranch = original })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	_, err := ResolveDefaultBranch(ctx, "/repo")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ResolveDefaultBranch() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("ResolveDefaultBranch ignored its deadline for %v", elapsed)
+	}
+}
+
+func TestPruneRejectsDefaultBranchMismatchBeforeMutation(t *testing.T) {
+	const path = "/repo"
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+	withScriptedRunner(t, map[string]cmdResponse{
+		cmdKey("git", []string{"-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"}): {},
+	})
+	item := &RepoItem{Name: "repo", Path: path, DefaultBranch: "master", CurrentBranch: "feature"}
+
+	_, err := PruneBranchesAndWorktrees(context.Background(), item)
+	if err == nil || !strings.Contains(err.Error(), `changed from "master" to "main"`) {
+		t.Fatalf("prune mismatch error = %v", err)
+	}
+}
+
+func registeredWorktreePath(t *testing.T, repo, branch string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", repo, "worktree", "list", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list worktrees: %v\n%s", err, out)
+	}
+	var path string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			path = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		}
+		if strings.TrimSpace(line) == "branch refs/heads/"+branch {
+			return path
+		}
+	}
+	t.Fatalf("worktree for branch %q not found in:\n%s", branch, out)
+	return ""
+}
+
+func TestPruneRefusesDirtySecondaryWorktreeBeforeRemoval(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	dirtyFile := filepath.Join(worktree, "dirty.txt")
+	if err := os.WriteFile(dirtyFile, []byte("do not delete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canonicalWorktree := registeredWorktreePath(t, repo, "feature")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("dirty-worktree prune failed instead of skipping changed worktree: %v", err)
+	}
+	if !reflect.DeepEqual(result.DirtyWorktrees, []string{canonicalWorktree}) || !reflect.DeepEqual(result.ProtectedBranches, []string{"feature"}) || len(result.RemovedWorktrees) != 0 || len(result.DeletedBranches) != 0 {
+		t.Fatalf("dirty-worktree prune did not skip and protect its branch: %+v", result)
+	}
+	if _, err := os.Stat(dirtyFile); err != nil {
+		t.Fatalf("dirty worktree was removed: %v", err)
+	}
+}
+
+func TestPruneRemovesWorktreeContainingOnlyIgnoredFiles(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("dist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", ".gitignore")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	if err := os.MkdirAll(filepath.Join(worktree, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "dist", "bundle.js"), []byte("ignored\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canonicalWorktree := registeredWorktreePath(t, repo, "feature")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("ignored-only worktree prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.RemovedWorktrees, []string{canonicalWorktree}) || !reflect.DeepEqual(result.DeletedBranches, []string{"feature"}) || len(result.DirtyWorktrees) != 0 {
+		t.Fatalf("ignored-only worktree was not removed: %+v", result)
+	}
+}
+
+func TestPruneSkipsDirtyWorktreeAndContinuesWithCleanWorktree(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "clean")
+	run("-C", repo, "branch", "dirty")
+	worktreeRoot := t.TempDir()
+	cleanWorktree := filepath.Join(worktreeRoot, "clean")
+	dirtyWorktree := filepath.Join(worktreeRoot, "dirty")
+	run("-C", repo, "worktree", "add", cleanWorktree, "clean")
+	run("-C", repo, "worktree", "add", dirtyWorktree, "dirty")
+	if err := os.WriteFile(filepath.Join(dirtyWorktree, "keep.txt"), []byte("do not delete\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canonicalClean := registeredWorktreePath(t, repo, "clean")
+	canonicalDirty := registeredWorktreePath(t, repo, "dirty")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("mixed-worktree prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.DirtyWorktrees, []string{canonicalDirty}) || !reflect.DeepEqual(result.RemovedWorktrees, []string{canonicalClean}) || !reflect.DeepEqual(result.ProtectedBranches, []string{"dirty"}) || !reflect.DeepEqual(result.DeletedBranches, []string{"clean"}) {
+		t.Fatalf("mixed-worktree prune audit is incomplete: %+v", result)
+	}
+	if _, err := os.Stat(cleanWorktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean worktree still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dirtyWorktree, "keep.txt")); err != nil {
+		t.Fatalf("dirty worktree was damaged: %v", err)
+	}
+}
+
+func TestPruneReportsRemovedCleanWorktreeAndBranch(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	canonicalWorktree := registeredWorktreePath(t, repo, "feature")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("clean prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.RemovedWorktrees, []string{canonicalWorktree}) || len(result.DirtyWorktrees) != 0 || !reflect.DeepEqual(result.DeletedBranches, []string{"feature"}) {
+		t.Fatalf("clean prune audit is incomplete: %+v", result)
+	}
+	if _, err := os.Stat(worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean worktree still exists: %v", err)
+	}
+}
+
+func TestPruneProtectsTemporarilyUnavailableWorktreeBranch(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	canonicalWorktree := registeredWorktreePath(t, repo, "feature")
+	movedWorktree := worktree + "-temporarily-unavailable"
+	if err := os.Rename(worktree, movedWorktree); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Rename(movedWorktree, worktree) })
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("unavailable-worktree prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.UnavailableWorktrees, []string{canonicalWorktree}) || !reflect.DeepEqual(result.ProtectedBranches, []string{"feature"}) || len(result.DeletedBranches) != 0 {
+		t.Fatalf("unavailable worktree branch was not protected: %+v", result)
+	}
+	if _, err := os.Stat(movedWorktree); err != nil {
+		t.Fatalf("temporarily unavailable worktree was damaged: %v", err)
+	}
+}
+
+func TestPruneRemovesExpiredWorktreeRegistration(t *testing.T) {
+	originalPruneExpire := worktreePruneExpire
+	worktreePruneExpire = "now"
+	t.Cleanup(func() { worktreePruneExpire = originalPruneExpire })
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	canonicalWorktree := registeredWorktreePath(t, repo, "feature")
+	if err := os.RemoveAll(worktree); err != nil {
+		t.Fatal(err)
+	}
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("expired-worktree prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.PrunedWorktrees, []string{canonicalWorktree}) || !reflect.DeepEqual(result.DeletedBranches, []string{"feature"}) || len(result.UnavailableWorktrees) != 0 {
+		t.Fatalf("expired registration was not pruned: %+v", result)
+	}
+}
+
+func TestPruneKeepsCleanBranchWithLocalOnlyCommits(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+	run("-C", repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+	run("-C", repo, "branch", "feature")
+	worktree := filepath.Join(t.TempDir(), "feature")
+	run("-C", repo, "worktree", "add", worktree, "feature")
+	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("local-only commit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", worktree, "add", "feature.txt")
+	run("-C", worktree, "commit", "-m", "local-only")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+
+	result, err := PruneBranchesAndWorktrees(context.Background(), &RepoItem{Name: "repo", Path: repo, DefaultBranch: "main"})
+	if err != nil {
+		t.Fatalf("unpushed-branch prune failed: %v", err)
+	}
+	if !reflect.DeepEqual(result.UnpushedBranches, []string{"feature"}) || len(result.DeletedBranches) != 0 || len(result.RemovedWorktrees) != 1 {
+		t.Fatalf("local-only branch was not retained: %+v", result)
+	}
+	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "refs/heads/feature").CombinedOutput(); err != nil {
+		t.Fatalf("local-only branch was deleted: %v\n%s", err, out)
+	}
+}
+
+func TestDestructiveActionsRejectUnverifiedDefaultBeforeMutation(t *testing.T) {
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "HEAD", nil })
+	withFakeRunner(t, func(name string, args []string) ([]byte, error) {
+		t.Fatalf("unverified default branch reached git mutation: %s", cmdKey(name, args))
+		return nil, nil
+	})
+
+	item := &RepoItem{Name: "repo", Path: "/repo", OriginalBranch: "feature", DefaultBranch: "HEAD"}
+	if _, err := PruneBranchesAndWorktrees(context.Background(), item); err == nil {
+		t.Fatal("prune accepted an unverified default branch")
+	}
+	if err := CommitPushPRAndSwitchDefault(context.Background(), item); err == nil {
+		t.Fatal("push accepted an unverified default branch")
+	}
+	if len(item.Logs) != 0 {
+		t.Fatalf("rejected operations mutated logs: %v", item.Logs)
+	}
+}
+
+func TestCommitPushRejectsDefaultBranchDriftBeforeMutation(t *testing.T) {
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+	withFakeRunner(t, func(name string, args []string) ([]byte, error) {
+		t.Fatalf("default-branch drift reached mutation: %s", cmdKey(name, args))
+		return nil, nil
+	})
+
+	item := &RepoItem{Name: "repo", Path: "/repo", OriginalBranch: "feature", DefaultBranch: "master"}
+	err := CommitPushPRAndSwitchDefault(context.Background(), item)
+	if err == nil || !strings.Contains(err.Error(), `changed from "master" to "main"`) {
+		t.Fatalf("push drift error = %v", err)
+	}
+	if len(item.Logs) != 0 {
+		t.Fatalf("rejected publishing mutated logs: %v", item.Logs)
+	}
+}
+
+func TestScanLocalDirectoryContextDoesNotJoinBlockedScan(t *testing.T) {
+	const targetDir = "/blocked/local-scan"
+	directoryScans.Lock()
+	directoryScans.active[targetDir] = &directoryScan{done: make(chan struct{}), started: time.Now()}
+	directoryScans.Unlock()
+	t.Cleanup(func() {
+		directoryScans.Lock()
+		delete(directoryScans.active, targetDir)
+		delete(directoryScans.abandoned, targetDir)
+		directoryScans.Unlock()
+	})
+
+	started := time.Now()
+	_, err := ScanLocalDirectoryContext(context.Background(), targetDir)
+	if !errors.Is(err, ErrDirectoryScanInProgress) {
+		t.Fatalf("ScanLocalDirectoryContext() error = %v, want ErrDirectoryScanInProgress", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("blocked scan retry waited %v instead of returning immediately", elapsed)
+	}
+}
+
+func TestScanLocalDirectoryContextEscalatesStuckScan(t *testing.T) {
+	const targetDir = "/stuck/local-scan"
+	directoryScans.Lock()
+	directoryScans.active[targetDir] = &directoryScan{done: make(chan struct{}), started: time.Now().Add(-directoryScanStuckAfter - time.Second)}
+	directoryScans.Unlock()
+	t.Cleanup(func() {
+		directoryScans.Lock()
+		delete(directoryScans.active, targetDir)
+		delete(directoryScans.abandoned, targetDir)
+		directoryScans.Unlock()
+	})
+
+	_, err := ScanLocalDirectoryContext(context.Background(), targetDir)
+	if !errors.Is(err, ErrDirectoryScanStuck) {
+		t.Fatalf("ScanLocalDirectoryContext() error = %v, want ErrDirectoryScanStuck", err)
+	}
+	directoryScans.Lock()
+	_, stillActive := directoryScans.active[targetDir]
+	directoryScans.Unlock()
+	if stillActive {
+		t.Fatal("stuck scan still blocked future refreshes")
+	}
+}
+
+func TestScanLocalDirectoryContextCapsAbandonedScans(t *testing.T) {
+	const targetDir = "/repeatedly-stuck/local-scan"
+	directoryScans.Lock()
+	directoryScans.abandoned[targetDir] = maxAbandonedDirectoryScans - 1
+	directoryScans.active[targetDir] = &directoryScan{done: make(chan struct{}), started: time.Now().Add(-directoryScanStuckAfter - time.Second)}
+	directoryScans.Unlock()
+	t.Cleanup(func() {
+		directoryScans.Lock()
+		delete(directoryScans.active, targetDir)
+		delete(directoryScans.abandoned, targetDir)
+		directoryScans.Unlock()
+	})
+
+	_, err := ScanLocalDirectoryContext(context.Background(), targetDir)
+	if !errors.Is(err, ErrDirectoryScanUnresponsive) {
+		t.Fatalf("repeated stuck scan error = %v, want ErrDirectoryScanUnresponsive", err)
+	}
+	_, err = ScanLocalDirectoryContext(context.Background(), targetDir)
+	if !errors.Is(err, ErrDirectoryScanUnresponsive) {
+		t.Fatalf("capped scan started new work: %v", err)
+	}
+}
+
+func TestSuccessfulAbandonedScanClearsFailureCap(t *testing.T) {
+	const targetDir = "/recovered/local-scan"
+	scan := &directoryScan{done: make(chan struct{}), started: time.Now()}
+	directoryScans.Lock()
+	directoryScans.abandoned[targetDir] = maxAbandonedDirectoryScans
+	directoryScans.Unlock()
+	t.Cleanup(func() {
+		directoryScans.Lock()
+		delete(directoryScans.active, targetDir)
+		delete(directoryScans.abandoned, targetDir)
+		directoryScans.Unlock()
+	})
+
+	finishDirectoryScan(targetDir, scan, []string{"repo"}, nil)
+	directoryScans.Lock()
+	_, capped := directoryScans.abandoned[targetDir]
+	directoryScans.Unlock()
+	if capped {
+		t.Fatal("successful abandoned scan did not clear failure cap")
+	}
+}
+
+func TestResetLocalDirectoryScanFailuresAllowsExplicitRetry(t *testing.T) {
+	const targetDir = "/manually-recovered/local-scan"
+	directoryScans.Lock()
+	directoryScans.abandoned[targetDir] = maxAbandonedDirectoryScans
+	directoryScans.Unlock()
+	t.Cleanup(func() {
+		directoryScans.Lock()
+		delete(directoryScans.active, targetDir)
+		delete(directoryScans.abandoned, targetDir)
+		directoryScans.Unlock()
+	})
+
+	ResetLocalDirectoryScanFailures(targetDir)
+	directoryScans.Lock()
+	_, capped := directoryScans.abandoned[targetDir]
+	directoryScans.Unlock()
+	if capped {
+		t.Fatal("explicit retry did not clear abandoned-scan cap")
+	}
+}
+
+func TestScanLocalDirectoryContextDoesNotReuseCompletedScan(t *testing.T) {
+	targetDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(targetDir, "first"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first, err := ScanLocalDirectoryContext(context.Background(), targetDir)
+	if err != nil || !reflect.DeepEqual(first, []string{"first"}) {
+		t.Fatalf("first scan = %v, %v", first, err)
+	}
+	if err := os.Mkdir(filepath.Join(targetDir, "second"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ScanLocalDirectoryContext(context.Background(), targetDir)
+	if err != nil || !reflect.DeepEqual(second, []string{"first", "second"}) {
+		t.Fatalf("second scan reused stale results: %v, %v", second, err)
+	}
 }
 
 func TestGetOriginalBranch(t *testing.T) {
