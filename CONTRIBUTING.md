@@ -47,9 +47,7 @@ make vet
 # (the version printed by `make lint`'s own output) and commit the result.
 make lint
 
-# Run the non-enforcing govet/shadow tier (Tier 1b, separate config).
-# Reports findings for information only — CI never gates on it, and it is
-# deliberately not part of `make lint`.
+# Run govet/shadow alone (also enforced by make lint and CI).
 make lint-shadow
 
 # Run tests with coverage report
