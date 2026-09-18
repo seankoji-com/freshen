@@ -1103,8 +1103,8 @@ func TestScanLocalDirectoryContextDoesNotReuseCompletedScan(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(first, []string{"first"}) {
 		t.Fatalf("first scan = %v, %v", first, err)
 	}
-	if err := os.Mkdir(filepath.Join(targetDir, "second"), 0o755); err != nil {
-		t.Fatal(err)
+	if mkdirErr := os.Mkdir(filepath.Join(targetDir, "second"), 0o755); mkdirErr != nil {
+		t.Fatal(mkdirErr)
 	}
 	second, err := ScanLocalDirectoryContext(context.Background(), targetDir)
 	if err != nil || !reflect.DeepEqual(second, []string{"first", "second"}) {

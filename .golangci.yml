@@ -7,7 +7,11 @@ linters:
     - staticcheck
     - unused
     - misspell
+    - govet
   settings:
+    govet:
+      enable:
+        - shadow
     errcheck:
       check-type-assertions: true
   exclusions:

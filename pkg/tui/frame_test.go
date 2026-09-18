@@ -990,3 +990,27 @@ func TestDiscardedActionCommandDoesNotStrandShutdown(t *testing.T) {
 		t.Fatal("discarded result command stranded shutdown")
 	}
 }
+
+// Job rows now show words rather than font-dependent glyphs. Pin all states so a
+// future rendering change cannot silently swap success, failure and waiting.
+func TestJobStateBadges(t *testing.T) {
+	cases := []struct {
+		status jobs.JobStatus
+		want   string
+	}{
+		{jobs.JobRunning, "RUNNING"},
+		{jobs.JobPassed, "PASSED"},
+		{jobs.JobFailed, "FAILED"},
+		{jobs.JobQueued, "QUEUED"},
+		{jobs.JobWaiting, "WAITING"},
+		{jobs.JobCancelled, "CANCELLED"},
+		{jobs.JobSkipped, "SKIPPED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := stripped(stateBadge(tc.status)); got != tc.want {
+				t.Fatalf("state badge = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
