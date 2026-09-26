@@ -40,6 +40,12 @@ func newSyncFixture(t *testing.T) *syncFixture {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	// Windows runners default to core.autocrlf=true, which rewrites the
+	// fixture files to CRLF on checkout. Pin it off for every git process
+	// in the test, including the ones the sync code spawns.
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.autocrlf")
+	t.Setenv("GIT_CONFIG_VALUE_0", "false")
 	root := t.TempDir()
 	f := &syncFixture{
 		t:      t,
