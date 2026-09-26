@@ -16,38 +16,49 @@ permissions:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@f592a081ee6b706e325eaca11579433a81966c4d # v4.1.7
+      - uses: actions/setup-go@0a12f3930d12edfb352702405f8d02aba3b51ccc # v5.0.7
         with:
           go-version-file: go.mod
+          cache: true
       - run: go vet ./...
       - run: go test -race "-coverprofile=coverage.out" ./...
       # Coverage reporting starts advisory so converter outages cannot freeze merges.
-      # Preserve the existing test gate and any established coverage threshold.
-      - name: Generate Cobertura coverage (advisory)
+      # Report generation is Linux-only; the conversion cannot reliably handle profiles
+      # from other platforms. Artifacts named per-OS to avoid collisions in matrix runs.
+      - name: Generate Cobertura coverage (advisory, Linux-only)
         if: runner.os == 'Linux'
         id: cobertura
         continue-on-error: true
         shell: bash
-        run: go run github.com/boumenot/gocover-cobertura@4afa1205ab3b54ae098dd4724c1657aad10f7484 -strict < coverage.out > coverage.xml
-      - name: Retain coverage reports (advisory)
-        if: steps.cobertura.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        run: |
+          if go run github.com/boumenot/gocover-cobertura@4afa1205ab3b54ae098dd4724c1657aad10f7484 < coverage.out > coverage.xml; then
+            if ! test -s coverage.xml || ! grep -q '<coverage' coverage.xml; then
+              echo "::warning::Cobertura conversion produced invalid output; skipping upload"
+              exit 1
+            fi
+          else
+            exit 1
+          fi
+      - name: Retain coverage reports (advisory, Linux-only)
+        if: runner.os == 'Linux' && steps.cobertura.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: go-coverage
+          name: go-coverage-${{ runner.os }}
           path: |
             coverage.out
             coverage.xml
           if-no-files-found: error
           retention-days: 14
 
-      - run: go build ./...
+      - name: Build
+        run: go build ./...
   vulnerabilities:
     runs-on: ubuntu-latest
     steps:

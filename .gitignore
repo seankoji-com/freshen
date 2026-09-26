@@ -9,3 +9,5 @@ freshen
 # Test & OS files
 .DS_Store
 *.test
+coverage.out
+coverage.xml
