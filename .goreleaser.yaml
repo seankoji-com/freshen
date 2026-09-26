@@ -4,6 +4,10 @@ builds:
     binary: freshen
     goos: [darwin, linux, windows]
     goarch: [amd64, arm64]
+    # main.Version, not GoReleaser's default main.version: the Makefile
+    # stamps the same exported variable.
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
 archives:
   - format_overrides:
       - goos: windows
@@ -14,5 +18,6 @@ brews:
   - repository:
       owner: seankoji-com
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: https://github.com/seankoji-com/freshen
     description: TUI for refreshing sibling Git repositories

@@ -28,3 +28,18 @@ func TestApplyConfigAliases(t *testing.T) {
 		}
 	}
 }
+
+func TestDisplayVersion(t *testing.T) {
+	cases := map[string]string{
+		"0.2.0":        "v0.2.0", // GoReleaser {{.Version}}
+		"v0.2.0":       "v0.2.0", // git describe
+		"v0.2.0-3-gab": "v0.2.0-3-gab",
+		"dev":          "dev",
+		"ab12cd3":      "ab12cd3", // git describe --always with no tags
+	}
+	for in, want := range cases {
+		if got := displayVersion(in); got != want {
+			t.Errorf("displayVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -26,7 +26,19 @@ import (
 // operations to stop after the TUI exits, before returning anyway.
 const shutdownWait = 5 * time.Second
 
-var Version = "1.0.0"
+// Version is stamped at build time: `make build` passes `git describe`, and
+// .goreleaser.yaml passes the release tag, both via -X main.Version.
+var Version = "dev"
+
+// displayVersion prints a single leading "v" whether or not the stamped value
+// carries one (git describe does, GoReleaser's {{.Version}} does not).
+func displayVersion(v string) string {
+	v = strings.TrimPrefix(v, "v")
+	if v != "" && v[0] >= '0' && v[0] <= '9' {
+		return "v" + v
+	}
+	return v
+}
 
 // aliasFlags implements flag.Value for a repeatable --alias local=remote flag,
 // letting a user add to or override the built-in repo alias pairs in
@@ -155,9 +167,10 @@ func main() {
 	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
 	flag.Parse()
+	git.DisableTerminalPrompts()
 
 	if versionFlag {
-		fmt.Printf("freshen v%s\n", Version)
+		fmt.Printf("freshen %s\n", displayVersion(Version))
 		os.Exit(0)
 	}
 	if aliasErr := applyConfigAliases(cfg.Aliases); aliasErr != nil {

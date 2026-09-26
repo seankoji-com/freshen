@@ -63,7 +63,24 @@ const (
 	orgFetchTimeout      = 30 * time.Second
 	branchResolveTimeout = 10 * time.Second
 	rebaseAbortTimeout   = 10 * time.Second
+	// stashRestoreTimeout bounds restoring an auto-stash on a fresh context,
+	// so changes are put back even after the sync itself was cancelled.
+	stashRestoreTimeout = 30 * time.Second
+	// syncTimeout caps one repository's whole sync, so a stalled network
+	// call cannot hold a worker slot forever.
+	syncTimeout = 10 * time.Minute
 )
+
+// DisableTerminalPrompts stops git spawned by this process from prompting on
+// the terminal for credentials, which would otherwise hang behind the TUI's
+// alternate screen. Credential helpers and SSH agents keep working; a repo
+// that needs interactive auth fails fast with an error instead. It is a no-op
+// when GIT_TERMINAL_PROMPT is already set, so an explicit choice wins.
+func DisableTerminalPrompts() {
+	if _, ok := os.LookupEnv("GIT_TERMINAL_PROMPT"); !ok {
+		_ = os.Setenv("GIT_TERMINAL_PROMPT", "0")
+	}
+}
 
 type RepoStatus string
 
@@ -258,7 +275,8 @@ func AddAlias(local, remote string) error {
 }
 
 // GetLocalDirName maps GitHub repository name to local folder alias.
-// The case statements contain user-specific aliases (e.g., .github -> github, careynas.net -> wiki.robot.house).
+// The only built-in alias is .github -> github; add others with --alias or
+// the config file's aliases list.
 // User-supplied aliases from --alias take precedence; see AddAlias.
 // The second return value reports whether the result is a safe single path
 // segment; callers MUST check it and skip the repo when false rather than
@@ -271,8 +289,6 @@ func GetLocalDirName(ghRepo string) (string, bool) {
 	switch ghRepo {
 	case ".github":
 		name = "github"
-	case "careynas.net":
-		name = "wiki.robot.house"
 	default:
 		name = ghRepo
 	}
@@ -304,7 +320,7 @@ func sanitizeDirName(name string) (string, bool) {
 }
 
 // GetGHRepoName maps local folder alias to GitHub repository name.
-// The case statements contain user-specific aliases (e.g., github -> .github, wiki.robot.house -> careynas.net).
+// The only built-in alias is github -> .github; see GetLocalDirName.
 // User-supplied aliases from --alias take precedence; see AddAlias, which
 // validates both halves of every pair so an alias always round-trips with
 // GetLocalDirName. Non-alias inputs are local directory entries, which are
@@ -316,8 +332,6 @@ func GetGHRepoName(localDir string) string {
 	switch localDir {
 	case "github":
 		return ".github"
-	case "wiki.robot.house":
-		return "careynas.net"
 	default:
 		return localDir
 	}
@@ -1029,13 +1043,15 @@ func (s *syncSession) publish() {
 //
 // safeOnly restricts the sync to actions that never touch what branch is
 // checked out: a plain pull on the default branch, or (if dirty) add+stash+
-// pull+stash-apply. If the repo is on a feature branch, safeOnly skips it
+// pull+stash-pop. If the repo is on a feature branch, safeOnly skips it
 // entirely rather than auto-switching to default or auto-rebasing — those
 // stay available via an explicit, single-repo sync (safeOnly=false).
 func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safeOnly bool) {
 	if ctx.Err() != nil {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
+	defer cancel()
 	s := &syncSession{item: item, emit: emit}
 
 	item.Status = StatusSyncing
@@ -1131,22 +1147,35 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 			return
 		}
 
-		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash apply...", defaultBranch, defaultBranch)
+		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash pop...", defaultBranch, defaultBranch)
 
 		// Best-effort: the stash below is what actually has to succeed.
 		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
 			s.log("󰀪 git add . failed (continuing): %v", err)
 		}
+		before := stashTop(ctx, item.Path)
 		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
 		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 		if err := stashCmd.Run(); err != nil {
 			s.finish(StatusError, "Stash Err", "󰅙 Failed to stash local changes: %v", err)
 			return
 		}
+		// Only pop what this sync pushed: "No local changes to save" exits 0
+		// without creating an entry, and popping then would take the user's own.
+		stashed := stashTop(ctx, item.Path)
+		if stashed == "" || stashed == before {
+			s.finish(StatusError, "Stash Err", "󰅙 git stash created no entry; local changes left in place.")
+			return
+		}
 		item.Stashed = true
 
 		if ctx.Err() != nil {
-			s.log("󰅙 Sync cancelled after stashing — changes remain stashed, re-run sync to restore them.")
+			if err := restoreStash(item.Path); err != nil {
+				s.finish(StatusError, "Stash Err", "󰅙 Sync cancelled after stashing and the stash could not be restored (%v) — changes are kept in stash %s.", err, stashed)
+				return
+			}
+			item.Stashed = false
+			s.log("󰅙 Sync cancelled after stashing — local changes restored.")
 			return
 		}
 
@@ -1154,16 +1183,27 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		var dirtyPullOut bytes.Buffer
 		pullCmd.Stdout = &dirtyPullOut
 		pullCmd.Stderr = &dirtyPullOut
-		if err := pullCmd.Run(); err != nil {
-			s.log("󰅙 git pull error (continuing with stash apply): %s — %s", err.Error(), dirtyPullOut.String())
+		pullErr := pullCmd.Run()
+		if pullErr != nil {
+			// A conflicted merge would block the pop; back it out first. This
+			// fails harmlessly when the pull never started a merge.
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
+			_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "merge", "--abort").Run()
+			abortCancel()
 		}
 
-		applyCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "apply")
-		if err := applyCmd.Run(); err == nil {
-			s.finish(StatusStashedApplied, "Stashed", "󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch)
-		} else {
-			s.finish(StatusError, "Conflict", "󰅙 Conflict occurred while applying stash!")
+		// pop drops the entry only when it applies cleanly; on conflict git
+		// keeps it, so nothing is lost either way.
+		if err := restoreStash(item.Path); err != nil {
+			s.finish(StatusError, "Conflict", "󰅙 Conflict re-applying local changes: %v — they are kept in stash %s.", err, stashed)
+			return
 		}
+		item.Stashed = false
+		if pullErr != nil {
+			s.finish(StatusError, "Pull Error", "󰅙 git pull error (local changes restored): %s — %s", pullErr.Error(), strings.TrimSpace(dirtyPullOut.String()))
+			return
+		}
+		s.finish(StatusStashedApplied, "Stashed", "󰄬 Successfully pulled '%s' and re-applied stashed changes.", defaultBranch)
 		return
 	}
 
@@ -1173,7 +1213,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	}
 
 	if !hasUnstagedChanges {
-		s.log(" Feature branch '%s' is clean. Checking out '%s' and running git pull --no-rebase origin %s...", origBranch, defaultBranch, defaultBranch)
+		s.log("󰀪 Feature branch '%s' is clean. Switching the checkout to '%s' (branch '%s' is kept) and running git pull --no-rebase origin %s...", origBranch, defaultBranch, origBranch, defaultBranch)
 
 		coCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "checkout", defaultBranch)
 		if err := coCmd.Run(); err != nil {
@@ -1201,7 +1241,9 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		s.log("󰀪 git fetch origin failed (continuing): %v", err)
 	}
 	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
-	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", rebaseTarget)
+	// --autostash: without it git refuses to rebase a dirty tree at all. On
+	// conflict, the --abort below restores the autostash.
+	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", "--autostash", rebaseTarget)
 	var rebaseOut bytes.Buffer
 	rebaseCmd.Stdout = &rebaseOut
 	rebaseCmd.Stderr = &rebaseOut
@@ -1218,6 +1260,31 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		abortCancel()
 		s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebase conflict: %s", rebaseOut.String())
 	}
+}
+
+// stashTop returns the object ID at the top of the stash, or "" when the
+// stash is empty or unreadable.
+func stashTop(ctx context.Context, path string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "refs/stash").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// restoreStash pops the top stash entry on a fresh context, so changes are put
+// back even when the sync's own context was cancelled or timed out.
+func restoreStash(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), stashRestoreTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", path, "stash", "pop").CombinedOutput()
+	if err != nil {
+		if msg := strings.TrimSpace(string(out)); msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
 }
 
 // SwitchBranch switches checkout to target branch.

@@ -155,7 +155,7 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 				"repositories": {
 					"nodes": [
 						{"name": "freshen", "issues": {"totalCount": 3}, "pullRequests": {"totalCount": 1}},
-						{"name": "careynas.net", "issues": {"totalCount": 0}, "pullRequests": {"totalCount": 2}}
+						{"name": "wiki.example.org", "issues": {"totalCount": 0}, "pullRequests": {"totalCount": 2}}
 					]
 				}
 			}
@@ -180,8 +180,8 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 			t.Fatalf("FetchOrgRepoCounts() error = %v", err)
 		}
 		want := map[string]RepoCounts{
-			"freshen":      {Issues: 3, PRs: 1},
-			"careynas.net": {Issues: 0, PRs: 2},
+			"freshen":          {Issues: 3, PRs: 1},
+			"wiki.example.org": {Issues: 0, PRs: 2},
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("FetchOrgRepoCounts() = %+v, want %+v", got, want)
@@ -1485,7 +1485,6 @@ func TestGetLocalDirName(t *testing.T) {
 		withAliases(t, nil)
 		cases := map[string]string{
 			".github":       "github",
-			"careynas.net":  "wiki.robot.house",
 			"freshen":       "freshen",
 			"foo..bar":      "foo..bar", // dots are legal in repo names, not traversal
 			"..evil":        "..evil",   // must NOT collide with "evil"
@@ -1520,14 +1519,14 @@ func TestGetLocalDirName(t *testing.T) {
 
 func TestAddAlias(t *testing.T) {
 	t.Run("valid pair round-trips through both directions", func(t *testing.T) {
-		withAliases(t, map[string]string{"wiki": "careynas.net"})
+		withAliases(t, map[string]string{"wiki": "wiki.example.org"})
 
-		local, ok := GetLocalDirName("careynas.net")
+		local, ok := GetLocalDirName("wiki.example.org")
 		if !ok || local != "wiki" {
-			t.Fatalf("GetLocalDirName(careynas.net) = %q, %v; want wiki, true", local, ok)
+			t.Fatalf("GetLocalDirName(wiki.example.org) = %q, %v; want wiki, true", local, ok)
 		}
-		if remote := GetGHRepoName(local); remote != "careynas.net" {
-			t.Errorf("GetGHRepoName(%q) = %q, want careynas.net", local, remote)
+		if remote := GetGHRepoName(local); remote != "wiki.example.org" {
+			t.Errorf("GetGHRepoName(%q) = %q, want wiki.example.org", local, remote)
 		}
 	})
 
