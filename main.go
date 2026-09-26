@@ -160,8 +160,8 @@ func main() {
 		fmt.Printf("freshen v%s\n", Version)
 		os.Exit(0)
 	}
-	if err := applyConfigAliases(cfg.Aliases); err != nil {
-		fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+	if aliasErr := applyConfigAliases(cfg.Aliases); aliasErr != nil {
+		fmt.Fprintf(os.Stderr, "freshen config: %v\n", aliasErr)
 		os.Exit(1)
 	}
 	if orgFlag != "" {
@@ -178,9 +178,9 @@ func main() {
 	if ownerFlag == "" && !nonInteractiveFlag {
 		promptErr := ""
 		for {
-			owner, err := runOwnerPrompt(promptErr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+			owner, ownerErr := runOwnerPrompt(promptErr)
+			if ownerErr != nil {
+				fmt.Fprintf(os.Stderr, "freshen: %v\n", ownerErr)
 				os.Exit(1)
 			}
 			if owner == "" {
@@ -192,8 +192,8 @@ func main() {
 			}
 			ownerFlag = owner
 			cfg.Owner = owner
-			if err := config.Save(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "freshen config: %v\n", err)
+			if saveErr := config.Save(cfg); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "freshen config: %v\n", saveErr)
 				os.Exit(1)
 			}
 			break
@@ -288,7 +288,7 @@ func configureTUILogging() *os.File {
 
 	path := logPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
-		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+		if f, openErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); openErr == nil {
 			slog.SetDefault(slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level})))
 			return f
 		} else {
@@ -296,7 +296,7 @@ func configureTUILogging() *os.File {
 			// startup, so stderr is still safe to write to (unlike the
 			// post-close path in main() above) — surface the failure rather
 			// than silently discarding every log line for the whole run.
-			fmt.Fprintf(os.Stderr, "freshen: opening log file %s: %v — log output will be discarded for this session\n", path, err)
+			fmt.Fprintf(os.Stderr, "freshen: opening log file %s: %v — log output will be discarded for this session\n", path, openErr)
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "freshen: creating log directory for %s: %v — log output will be discarded for this session\n", path, err)

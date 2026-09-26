@@ -1249,8 +1249,8 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	if knownDefault != defaultBranch {
 		return fmt.Errorf("default branch changed from %q to %q; sync the repository and confirm publishing again", knownDefault, defaultBranch)
 	}
-	if err := ensureLocalDefaultBranch(ctx, item.Path, defaultBranch); err != nil {
-		return err
+	if branchErr := ensureLocalDefaultBranch(ctx, item.Path, defaultBranch); branchErr != nil {
+		return branchErr
 	}
 	branch, err := resolveCurrentBranch(ctx, item.Path)
 	if err != nil {
@@ -1369,16 +1369,16 @@ func ValidateWorkspacePath(workspace, path string) error {
 	if err != nil {
 		return err
 	}
-	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+	if resolved, resolveErr := filepath.EvalSymlinks(target); resolveErr == nil {
 		target = resolved
-	} else if os.IsNotExist(err) {
+	} else if os.IsNotExist(resolveErr) {
 		parent, parentErr := filepath.EvalSymlinks(filepath.Dir(target))
 		if parentErr != nil {
 			return fmt.Errorf("resolve target parent: %w", parentErr)
 		}
 		target = filepath.Join(parent, filepath.Base(target))
 	} else {
-		return fmt.Errorf("resolve target: %w", err)
+		return fmt.Errorf("resolve target: %w", resolveErr)
 	}
 	rel, err := filepath.Rel(root, target)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {

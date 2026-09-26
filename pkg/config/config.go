@@ -50,8 +50,8 @@ func Save(c Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+	if mkdirErr := os.MkdirAll(filepath.Dir(path), 0o700); mkdirErr != nil {
+		return mkdirErr
 	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
