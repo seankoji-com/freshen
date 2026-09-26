@@ -12,7 +12,7 @@
 - **Organization overview**: Starts with repository, Actions and runner health at a glance, then opens dedicated searchable screens for each area.
 - **Concern queue**: Ranks repositories with open PRs or issues and opens their existing detail view for review.
 - **Explicit repository sync**: Startup loads metadata. Sync or clone only when requested; archived repositories are highlighted.
-- **Alias Mappings**: Hardcoded mapping support for custom repo folder names (e.g. `.github` ➔ `github`, `careynas.net` ➔ `wiki.robot.house`).
+- **Alias Mappings**: Map GitHub repo names to custom local folder names with a repeatable `--alias local=remote` flag or an `aliases` list in the config file. `.github` ➔ `github` is built in.
 - **GitHub Actions monitoring**: Workflow runs, a separate job queue, completed-job and step counts, runner assignments, and a log tail for the selected job.
 - **Interactive Controls**:
   - Re-sync / retry individual repositories.

@@ -8,7 +8,7 @@ GOLANGCI_LINT_VERSION := v2.13.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 build:
-	go build -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo 1.0.0)" -o freshen .
+	go build -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo dev)" -o freshen .
 
 test:
 	go test -race ./...
@@ -28,7 +28,7 @@ lint-shadow:
 	$(GOLANGCI_LINT) run -c .golangci-shadow.yml ./...
 
 install:
-	go install -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo 1.0.0)"
+	go install -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo dev)"
 
 coverage:
 	go test ./... -cover
