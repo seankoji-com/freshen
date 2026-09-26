@@ -26,9 +26,39 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          cache: true
       - run: go vet ./...
-      - run: go test -race ./...
-      - run: go build ./...
+      - run: go test -race "-coverprofile=coverage.out" ./...
+      # Coverage reporting starts advisory so converter outages cannot freeze merges.
+      # Report generation is Linux-only; the conversion cannot reliably handle profiles
+      # from other platforms. Artifacts named per-OS to avoid collisions in matrix runs.
+      - name: Generate Cobertura coverage (advisory, Linux-only)
+        if: runner.os == 'Linux'
+        id: cobertura
+        continue-on-error: true
+        shell: bash
+        run: |
+          if go run github.com/boumenot/gocover-cobertura@4afa1205ab3b54ae098dd4724c1657aad10f7484 < coverage.out > coverage.xml; then
+            if ! test -s coverage.xml || ! grep -q '<coverage' coverage.xml; then
+              echo "::warning::Cobertura conversion produced invalid output; skipping upload"
+              exit 1
+            fi
+          else
+            exit 1
+          fi
+      - name: Retain coverage reports (advisory, Linux-only)
+        if: runner.os == 'Linux' && steps.cobertura.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-coverage-${{ runner.os }}
+          path: |
+            coverage.out
+            coverage.xml
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build
+        run: go build ./...
   vulnerabilities:
     timeout-minutes: 15
     runs-on: ubuntu-latest

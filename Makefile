@@ -34,4 +34,4 @@ coverage:
 	go test ./... -cover
 
 clean:
-	rm -f freshen coverage.out
+	rm -f freshen coverage.out coverage.xml
