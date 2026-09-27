@@ -1153,7 +1153,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
 			s.log("󰀪 git add . failed (continuing): %v", err)
 		}
-		before := stashTop(ctx, item.Path)
+		before := stashTop(item.Path)
 		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
 		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
 		if err := stashCmd.Run(); err != nil {
@@ -1162,7 +1162,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		}
 		// Only pop what this sync pushed: "No local changes to save" exits 0
 		// without creating an entry, and popping then would take the user's own.
-		stashed := stashTop(ctx, item.Path)
+		stashed := stashTop(item.Path)
 		if stashed == "" || stashed == before {
 			s.finish(StatusError, "Stash Err", "󰅙 git stash created no entry; local changes left in place.")
 			return
@@ -1263,8 +1263,13 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 }
 
 // stashTop returns the object ID at the top of the stash, or "" when the
-// stash is empty or unreadable.
-func stashTop(ctx context.Context, path string) string {
+// stash is empty or unreadable. It runs on a fresh context: if the sync were
+// cancelled right after "stash push", reading refs/stash on the sync context
+// would fail, and the caller would report "no entry" while the user's changes
+// sat in a stash nobody restores.
+func stashTop(path string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), branchResolveTimeout)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "refs/stash").Output()
 	if err != nil {
 		return ""
