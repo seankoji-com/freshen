@@ -23,8 +23,11 @@ import (
 )
 
 // shutdownWait is how long main() waits for in-flight background git
-// operations to stop after the TUI exits, before returning anyway.
-const shutdownWait = 5 * time.Second
+// operations to stop after the TUI exits, before returning anyway. A
+// cancelled sync may still spend up to git.CleanupTimeout aborting a merge
+// and restoring its auto-stash; exiting sooner would kill that git process
+// mid-restore, so the wait covers it with a few seconds to spare.
+const shutdownWait = git.CleanupTimeout + 5*time.Second
 
 // Version is stamped at build time: `make build` passes `git describe`, and
 // .goreleaser.yaml passes the release tag, both via -X main.Version.
@@ -166,16 +169,19 @@ func main() {
 	flag.BoolVar(&deleteArchivedFlag, "delete-archived", false, "Allow archived repository deletion in non-interactive mode")
 	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
+	// Config aliases go in before flag.Parse so a -alias flag for the same
+	// local name overrides them, like every other flag overrides config.
+	if aliasErr := applyConfigAliases(cfg.Aliases); aliasErr != nil {
+		fmt.Fprintf(os.Stderr, "freshen config: %v\n", aliasErr)
+		os.Exit(1)
+	}
+
 	flag.Parse()
 	git.DisableTerminalPrompts()
 
 	if versionFlag {
 		fmt.Printf("freshen %s\n", displayVersion(Version))
 		os.Exit(0)
-	}
-	if aliasErr := applyConfigAliases(cfg.Aliases); aliasErr != nil {
-		fmt.Fprintf(os.Stderr, "freshen config: %v\n", aliasErr)
-		os.Exit(1)
 	}
 	if orgFlag != "" {
 		ownerFlag = orgFlag

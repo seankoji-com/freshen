@@ -13,6 +13,16 @@ jobs:
         with: {fetch-depth: 0, persist-credentials: false}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with: {go-version-file: go.mod}
+      # Fail before anything is published: without this secret the release
+      # and archives would go out and only the final tap push would fail.
+      - name: Check Homebrew tap token
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_GITHUB_TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_GITHUB_TOKEN is not set. Add a repository or organization secret with contents:write on seankoji-com/homebrew-tap, then re-run this workflow."
+            exit 1
+          fi
       - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with: {distribution: goreleaser, version: v2.18.2}
         env:

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/seankoji-com/freshen/pkg/jobs"
@@ -62,14 +63,25 @@ const (
 	countsSweepTimeout   = countsMaxPages*countsFetchTimeout + 5*time.Second
 	orgFetchTimeout      = 30 * time.Second
 	branchResolveTimeout = 10 * time.Second
-	rebaseAbortTimeout   = 10 * time.Second
-	// stashRestoreTimeout bounds restoring an auto-stash on a fresh context,
-	// so changes are put back even after the sync itself was cancelled.
-	stashRestoreTimeout = 30 * time.Second
-	// syncTimeout caps one repository's whole sync, so a stalled network
-	// call cannot hold a worker slot forever.
+	// CleanupTimeout bounds the git cleanup a sync runs on a fresh context
+	// after its own context is cancelled or times out: aborting a merge or
+	// rebase, then finding and restoring the auto-stash. Every cleanup
+	// sequence shares one such deadline, so a cancelled sync finishes within
+	// CleanupTimeout. main's shutdown grace period is sized from it, so the
+	// process never exits (and kills git) mid-restore.
+	CleanupTimeout = 10 * time.Second
+	// syncTimeout caps one repository's sync of an existing checkout, so a
+	// stalled network call cannot hold a worker slot forever. Cloning is
+	// exempt: a large first clone can legitimately take longer.
 	syncTimeout = 10 * time.Minute
 )
+
+// autoStashSeq makes each auto-stash message unique within this process.
+var autoStashSeq atomic.Uint64
+
+// errStashMissing reports that the stash entry a sync created is no longer in
+// the stash list, so there is nothing of ours to restore.
+var errStashMissing = errors.New("the auto-stash entry is no longer in the stash list")
 
 // DisableTerminalPrompts stops git spawned by this process from prompting on
 // the terminal for credentials, which would otherwise hang behind the TUI's
@@ -1043,15 +1055,14 @@ func (s *syncSession) publish() {
 //
 // safeOnly restricts the sync to actions that never touch what branch is
 // checked out: a plain pull on the default branch, or (if dirty) add+stash+
-// pull+stash-pop. If the repo is on a feature branch, safeOnly skips it
-// entirely rather than auto-switching to default or auto-rebasing — those
+// pull, then restoring that exact stash entry. If the repo is on a feature
+// branch, safeOnly skips it entirely rather than auto-switching to default or
+// auto-rebasing — those
 // stay available via an explicit, single-repo sync (safeOnly=false).
 func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safeOnly bool) {
 	if ctx.Err() != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
-	defer cancel()
 	s := &syncSession{item: item, emit: emit}
 
 	item.Status = StatusSyncing
@@ -1110,6 +1121,11 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		return
 	}
 
+	// Cloning above runs on the caller's context only; everything from here
+	// on works on an existing checkout and gets the syncTimeout cap.
+	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
+	defer cancel()
+
 	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
@@ -1147,30 +1163,49 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 			return
 		}
 
-		s.log(" On default branch '%s' (dirty). Executing git add . && git stash && git pull --no-rebase origin %s && git stash pop...", defaultBranch, defaultBranch)
+		s.log(" On default branch '%s' (dirty). Stashing local changes (including untracked files), pulling origin %s, then restoring them...", defaultBranch, defaultBranch)
 
-		// Best-effort: the stash below is what actually has to succeed.
-		if err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", ".").Run(); err != nil {
-			s.log("󰀪 git add . failed (continuing): %v", err)
-		}
-		before := stashTop(item.Path)
-		stashMsg := fmt.Sprintf("freshen auto-stash %s", time.Now().Format("2006-01-02 15:04:05"))
-		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
-		if err := stashCmd.Run(); err != nil {
-			s.finish(StatusError, "Stash Err", "󰅙 Failed to stash local changes: %v", err)
+		// Stage untracked files so the stash takes them too. If this fails,
+		// stop: pulling over unprotected untracked files is what the stash
+		// exists to prevent.
+		if out, err := exec.CommandContext(ctx, "git", "-C", item.Path, "add", "-A").CombinedOutput(); err != nil {
+			s.finish(StatusError, "Stash Err", "󰅙 git add -A failed, nothing was stashed or pulled: %v %s", err, strings.TrimSpace(string(out)))
 			return
 		}
-		// Only pop what this sync pushed: "No local changes to save" exits 0
-		// without creating an entry, and popping then would take the user's own.
-		stashed := stashTop(item.Path)
-		if stashed == "" || stashed == before {
+		// A unique message identifies this sync's entry in the stash list, so
+		// restore never touches an entry the user (or another run) made.
+		stashMsg := fmt.Sprintf("freshen auto-stash %s pid %d #%d", time.Now().Format(time.RFC3339Nano), os.Getpid(), autoStashSeq.Add(1))
+		stashCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
+		if out, err := stashCmd.CombinedOutput(); err != nil {
+			s.finish(StatusError, "Stash Err", "󰅙 Failed to stash local changes: %v %s", err, strings.TrimSpace(string(out)))
+			return
+		}
+
+		// Everything from here to the end of cleanup may run after ctx is
+		// cancelled, so it shares one fresh CleanupTimeout budget.
+		lookupCtx, lookupCancel := context.WithTimeout(context.Background(), CleanupTimeout)
+		stashed, err := findAutoStash(lookupCtx, item.Path, stashMsg)
+		if err != nil {
+			lookupCancel()
+			// The push succeeded, so the changes are most likely stashed;
+			// say so rather than claim nothing happened.
+			item.Stashed = true
+			s.finish(StatusError, "Stash Err", "󰅙 Stashed local changes but could not read the stash list (%v); nothing was pulled. Look for %q in git stash list.", err, stashMsg)
+			return
+		}
+		if stashed == "" {
+			lookupCancel()
+			// "No local changes to save" exits 0 without creating an entry.
 			s.finish(StatusError, "Stash Err", "󰅙 git stash created no entry; local changes left in place.")
 			return
 		}
 		item.Stashed = true
+		s.log("󰏗 Stashed local changes as %s (%s).", shortSHA(stashed), stashMsg)
 
 		if ctx.Err() != nil {
-			if err := restoreStash(item.Path); err != nil {
+			err := restoreStash(lookupCtx, item.Path, stashed)
+			lookupCancel()
+			if err != nil {
 				s.finish(StatusError, "Stash Err", "󰅙 Sync cancelled after stashing and the stash could not be restored (%v) — changes are kept in stash %s.", err, stashed)
 				return
 			}
@@ -1178,24 +1213,29 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 			s.log("󰅙 Sync cancelled after stashing — local changes restored.")
 			return
 		}
+		lookupCancel()
 
 		pullCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "pull", "--no-rebase", "origin", defaultBranch)
 		var dirtyPullOut bytes.Buffer
 		pullCmd.Stdout = &dirtyPullOut
 		pullCmd.Stderr = &dirtyPullOut
 		pullErr := pullCmd.Run()
+
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), CleanupTimeout)
+		defer cleanupCancel()
 		if pullErr != nil {
-			// A conflicted merge would block the pop; back it out first. This
-			// fails harmlessly when the pull never started a merge.
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
-			_ = exec.CommandContext(abortCtx, "git", "-C", item.Path, "merge", "--abort").Run()
-			abortCancel()
+			// A conflicted merge would block the restore; back it out first.
+			// With no merge in progress this fails harmlessly, so only log
+			// when one was actually left behind.
+			if abortOut, abortErr := exec.CommandContext(cleanupCtx, "git", "-C", item.Path, "merge", "--abort").CombinedOutput(); abortErr != nil && mergeInProgress(cleanupCtx, item.Path) {
+				s.log("󰀪 git merge --abort failed — repository may be left mid-merge: %v %s", abortErr, strings.TrimSpace(string(abortOut)))
+			}
 		}
 
-		// pop drops the entry only when it applies cleanly; on conflict git
-		// keeps it, so nothing is lost either way.
-		if err := restoreStash(item.Path); err != nil {
-			s.finish(StatusError, "Conflict", "󰅙 Conflict re-applying local changes: %v — they are kept in stash %s.", err, stashed)
+		// apply keeps the entry on conflict, and restoreStash drops it only
+		// after a clean apply, so nothing is lost either way.
+		if err := restoreStash(cleanupCtx, item.Path, stashed); err != nil {
+			s.finish(StatusError, "Conflict", "󰅙 Could not re-apply local changes: %v — they are kept in stash %s.", err, stashed)
 			return
 		}
 		item.Stashed = false
@@ -1243,17 +1283,28 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
 	// --autostash: without it git refuses to rebase a dirty tree at all. On
 	// conflict, the --abort below restores the autostash.
+	stashesBefore, stashListErr := stashEntries(ctx, item.Path)
 	rebaseCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "rebase", "--autostash", rebaseTarget)
 	var rebaseOut bytes.Buffer
 	rebaseCmd.Stdout = &rebaseOut
 	rebaseCmd.Stderr = &rebaseOut
 
 	if err := rebaseCmd.Run(); err == nil {
+		// A rebase that succeeds but cannot re-apply its autostash still
+		// exits 0; git keeps the changes as a new stash entry and leaves
+		// conflict markers in the tree. Detect that by the entry it adds.
+		if stashListErr == nil {
+			if after, listErr := stashEntries(ctx, item.Path); listErr == nil && len(after) > len(stashesBefore) {
+				item.Stashed = true
+				s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebased '%s' onto '%s', but re-applying local changes conflicted — resolve the conflicts; the changes are also kept in stash %s. %s", origBranch, rebaseTarget, after[0].sha, strings.TrimSpace(rebaseOut.String()))
+				return
+			}
+		}
 		s.finish(StatusRebased, "Rebased", "󰄬 Rebased '%s' onto '%s'.", origBranch, rebaseTarget)
 	} else {
 		// Use a fresh context for the abort so a mid-rebase state isn't left behind
 		// even if the sync itself was cancelled.
-		abortCtx, abortCancel := context.WithTimeout(context.Background(), rebaseAbortTimeout)
+		abortCtx, abortCancel := context.WithTimeout(context.Background(), CleanupTimeout)
 		if abortErr := exec.CommandContext(abortCtx, "git", "-C", item.Path, "rebase", "--abort").Run(); abortErr != nil {
 			s.log("󰀪 git rebase --abort failed — repository may be left mid-rebase: %v", abortErr)
 		}
@@ -1262,34 +1313,96 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	}
 }
 
-// stashTop returns the object ID at the top of the stash, or "" when the
-// stash is empty or unreadable. It runs on a fresh context: if the sync were
-// cancelled right after "stash push", reading refs/stash on the sync context
-// would fail, and the caller would report "no entry" while the user's changes
-// sat in a stash nobody restores.
-func stashTop(path string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), branchResolveTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "refs/stash").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+type stashEntry struct {
+	ref     string // stash@{n}, valid only until the stash list next changes
+	sha     string
+	subject string
 }
 
-// restoreStash pops the top stash entry on a fresh context, so changes are put
-// back even when the sync's own context was cancelled or timed out.
-func restoreStash(path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), stashRestoreTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "git", "-C", path, "stash", "pop").CombinedOutput()
+// stashEntries lists the stash, newest first.
+func stashEntries(ctx context.Context, path string) ([]stashEntry, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", path, "stash", "list", "--format=%gd%x00%H%x00%gs").Output()
 	if err != nil {
+		return nil, fmt.Errorf("git stash list: %w", err)
+	}
+	var entries []stashEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, "\x00", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		entries = append(entries, stashEntry{ref: parts[0], sha: parts[1], subject: parts[2]})
+	}
+	return entries, nil
+}
+
+// findAutoStash returns the object ID of the stash entry whose subject ends
+// with msg, or "" when there is none. The caller runs it on a fresh context:
+// if the sync were cancelled right after "stash push", listing on the sync
+// context would fail while the changes sat in a stash nobody restores.
+func findAutoStash(ctx context.Context, path, msg string) (string, error) {
+	entries, err := stashEntries(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		// git records the subject as "On <branch>: <msg>".
+		if strings.HasSuffix(e.subject, ": "+msg) {
+			return e.sha, nil
+		}
+	}
+	return "", nil
+}
+
+// stashRefFor returns the current stash@{n} for the entry with object ID sha.
+func stashRefFor(ctx context.Context, path, sha string) (string, error) {
+	entries, err := stashEntries(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if e.sha == sha {
+			return e.ref, nil
+		}
+	}
+	return "", errStashMissing
+}
+
+// restoreStash applies the stash entry with object ID sha and then drops that
+// entry only, wherever it now sits in the stash list. Other entries are never
+// touched. It returns errStashMissing without changing anything when the
+// entry is gone, and leaves the entry in place when the apply fails.
+func restoreStash(ctx context.Context, path, sha string) error {
+	if _, err := stashRefFor(ctx, path, sha); err != nil {
+		return err
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", path, "stash", "apply", sha).CombinedOutput(); err != nil {
 		if msg := strings.TrimSpace(string(out)); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)
 		}
 		return err
 	}
+	// Re-resolve right before dropping: the list may have shifted.
+	ref, err := stashRefFor(ctx, path, sha)
+	if err != nil {
+		return fmt.Errorf("changes re-applied but the stash entry could not be dropped: %w", err)
+	}
+	if out, err := exec.CommandContext(ctx, "git", "-C", path, "stash", "drop", ref).CombinedOutput(); err != nil {
+		return fmt.Errorf("changes re-applied but git stash drop %s failed: %w %s", ref, err, strings.TrimSpace(string(out)))
+	}
 	return nil
+}
+
+// mergeInProgress reports whether the repository has an unfinished merge.
+func mergeInProgress(ctx context.Context, path string) bool {
+	return exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD").Run() == nil
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 // SwitchBranch switches checkout to target branch.
