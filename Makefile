@@ -7,8 +7,13 @@
 GOLANGCI_LINT_VERSION := v2.13.2
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
+# One version stamp for build and install. --dirty marks a build from an
+# uncommitted tree; an untagged checkout falls back to the short commit, and
+# a tree with no git metadata to "dev".
+VERSION_LDFLAGS := -X main.Version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 build:
-	go build -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo 1.0.0)" -o freshen .
+	go build -ldflags "$(VERSION_LDFLAGS)" -o freshen .
 
 test:
 	go test -race ./...
@@ -28,7 +33,7 @@ lint-shadow:
 	$(GOLANGCI_LINT) run -c .golangci-shadow.yml ./...
 
 install:
-	go install -ldflags "-X main.Version=$$(git describe --tags --always 2>/dev/null || echo 1.0.0)"
+	go install -ldflags "$(VERSION_LDFLAGS)"
 
 coverage:
 	go test ./... -cover

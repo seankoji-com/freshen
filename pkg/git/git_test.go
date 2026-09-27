@@ -155,7 +155,7 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 				"repositories": {
 					"nodes": [
 						{"name": "freshen", "issues": {"totalCount": 3}, "pullRequests": {"totalCount": 1}},
-						{"name": "careynas.net", "issues": {"totalCount": 0}, "pullRequests": {"totalCount": 2}}
+						{"name": "wiki.example.org", "issues": {"totalCount": 0}, "pullRequests": {"totalCount": 2}}
 					]
 				}
 			}
@@ -180,8 +180,8 @@ func TestFetchOrgRepoCounts(t *testing.T) {
 			t.Fatalf("FetchOrgRepoCounts() error = %v", err)
 		}
 		want := map[string]RepoCounts{
-			"freshen":      {Issues: 3, PRs: 1},
-			"careynas.net": {Issues: 0, PRs: 2},
+			"freshen":          {Issues: 3, PRs: 1},
+			"wiki.example.org": {Issues: 0, PRs: 2},
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("FetchOrgRepoCounts() = %+v, want %+v", got, want)
@@ -1485,7 +1485,6 @@ func TestGetLocalDirName(t *testing.T) {
 		withAliases(t, nil)
 		cases := map[string]string{
 			".github":       "github",
-			"careynas.net":  "wiki.robot.house",
 			"freshen":       "freshen",
 			"foo..bar":      "foo..bar", // dots are legal in repo names, not traversal
 			"..evil":        "..evil",   // must NOT collide with "evil"
@@ -1520,14 +1519,14 @@ func TestGetLocalDirName(t *testing.T) {
 
 func TestAddAlias(t *testing.T) {
 	t.Run("valid pair round-trips through both directions", func(t *testing.T) {
-		withAliases(t, map[string]string{"wiki": "careynas.net"})
+		withAliases(t, map[string]string{"wiki": "wiki.example.org"})
 
-		local, ok := GetLocalDirName("careynas.net")
+		local, ok := GetLocalDirName("wiki.example.org")
 		if !ok || local != "wiki" {
-			t.Fatalf("GetLocalDirName(careynas.net) = %q, %v; want wiki, true", local, ok)
+			t.Fatalf("GetLocalDirName(wiki.example.org) = %q, %v; want wiki, true", local, ok)
 		}
-		if remote := GetGHRepoName(local); remote != "careynas.net" {
-			t.Errorf("GetGHRepoName(%q) = %q, want careynas.net", local, remote)
+		if remote := GetGHRepoName(local); remote != "wiki.example.org" {
+			t.Errorf("GetGHRepoName(%q) = %q, want wiki.example.org", local, remote)
 		}
 	})
 
@@ -1555,4 +1554,36 @@ func TestAddAlias(t *testing.T) {
 			t.Errorf("GetLocalDirName(some-repo) = %q, %v; want some-repo, true", got, ok)
 		}
 	})
+}
+
+// Config aliases are registered first and -alias flags second; a later pair
+// for the same local or remote name must replace the earlier pair entirely.
+func TestAddAliasOverrideDropsReplacedPair(t *testing.T) {
+	withAliases(t, nil)
+	for _, p := range [][2]string{{"wiki", "old-wiki"}, {"docs", "product-docs"}} { // config
+		if err := AddAlias(p[0], p[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range [][2]string{{"wiki", "new-wiki"}, {"manuals", "product-docs"}} { // flags
+		if err := AddAlias(p[0], p[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := GetGHRepoName("wiki"); got != "new-wiki" {
+		t.Errorf("GetGHRepoName(wiki) = %q, want new-wiki", got)
+	}
+	if got, _ := GetLocalDirName("new-wiki"); got != "wiki" {
+		t.Errorf("GetLocalDirName(new-wiki) = %q, want wiki", got)
+	}
+	if got, _ := GetLocalDirName("old-wiki"); got != "old-wiki" {
+		t.Errorf("GetLocalDirName(old-wiki) = %q, want its own folder, not the overridden alias", got)
+	}
+	if got, _ := GetLocalDirName("product-docs"); got != "manuals" {
+		t.Errorf("GetLocalDirName(product-docs) = %q, want manuals", got)
+	}
+	if got := GetGHRepoName("docs"); got != "docs" {
+		t.Errorf("GetGHRepoName(docs) = %q, want docs (its pair was replaced)", got)
+	}
 }

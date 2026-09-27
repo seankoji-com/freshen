@@ -23,10 +23,25 @@ import (
 )
 
 // shutdownWait is how long main() waits for in-flight background git
-// operations to stop after the TUI exits, before returning anyway.
-const shutdownWait = 5 * time.Second
+// operations to stop after the TUI exits, before returning anyway. A
+// cancelled sync may still spend up to git.CleanupTimeout aborting a merge
+// and restoring its auto-stash; exiting sooner would kill that git process
+// mid-restore, so the wait covers it with a few seconds to spare.
+const shutdownWait = git.CleanupTimeout + 5*time.Second
 
-var Version = "1.0.0"
+// Version is stamped at build time: `make build` passes `git describe`, and
+// .goreleaser.yaml passes the release tag, both via -X main.Version.
+var Version = "dev"
+
+// displayVersion prints a single leading "v" whether or not the stamped value
+// carries one (git describe does, GoReleaser's {{.Version}} does not).
+func displayVersion(v string) string {
+	v = strings.TrimPrefix(v, "v")
+	if v != "" && v[0] >= '0' && v[0] <= '9' {
+		return "v" + v
+	}
+	return v
+}
 
 // aliasFlags implements flag.Value for a repeatable --alias local=remote flag,
 // letting a user add to or override the built-in repo alias pairs in
@@ -154,21 +169,25 @@ func main() {
 	flag.BoolVar(&deleteArchivedFlag, "delete-archived", false, "Allow archived repository deletion in non-interactive mode")
 	flag.Var(&aliasFlag, "alias", "Repeatable repo alias mapping in the form local=remote, adding to/overriding the built-in defaults")
 
-	flag.Parse()
-
-	if versionFlag {
-		fmt.Printf("freshen v%s\n", Version)
-		os.Exit(0)
-	}
+	// Config aliases go in before flag.Parse so a -alias flag for the same
+	// local name overrides them, like every other flag overrides config.
 	if aliasErr := applyConfigAliases(cfg.Aliases); aliasErr != nil {
 		fmt.Fprintf(os.Stderr, "freshen config: %v\n", aliasErr)
 		os.Exit(1)
+	}
+
+	flag.Parse()
+	git.DisableTerminalPrompts()
+
+	if versionFlag {
+		fmt.Printf("freshen %s\n", displayVersion(Version))
+		os.Exit(0)
 	}
 	if orgFlag != "" {
 		ownerFlag = orgFlag
 	}
 	if cfg.Workspace == "" && !nonInteractiveFlag && dirFlag == defaultReposDir {
-		cfg, err = runFirstSetup(defaultReposDir)
+		cfg, err = runFirstSetup(defaultReposDir, cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
 			os.Exit(1)

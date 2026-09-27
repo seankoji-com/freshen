@@ -12,7 +12,7 @@
 - **Organization overview**: Starts with repository, Actions and runner health at a glance, then opens dedicated searchable screens for each area.
 - **Concern queue**: Ranks repositories with open PRs or issues and opens their existing detail view for review.
 - **Explicit repository sync**: Startup loads metadata. Sync or clone only when requested; archived repositories are highlighted.
-- **Alias Mappings**: Hardcoded mapping support for custom repo folder names (e.g. `.github` ➔ `github`, `careynas.net` ➔ `wiki.robot.house`).
+- **Alias Mappings**: Map GitHub repo names to custom local folder names with a repeatable `-alias local=remote` flag or an `aliases` list in the config file. `.github` ➔ `github` is built in.
 - **GitHub Actions monitoring**: Workflow runs, a separate job queue, completed-job and step counts, runner assignments, and a log tail for the selected job.
 - **Interactive Controls**:
   - Re-sync / retry individual repositories.
@@ -112,6 +112,10 @@ freshen -dir ~/repos -owner octocat
 # Non-interactive sync; archived repositories are never deleted by default
 freshen -y
 
+# Keep the GitHub repo "my-wiki" in a local folder named "wiki"
+# (local folder name first, GitHub repo name second; repeatable)
+freshen -alias wiki=my-wiki -alias docs=product-docs
+
 # Display version
 freshen -v
 ```
@@ -128,7 +132,18 @@ Batch mode (`-y`) leaves logging on stderr.
 
 ### First run, configuration, and GitHub access
 
-On first interactive launch, freshen asks for a sibling-repository workspace and an optional GitHub owner. Configuration is stored as `freshen/config.json` in the platform config directory; it contains no credentials. Flags override config, then `FRESHEN_OWNER` (or legacy `FRESHEN_ORG`) can supply an owner.
+On first interactive launch, freshen asks for a sibling-repository workspace and an optional GitHub owner. Configuration is stored as `freshen/config.json` in the platform config directory; it contains no credentials. To keep alias mappings without passing `-alias` every run, add an `aliases` list in the same `local=remote` form to your existing `config.json` (run freshen once first so setup creates it):
+
+```json
+{
+  "workspace": "/Users/you/repos",
+  "owner": "octocat",
+  "concurrency": 4,
+  "aliases": ["wiki=my-wiki", "docs=product-docs"]
+}
+```
+
+Flags override config. A `-alias` replaces any config alias that uses the same local folder name or the same GitHub repo name, so each folder maps to exactly one repo. Then `FRESHEN_OWNER` (or legacy `FRESHEN_ORG`) can supply an owner.
 
 Workspace-only mode requires `git` and never calls GitHub. GitHub features require an authenticated [GitHub CLI](https://cli.github.com/) (`gh auth login`) or `GH_TOKEN`. Use a token with access to the target repositories; organization runner visibility may require organization-admin or runner permissions.
 

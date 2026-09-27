@@ -66,7 +66,9 @@ func (m setupModel) View() string {
 	return lipgloss.NewStyle().Padding(1, 2).Render("Freshen first-run setup\n\nWorkspace (sibling repositories):\n" + m.inputs[0].View() + "\n\nEnter to save • Esc to cancel")
 }
 
-func runFirstSetup(defaultDir string) (config.Config, error) {
+// runFirstSetup asks for the workspace and saves it into existing, so keys the
+// user already put in config.json (such as aliases) survive first-run setup.
+func runFirstSetup(defaultDir string, existing config.Config) (config.Config, error) {
 	p, err := tea.NewProgram(newSetupModel(defaultDir)).Run()
 	if err != nil {
 		return config.Config{}, err
@@ -85,7 +87,11 @@ func runFirstSetup(defaultDir string) (config.Config, error) {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return config.Config{}, err
 	}
-	c := config.Config{Workspace: workspace, Concurrency: 4}
+	c := existing
+	c.Workspace = workspace
+	if c.Concurrency <= 0 {
+		c.Concurrency = 4
+	}
 	return c, config.Save(c)
 }
 
