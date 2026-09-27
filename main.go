@@ -187,7 +187,7 @@ func main() {
 		ownerFlag = orgFlag
 	}
 	if cfg.Workspace == "" && !nonInteractiveFlag && dirFlag == defaultReposDir {
-		cfg, err = runFirstSetup(defaultReposDir)
+		cfg, err = runFirstSetup(defaultReposDir, cfg)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
 			os.Exit(1)

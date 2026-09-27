@@ -132,15 +132,18 @@ Batch mode (`-y`) leaves logging on stderr.
 
 ### First run, configuration, and GitHub access
 
-On first interactive launch, freshen asks for a sibling-repository workspace and an optional GitHub owner. Configuration is stored as `freshen/config.json` in the platform config directory; it contains no credentials. To keep alias mappings without passing `-alias` every run, add them to the config file's `aliases` list in the same `local=remote` form:
+On first interactive launch, freshen asks for a sibling-repository workspace and an optional GitHub owner. Configuration is stored as `freshen/config.json` in the platform config directory; it contains no credentials. To keep alias mappings without passing `-alias` every run, add an `aliases` list in the same `local=remote` form to your existing `config.json` (run freshen once first so setup creates it):
 
 ```json
 {
+  "workspace": "/Users/you/repos",
+  "owner": "octocat",
+  "concurrency": 4,
   "aliases": ["wiki=my-wiki", "docs=product-docs"]
 }
 ```
 
-Flags override config (a `-alias` for the same local folder name wins over the config entry), then `FRESHEN_OWNER` (or legacy `FRESHEN_ORG`) can supply an owner.
+Flags override config. A `-alias` replaces any config alias that uses the same local folder name or the same GitHub repo name, so each folder maps to exactly one repo. Then `FRESHEN_OWNER` (or legacy `FRESHEN_ORG`) can supply an owner.
 
 Workspace-only mode requires `git` and never calls GitHub. GitHub features require an authenticated [GitHub CLI](https://cli.github.com/) (`gh auth login`) or `GH_TOKEN`. Use a token with access to the target repositories; organization runner visibility may require organization-admin or runner permissions.
 

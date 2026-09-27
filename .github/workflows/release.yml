@@ -4,6 +4,12 @@ on:
     tags: ['v*']
 permissions:
   contents: write
+# Releases push to the shared homebrew-tap repository, so two tags must never
+# publish at once. Group on the repository (not the ref) and never cancel a
+# run that may already have published.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
 jobs:
   release:
     timeout-minutes: 20

@@ -1555,3 +1555,35 @@ func TestAddAlias(t *testing.T) {
 		}
 	})
 }
+
+// Config aliases are registered first and -alias flags second; a later pair
+// for the same local or remote name must replace the earlier pair entirely.
+func TestAddAliasOverrideDropsReplacedPair(t *testing.T) {
+	withAliases(t, nil)
+	for _, p := range [][2]string{{"wiki", "old-wiki"}, {"docs", "product-docs"}} { // config
+		if err := AddAlias(p[0], p[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range [][2]string{{"wiki", "new-wiki"}, {"manuals", "product-docs"}} { // flags
+		if err := AddAlias(p[0], p[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := GetGHRepoName("wiki"); got != "new-wiki" {
+		t.Errorf("GetGHRepoName(wiki) = %q, want new-wiki", got)
+	}
+	if got, _ := GetLocalDirName("new-wiki"); got != "wiki" {
+		t.Errorf("GetLocalDirName(new-wiki) = %q, want wiki", got)
+	}
+	if got, _ := GetLocalDirName("old-wiki"); got != "old-wiki" {
+		t.Errorf("GetLocalDirName(old-wiki) = %q, want its own folder, not the overridden alias", got)
+	}
+	if got, _ := GetLocalDirName("product-docs"); got != "manuals" {
+		t.Errorf("GetLocalDirName(product-docs) = %q, want manuals", got)
+	}
+	if got := GetGHRepoName("docs"); got != "docs" {
+		t.Errorf("GetGHRepoName(docs) = %q, want docs (its pair was replaced)", got)
+	}
+}

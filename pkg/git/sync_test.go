@@ -400,3 +400,29 @@ func TestDisableTerminalPromptsReachesSubprocesses(t *testing.T) {
 		t.Errorf("subprocess did not inherit GIT_TERMINAL_PROMPT=0:\n%s", out)
 	}
 }
+
+func TestSyncRefusesRepoWithUnfinishedMerge(t *testing.T) {
+	f := newSyncFixture(t)
+	f.commit(f.work, "tracked.txt", "local commit\n", "local change")
+	f.commit(f.peer, "tracked.txt", "upstream commit\n", "upstream change")
+	runGit(t, f.peer, "push", "origin", "main")
+	runGit(t, f.work, "fetch", "origin")
+	// The user's own merge, stopped on a conflict.
+	cmd := exec.Command("git", "-C", f.work, "merge", "origin/main")
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected a conflicted merge, got success:\n%s", out)
+	}
+	mergeHead := runGit(t, f.work, "rev-parse", "MERGE_HEAD")
+
+	item := f.sync(true)
+
+	if item.Status != StatusError || item.StatusMsg != "Merge Pending" {
+		t.Fatalf("status = %s/%s, want ERROR/Merge Pending; logs:\n%s", item.Status, item.StatusMsg, strings.Join(item.Logs, "\n"))
+	}
+	if got := runGit(t, f.work, "rev-parse", "MERGE_HEAD"); got != mergeHead {
+		t.Errorf("the user's merge was changed: MERGE_HEAD = %s, want %s", got, mergeHead)
+	}
+	if n := f.stashCount(); n != 0 {
+		t.Errorf("sync stashed %d entries on a repo it should have left alone", n)
+	}
+}

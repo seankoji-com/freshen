@@ -281,6 +281,15 @@ func AddAlias(local, remote string) error {
 	if _, ok := sanitizeDirName(remote); !ok {
 		return fmt.Errorf("invalid remote alias name %q: must be a single path segment, not empty, %q or %q", remote, ".", "..")
 	}
+	// A later pair for the same local or remote name replaces the earlier
+	// one completely. Drop the replaced pair's other half, or two GitHub repos
+	// would resolve to the same folder (or one folder to two repos).
+	if prev, ok := aliasToRemote[local]; ok && prev != remote {
+		delete(aliasToLocal, prev)
+	}
+	if prev, ok := aliasToLocal[remote]; ok && prev != local {
+		delete(aliasToRemote, prev)
+	}
 	aliasToRemote[local] = remote
 	aliasToLocal[remote] = local
 	return nil
@@ -1126,6 +1135,13 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
 	defer cancel()
 
+	// An unfinished merge belongs to the user: pulling or rebasing would fail
+	// on it, and cleaning up after that failure would abort their merge.
+	if mergeInProgress(ctx, item.Path) {
+		s.finish(StatusError, "Merge Pending", "󰅙 '%s' has an unfinished merge (MERGE_HEAD exists). Commit or abort it, then sync again; nothing was changed.", item.Path)
+		return
+	}
+
 	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
 
 	if origBranch != defaultBranch {
@@ -1223,11 +1239,11 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), CleanupTimeout)
 		defer cleanupCancel()
-		if pullErr != nil {
-			// A conflicted merge would block the restore; back it out first.
-			// With no merge in progress this fails harmlessly, so only log
-			// when one was actually left behind.
-			if abortOut, abortErr := exec.CommandContext(cleanupCtx, "git", "-C", item.Path, "merge", "--abort").CombinedOutput(); abortErr != nil && mergeInProgress(cleanupCtx, item.Path) {
+		// A conflicted merge would block the restore; back it out first. The
+		// sync refused to start with a merge already in progress, so any merge
+		// found here was started by this pull.
+		if pullErr != nil && mergeInProgress(cleanupCtx, item.Path) {
+			if abortOut, abortErr := exec.CommandContext(cleanupCtx, "git", "-C", item.Path, "merge", "--abort").CombinedOutput(); abortErr != nil {
 				s.log("󰀪 git merge --abort failed — repository may be left mid-merge: %v %s", abortErr, strings.TrimSpace(string(abortOut)))
 			}
 		}
@@ -1293,12 +1309,23 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		// A rebase that succeeds but cannot re-apply its autostash still
 		// exits 0; git keeps the changes as a new stash entry and leaves
 		// conflict markers in the tree. Detect that by the entry it adds.
-		if stashListErr == nil {
-			if after, listErr := stashEntries(ctx, item.Path); listErr == nil && len(after) > len(stashesBefore) {
+		verifyErr := stashListErr
+		if verifyErr == nil {
+			// A fresh context: a sync deadline landing right after the
+			// rebase must not turn "could not check" into "clean".
+			verifyCtx, verifyCancel := context.WithTimeout(context.Background(), CleanupTimeout)
+			after, listErr := stashEntries(verifyCtx, item.Path)
+			verifyCancel()
+			verifyErr = listErr
+			if listErr == nil && len(after) > len(stashesBefore) {
 				item.Stashed = true
 				s.finish(StatusRebaseConflict, "Conflict", "󰅙 Rebased '%s' onto '%s', but re-applying local changes conflicted — resolve the conflicts; the changes are also kept in stash %s. %s", origBranch, rebaseTarget, after[0].sha, strings.TrimSpace(rebaseOut.String()))
 				return
 			}
+		}
+		if verifyErr != nil {
+			s.finish(StatusError, "Unverified", "󰀪 Rebased '%s' onto '%s', but could not check whether local changes were re-applied (%v). Run git status and git stash list before relying on the tree.", origBranch, rebaseTarget, verifyErr)
+			return
 		}
 		s.finish(StatusRebased, "Rebased", "󰄬 Rebased '%s' onto '%s'.", origBranch, rebaseTarget)
 	} else {
