@@ -14,7 +14,7 @@ archives:
   - wrap_in_directory: false
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
 checksum:
   name_template: checksums.txt
 brews:
