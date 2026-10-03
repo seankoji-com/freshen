@@ -9,7 +9,10 @@ builds:
     ldflags:
       - -s -w -X main.Version={{.Version}}
 archives:
-  - format_overrides:
+  # Archives hold files at the root (freshen.exe, not freshen_<ver>_<os>_<arch>/).
+  # The winget manifest's RelativeFilePath depends on this, so pin the default.
+  - wrap_in_directory: false
+    format_overrides:
       - goos: windows
         format: zip
 checksum:
@@ -19,5 +22,14 @@ brews:
       owner: seankoji-com
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    # The tap keeps formulae under Formula/; without this GoReleaser writes
+    # freshen.rb at the tap root and leaves Formula/freshen.rb untouched.
+    directory: Formula
     homepage: https://github.com/seankoji-com/freshen
     description: TUI for refreshing sibling Git repositories
+    license: Apache-2.0
+    # Do not overwrite the stable formula when tagging a prerelease (v1.0.0-rc1).
+    skip_upload: auto
+    # main.Version is stamped from the tag; `-v` prints "freshen v<version>".
+    test: |
+      assert_match "freshen v#{version}", shell_output("#{bin}/freshen -v")

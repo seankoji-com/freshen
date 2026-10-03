@@ -35,7 +35,7 @@ repo's closed-PR history, not generic Go advice.
 ## Do not spend attention here
 - `docs/*.md` (architecture.md, conventions.md, dependencies.md) and
   `docs/assets/` — reference prose and a screenshot, not logic.
-- `manifests/SeanKoji.Freshen.yaml` — generated winget packaging metadata.
+- `scripts/winget-manifest.sh` — renders the winget manifest from a release's `checksums.txt`.
 - `.github/workflows/*.yml` — synced from `seankoji-com/.github` (5 of the
   last 20 PRs were exactly this sync); local review gets overwritten on the
   next sync.

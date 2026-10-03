@@ -83,3 +83,48 @@ jobs:
       # defines the enforcing pipeline, so CI and local dev can't drift.
       - name: Tier 1a (enforcing) — make lint
         run: make lint
+  # Surfaces .goreleaser.yaml errors and release-layout regressions on the PR,
+  # not when a tag is pushed. Keep `version` in step with release.yml.
+  release-config:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: goreleaser check
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: check
+      - name: goreleaser snapshot build (no publish)
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: v2.18.2
+          args: release --snapshot --clean --skip=publish
+        env:
+          # The tap token is templated into .goreleaser.yaml; snapshot runs never
+          # use it, but an unset variable can fail template evaluation.
+          HOMEBREW_TAP_GITHUB_TOKEN: snapshot-unused
+      - name: Check generated formula and winget manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          formula=$(find dist -name freshen.rb)
+          echo "formula: $formula"
+          test "$formula" = dist/homebrew/Formula/freshen.rb
+          ruby -c "$formula"
+          grep -F 'license "Apache-2.0"' "$formula"
+          grep -F 'assert_match "freshen v#{version}"' "$formula"
+          version=$(jq -r .version dist/metadata.json)
+          # RelativeFilePath in the winget manifest assumes the exe is at the archive root.
+          unzip -Z1 "dist/freshen_${version}_windows_amd64.zip" | grep -Fx freshen.exe
+          unzip -Z1 "dist/freshen_${version}_windows_arm64.zip" | grep -Fx freshen.exe
+          scripts/winget-manifest.sh "v${version}" dist/checksums.txt dist/SeanKoji.Freshen.yaml
+          cat dist/SeanKoji.Freshen.yaml

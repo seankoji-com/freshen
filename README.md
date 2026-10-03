@@ -38,8 +38,9 @@ brew install seankoji-com/tap/freshen
 Install via the Windows Package Manager:
 
 ```powershell
-# Install from repository manifest
-winget install --manifest manifests/SeanKoji.Freshen.yaml
+# Install from the manifest attached to a GitHub release
+# (download SeanKoji.Freshen.yaml from the release page first)
+winget install --manifest SeanKoji.Freshen.yaml
 
 # Or once indexed in winget-pkgs
 winget install SeanKoji.Freshen
@@ -159,10 +160,14 @@ checksums to GitHub Releases, and updates the configured Homebrew tap when the
 repository token has write access to that tap. Configure a dedicated
 `HOMEBREW_TAP_GITHUB_TOKEN` repository secret with write access to
 `seankoji-com/homebrew-tap`; the default `GITHUB_TOKEN` cannot write to that
-separate repository. Winget publication is a separate
-upstream submission: update the version, URLs, installer hashes, and license in
-`manifests/SeanKoji.Freshen.yaml`, validate it with `winget validate`, then open
-the corresponding pull request in `microsoft/winget-pkgs`.
+separate repository. The Homebrew formula is written to
+`Formula/freshen.rb` in the tap. The workflow also generates
+`SeanKoji.Freshen.yaml` from the release's `checksums.txt`
+(`scripts/winget-manifest.sh`) and attaches it to the release. Winget
+publication is a separate upstream submission: validate that file with
+`winget validate`, then open the corresponding pull request in
+`microsoft/winget-pkgs`. CI runs `goreleaser check` and a snapshot build on every
+pull request so release config errors surface before a tag.
 
 ---
 
