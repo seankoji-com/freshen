@@ -38,3 +38,11 @@ jobs:
           # push to seankoji-com/homebrew-tap needs its own token with
           # contents:write on that repo (see .goreleaser.yaml brews.repository).
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+      # Winget manifests are generated from the release's own checksums.txt and
+      # attached to the release; submit that file to microsoft/winget-pkgs.
+      - name: Generate winget manifest and attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          scripts/winget-manifest.sh "$GITHUB_REF_NAME" dist/checksums.txt dist/SeanKoji.Freshen.yaml
+          gh release upload "$GITHUB_REF_NAME" dist/SeanKoji.Freshen.yaml --clobber
