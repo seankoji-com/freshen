@@ -107,11 +107,11 @@ jobs:
       # so tolerate exactly that deprecation and fail on everything else.
       - name: goreleaser check
         shell: bash
-        env:
-          NO_COLOR: "1"
         run: |
           rc=0
-          goreleaser check 2>&1 | tee check.log || rc=${PIPESTATUS[0]}
+          goreleaser check 2>&1 | tee check.raw || rc=${PIPESTATUS[0]}
+          # goreleaser ignores NO_COLOR; strip ANSI so the greps below match.
+          sed 's/\x1b\[[0-9;]*m//g' check.raw > check.log
           if [ "$rc" -eq 0 ]; then exit 0; fi
           if [ "$rc" -eq 2 ] \
             && grep -q 'uses deprecated properties' check.log \
