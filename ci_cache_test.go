@@ -224,23 +224,61 @@ func (f *cacheFixture) childEnv() []string {
 	return env
 }
 
-// shimProbe runs every shim through the fixture environment and compares the
-// output with the values the fixture published. A real toolchain, or a selector
-// that never loaded, produces different output, so the probe fails instead of
-// letting a host binary satisfy a cache assertion. It never skips.
+// shimProbe verifies, before anything else runs, that go/git/gcc resolve to this
+// fixture's own shims, and only then exercises them and compares their output
+// with the values the fixture published. A real toolchain, or a selector that
+// never loaded, produces a rejected selection or different output, so the probe
+// fails instead of letting a host binary satisfy a cache assertion. It never
+// skips.
+//
+// The selection preflight is a guard, not a diagnostic: the script returns
+// `selection=rejected` and exits *before* the `go env`/`git rev-parse`/`gcc
+// --version` lines. The earlier version invoked every tool first and validated
+// resolution afterwards, so a fixture whose selector was missing, empty or
+// foreign still executed the host's real go/git/gcc — on a Windows runner the
+// real git answered `fatal: not a git repository`, and a real tool could satisfy
+// a policy fixture. A rejected selection must never reach a real tool.
+//
+// A tool counts as fixture-owned only when it is either a shell function that
+// hands off to <fixture>/bin/<tool> (the BASH_ENV selector) or the literal
+// <fixture>/bin/<tool> file on PATH. A bare name, a path anywhere else, or a
+// foreign function is rejected.
 func (f *cacheFixture) shimProbe() error {
 	f.t.Helper()
 	const script = `set -u
-for tool in go git gcc; do printf 'which-%s=%s\n' "$tool" "$(command -v "$tool")"; done
+fixture_dir=${1:-}
+rejected=''
+for tool in go git gcc; do
+  resolved=$(command -v "$tool" 2>/dev/null || true)
+  kind=''
+  if [ "$resolved" = "$tool" ] && [ "$(type -t "$tool" 2>/dev/null || true)" = function ]; then
+    shim_dir=${FRESHEN_SHIM_DIR:-}
+    if [ -n "$shim_dir" ] && [ -f "$shim_dir/bin/$tool" ]; then
+      case "$(declare -f "$tool" 2>/dev/null || true)" in
+        *'$FRESHEN_SHIM_DIR/bin/'"$tool"*) kind=function ;;
+      esac
+    fi
+  elif [ -n "$fixture_dir" ] && [ "$resolved" = "$fixture_dir/bin/$tool" ]; then
+    kind=path
+  fi
+  printf 'which-%s=%s\n' "$tool" "$resolved"
+  printf 'kind-%s=%s\n' "$tool" "$kind"
+  if [ -z "$kind" ]; then rejected=1; fi
+done
+if [ -n "$rejected" ]; then
+  printf 'selection=rejected\n'
+  exit 0
+fi
+printf 'selection=fixture\n'
 printf 'go-env=%s\n' "$(go env GOVERSION)"
 printf 'git-rev=%s\n' "$(git rev-parse HEAD)"
 printf 'gcc-ver=%s\n' "$(gcc --version)"
 `
-	cmd := exec.Command("bash", "-c", script)
+	cmd := exec.Command("bash", "-c", script, "freshen-fixture", f.posixPath(f.dir))
 	cmd.Dir = f.dir
 	cmd.Env = f.childEnv()
 	out, err := cmd.CombinedOutput()
-	observed := make(map[string]string, len(shimTools)+3)
+	observed := make(map[string]string, 2*len(shimTools)+4)
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if key, value, ok := strings.Cut(line, "="); ok {
 			observed[key] = value
@@ -250,10 +288,16 @@ printf 'gcc-ver=%s\n' "$(gcc --version)"
 	if err != nil {
 		problems = append(problems, fmt.Sprintf("probe exited with %v", err))
 	}
+	if observed["selection"] != "fixture" {
+		problems = append(problems, fmt.Sprintf("selection=%q, so no fixture tool was exercised", observed["selection"]))
+		for _, tool := range shimTools {
+			problems = append(problems, fmt.Sprintf("%s resolved to %q", tool, observed["which-"+tool]))
+		}
+		return fmt.Errorf("%s (BASH_ENV=%q PATH=%q): %s", strings.Join(problems, "; "), f.env["BASH_ENV"], f.env["PATH"], out)
+	}
 	for _, tool := range shimTools {
-		resolved := observed["which-"+tool]
-		if resolved != tool && !strings.HasSuffix(filepath.ToSlash(resolved), "/bin/"+tool) {
-			problems = append(problems, fmt.Sprintf("%s resolved to %q, not a fixture shim", tool, resolved))
+		if observed["kind-"+tool] == "" {
+			problems = append(problems, fmt.Sprintf("%s resolved to %q, not a fixture shim", tool, observed["which-"+tool]))
 		}
 	}
 	for _, expect := range []struct{ field, key string }{
@@ -641,6 +685,87 @@ func TestCICacheShimSelectorRequired(t *testing.T) {
 			} else {
 				t.Logf("probe rejected the bad case: %v", err)
 			}
+		})
+	}
+}
+
+// TestCICacheExternalSelectionIsInert is the host tripwire for the rejection
+// path. When the fixture selector is missing, empty or foreign, the probe must
+// refuse the selection without ever running go, git or gcc. The fixture PATH
+// holds only dummy tools that append their name to TRIPWIRE, so any invocation
+// leaves a mark: a probe that passed, or that reached the `go env`/`git
+// rev-parse`/`gcc --version` lines before validating, would create it. No real
+// tool is reachable and none is called.
+//
+// The `selection=rejected` marker is the platform-independent half of the
+// proof (the script exited before the invocation lines); the empty TRIPWIRE is
+// the exec-level half, which also holds where a script can be executed from
+// PATH.
+func TestCICacheExternalSelectionIsInert(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(f *cacheFixture)
+	}{
+		{"host-tools-reachable", func(f *cacheFixture) {
+			// No selector, and only the inert dummies on PATH: the tools
+			// resolve, but not to this fixture, so a regression executes a
+			// tripwire instead of a system binary.
+			f.env["BASH_ENV"] = f.posixPath(filepath.Join(f.dir, "absent.bash"))
+		}},
+		{"foreign-selector-delegates", func(f *cacheFixture) {
+			// A selector that defines go/git/gcc but hands off to the dummies
+			// instead of the fixture's bin/ is still a foreign selection.
+			delegates := "#!/usr/bin/env bash\n"
+			for _, tool := range shimTools {
+				delegates += tool + `() { command "` + f.posixPath(filepath.Join(f.dir, "host-tools", tool)) + `" "$@"; }
+`
+			}
+			f.write("foreign-selector.bash", []byte(delegates))
+			f.env["BASH_ENV"] = f.posixPath(filepath.Join(f.dir, "foreign-selector.bash"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCacheFixture(t)
+			tripwire := filepath.Join(f.dir, "tripwire")
+			f.env["TRIPWIRE"] = f.posixPath(tripwire)
+			hostTools := filepath.Join(f.dir, "host-tools")
+			for _, tool := range shimTools {
+				// The interpreter sits at an absolute path so the dummy still
+				// runs when PATH holds nothing but this directory — a
+				// `#!/usr/bin/env bash` shebang would fail to start and leave
+				// the tripwire empty even on a real regression.
+				f.write("host-tools/"+tool, []byte("#!/bin/sh\nprintf '%s\\n' \""+tool+"\" >> \"$TRIPWIRE\"\n"))
+			}
+			// Drop the fixture PATH entry: resolution can only come from the
+			// selector, which the case below disables.
+			f.env["PATH"] = hostTools
+			if tc.setup != nil {
+				tc.setup(f)
+			}
+			err := f.shimProbe()
+			if err == nil {
+				t.Fatal("probe passed with a non-fixture selection; a real tool could satisfy this fixture")
+			}
+			if !strings.Contains(err.Error(), "selection=rejected") {
+				t.Fatalf("rejected selection did not report the preflight guard: %v", err)
+			}
+			if data, readErr := os.ReadFile(tripwire); readErr == nil {
+				t.Fatalf("rejected selection invoked external tools: %s", data)
+			} else if !os.IsNotExist(readErr) {
+				t.Fatalf("tripwire unreadable: %v", readErr)
+			}
+			// Control: the same dummy invoked on purpose must leave a mark, so
+			// the empty tripwire above proves inertness rather than a dead trap.
+			control := exec.Command("bash", f.posixPath(filepath.Join(hostTools, "go")))
+			control.Dir = f.dir
+			control.Env = f.childEnv()
+			if out, controlErr := control.CombinedOutput(); controlErr != nil {
+				t.Fatalf("tripwire control could not run: %v: %s", controlErr, out)
+			}
+			if data, readErr := os.ReadFile(tripwire); readErr != nil || !strings.Contains(string(data), "go") {
+				t.Fatalf("tripwire control did not record an invocation: %q, %v", data, readErr)
+			}
+			t.Logf("rejected selection reached no tool: %v", err)
 		})
 	}
 }
