@@ -712,18 +712,18 @@ func TestCICachePathListSpellings(t *testing.T) {
 // `GOCACHE`, and an exact-case override would leave the host's real toolchain
 // lookup and mutable stores in the child environment.
 func TestCICacheEnvironmentKeyCase(t *testing.T) {
+	// Build the fixture first: it composes its own PATH from the process PATH, and
+	// on Windows `Path` and `PATH` are one variable, so installing the host
+	// spellings first would fold them into the fixture value instead of standing
+	// beside it.
+	f := newCacheFixture(t)
+	f.caseInsensitiveKeys = true
 	hostTools := filepath.Join(t.TempDir(), "host-tools")
 	hostCache := filepath.Join(t.TempDir(), "host-go-cache")
-	// Keep the real PATH entries: on Windows the environment is case-insensitive,
-	// so setting `Path` alone replaces `PATH` and the fixture's own bash/cygpath
-	// lookups stop resolving. Append a distinctive host marker instead, so an
-	// unfolded `Path` would still be visible to the assertions below.
-	t.Setenv("Path", pathList(append(filepath.SplitList(os.Getenv("PATH")), hostTools), string(os.PathListSeparator)))
+	t.Setenv("Path", hostTools)
 	t.Setenv("GoCache", hostCache)
 	t.Setenv("FRESHEN_FIXTURE_UNRELATED", "keep")
 
-	f := newCacheFixture(t)
-	f.caseInsensitiveKeys = true
 	env := f.childEnv()
 	paths, unrelated := 0, false
 	for _, entry := range env {
