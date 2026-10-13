@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -34,11 +35,14 @@ func (m terminalDemo) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	// Quit only through bindings the production handler honours right now, so
+	// the demo cannot mask a hint that advertises a suspended key.
+	keys := m.keys()
 	next, cmd := m.Model.Update(msg)
 	updated := next.(Model)
 	settleDemoRequests(&updated)
 	next = updated
-	if k, ok := msg.(tea.KeyMsg); ok && (k.String() == "q" || k.String() == "ctrl+c") {
+	if k, ok := msg.(tea.KeyMsg); ok && (key.Matches(k, keys.ForceQuit) || key.Matches(k, keys.Quit)) {
 		return next, tea.Quit
 	}
 	if _, ok := msg.(spinner.TickMsg); ok {

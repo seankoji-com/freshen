@@ -583,3 +583,92 @@ func TestActionMenuKeepsSelectionWithLongName(t *testing.T) {
 		}
 	}
 }
+
+// An in-flight refresh over cached rows stays visible at every width: when the
+// header cannot fit the freshness text it keeps a compact spinner instead.
+func TestCompactHeaderKeepsRefreshIndicator(t *testing.T) {
+	cases := []struct {
+		name  string
+		focus string
+		set   func(m *Model)
+	}{
+		{"runners", "3", func(m *Model) { m.IsRunnersLoading = true }},
+		{"repos", "1", func(m *Model) { m.IsOrgSyncing = true }},
+		{"actions", "2", func(m *Model) { m.IsJobQueueLoading = true }},
+		{"overview", "0", func(m *Model) { m.IsRunnersLoading = true }},
+		{"long-owner", "3", func(m *Model) { m.TargetOrg = strings.Repeat("an-organisation-", 4); m.IsRunnersLoading = true }},
+	}
+	for _, size := range [][2]int{{30, 10}, {31, 11}, {48, 14}, {80, 24}, {200, 50}} {
+		for _, c := range cases {
+			m := sized(smokeFixtureModel(), size[0], size[1])
+			press(&m, c.focus)
+			c.set(&m)
+			lines := strings.Split(m.View(), "\n")
+			if len(lines) != size[1] {
+				t.Fatalf("%s %v: %d rows", c.name, size, len(lines))
+			}
+			for i, l := range lines {
+				if w := ansi.StringWidth(l); w > size[0] {
+					t.Fatalf("%s %v: row %d is %d cells", c.name, size, i, w)
+				}
+			}
+			header := stripped(lines[0])
+			if spin := strings.TrimSpace(stripped(m.Spinner.View())); !strings.Contains(header, spin) {
+				t.Fatalf("%s %v: header hides the refresh in flight: %q", c.name, size, header)
+			}
+			if !strings.Contains(header, "freshen") {
+				t.Fatalf("%s %v: header lost the app name: %q", c.name, size, header)
+			}
+			if len(m.Runners) == 0 || len(m.Repos) == 0 {
+				t.Fatal("fixture must keep cached rows")
+			}
+		}
+	}
+	// Idle screens show no indicator, so the spinner always means work.
+	m := sized(smokeFixtureModel(), 30, 10)
+	press(&m, "3")
+	if header := stripped(strings.Split(m.View(), "\n")[0]); strings.Contains(header, "refreshing") || strings.Contains(header, strings.TrimSpace(stripped(m.Spinner.View()))) {
+		t.Fatalf("idle header shows a refresh: %q", header)
+	}
+}
+
+// The too-small notice names a quit key that works in the current layer:
+// pressing exactly what it shows quits, including during a confirmation.
+func TestResizeNoticeNamesWorkingQuitKey(t *testing.T) {
+	contexts := []struct {
+		name, want string
+		open       func(m *Model)
+	}{
+		{"screen", "q quit", func(m *Model) { press(m, "1") }},
+		{"help", "q quit", func(m *Model) { press(m, "?") }},
+		{"filter", "ctrl+c quit", func(m *Model) { press(m, "1"); press(m, "/") }},
+		{"menu", "ctrl+c quit", func(m *Model) { press(m, "1"); press(m, " ") }},
+		{"confirm", "ctrl+c quit", func(m *Model) { press(m, "1"); press(m, "X") }},
+	}
+	for _, c := range contexts {
+		m := sized(smokeFixtureModel(), 80, 24)
+		c.open(&m)
+		m = sized(m, 29, 9)
+		frame := stripped(m.View())
+		if !strings.Contains(frame, c.want) {
+			t.Fatalf("%s: notice does not offer %q:\n%s", c.name, c.want, frame)
+		}
+		hint := strings.Fields(c.want)[0]
+		if !isQuit(pressHandler(&m, hint)) {
+			t.Fatalf("%s: the advertised %q did not quit (pending=%q)", c.name, hint, m.PendingAction)
+		}
+	}
+	// The demo quits only through the same bindings, so it cannot hide a mismatch.
+	d := terminalDemo{sized(smokeFixtureModel(), 80, 24)}
+	next, _ := d.Update(keyMsg("1"))
+	next, _ = next.Update(keyMsg("X"))
+	if next.(terminalDemo).PendingAction == "" {
+		t.Fatal("fixture did not open the prune confirmation")
+	}
+	if _, cmd := next.Update(keyMsg("q")); isQuit(cmd) {
+		t.Fatal("demo quit on q during a confirmation, which production ignores")
+	}
+	if _, cmd := next.Update(keyMsg("ctrl+c")); !isQuit(cmd) {
+		t.Fatal("demo did not quit on ctrl+c")
+	}
+}

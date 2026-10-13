@@ -211,7 +211,35 @@ func (m Model) headerRow() string {
 	if m.JobQueueFetchFailed {
 		left += "  " + th.toastError.Render(statusGlyphs[kindFailure]+" Actions incomplete")
 	}
-	return joinEnds(left, th.dim.Render(m.freshness())+" ", m.Width)
+	if full := th.dim.Render(m.freshness()) + " "; ansi.StringWidth(left)+ansi.StringWidth(full)+2 <= m.Width || !m.screenRefreshing() {
+		return joinEnds(left, full, m.Width)
+	}
+	// Too narrow for the freshness text: keep a compact refresh indicator so an
+	// in-flight refresh over cached rows is never invisible.
+	spin := strings.TrimSpace(m.Spinner.View())
+	for _, right := range []string{spin + " refreshing ", spin + " "} {
+		if ansi.StringWidth(left)+ansi.StringWidth(right)+2 <= m.Width {
+			return joinEnds(left, th.dim.Render(right), m.Width)
+		}
+	}
+	right := th.dim.Render(spin + " ")
+	return ansi.Truncate(left, max(0, m.Width-ansi.StringWidth(right)-1), "…") + " " + right
+}
+
+// screenRefreshing reports whether a refresh feeding the current screen is in
+// flight; it matches the spinner conditions in freshness.
+func (m Model) screenRefreshing() bool {
+	switch m.ActiveFocus {
+	case FocusOverview:
+		return m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading
+	case FocusRepos, FocusConcerns:
+		return m.IsOrgSyncing
+	case FocusJobs:
+		return m.TargetOrg != "" && (m.IsJobQueueLoading || m.RunLoading || m.LogLoading != "")
+	case FocusRunners:
+		return m.TargetOrg != "" && m.IsRunnersLoading
+	}
+	return false
 }
 
 func (m Model) screenName() string {
@@ -477,7 +505,7 @@ func (m Model) screenView() string {
 		return "Starting freshen…"
 	}
 	if m.Width < minFrameWidth || m.Height < minFrameHeight {
-		return fitFrame(fmt.Sprintf("freshen\nResize to at least %d × %d\nq quit", minFrameWidth, minFrameHeight), m.Width, m.Height)
+		return fitFrame(fmt.Sprintf("freshen\nResize to at least %d × %d\n%s", minFrameWidth, minFrameHeight, m.quitHint()), m.Width, m.Height)
 	}
 	body := m.listContent()
 	if m.ActiveFocus == FocusOverview {
@@ -495,6 +523,16 @@ func (m Model) screenView() string {
 	}
 	body = insetFrame(body, m.Width, m.bodyHeight())
 	return fitFrame(strings.Join([]string{m.headerRow(), m.tabRow(), m.contextRow(), body, " " + m.statusLine(), " " + m.footerView()}, "\n"), m.Width, m.Height)
+}
+
+// quitHint names a quit key that works right now: q is suspended by the
+// filter, menu and confirmation layers, ctrl+c never is.
+func (m Model) quitHint() string {
+	k := m.keys()
+	if k.Quit.Enabled() {
+		return k.Quit.Help().Key + " quit"
+	}
+	return k.ForceQuit.Help().Key + " quit"
 }
 
 // helpMaxOffset is the furthest the help overlay can scroll at the current

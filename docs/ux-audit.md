@@ -52,6 +52,8 @@ Reviewed on 13 October 2026 against `f324ced`.
 | A successful empty log kept an earlier "log fetch failed" line on screen; a failed refresh replaced the last good tail | The detail states only the latest outcome; a kept tail is labelled "Showing the previous tail" |
 | Resizing with help scrolled to the end left one help row and a status of "lines 76–46 of 46" | The help offset is clamped to the rewrapped content on resize |
 | A long repository name wrapped the action menu heading over the selected action at 30 × 10 | The heading is cut to one row and the detail gives way first, so the selected action always shows |
+| On narrow terminals the header dropped its data age, spinner included, so a refresh over cached rows showed no loading state | The header falls back to `⣾ refreshing`, then the spinner alone, and truncates the owner before losing it |
+| The under-size notice offered `q quit` during a filter, menu or confirmation, where `q` is ignored; the demo quit on `q` regardless | The notice names the quit binding enabled in the current layer (`ctrl+c` in modal layers), and the demo quits only through enabled bindings |
 
 ## Verification
 
@@ -67,7 +69,8 @@ frame of repository detail requests, the repository handoff, empty logs,
 single-flight and out-of-order log responses, cancellation of a stuck log request
 before its replacement, error-to-empty and populated-to-empty log transitions,
 wrapped and Home/End-scrolled help, the help offset after a resize, the action
-menu with long names, wrapped narrow details and the demo's settled requests.
+menu with long names, wrapped narrow details, the demo's settled requests, the
+narrow-header refresh indicator and the resize notice's quit key in each layer.
 `pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
 multi-page fallback ends at the request deadline.
 

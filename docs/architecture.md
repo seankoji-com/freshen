@@ -57,7 +57,11 @@ them to `…`, and only last truncates the current crumb. Detail viewports and
 the help overlay wrap to the body width, so nothing is reachable only past the
 right edge; a resize clamps the help offset to the rewrapped rows. The action
 menu budgets rendered rows, cutting its heading to one row and dropping detail
-first, so the selected action stays visible. Below 30 × 10 a resize notice replaces the frame.
+first, so the selected action stays visible. When the header cannot fit the
+data age, a refresh in flight keeps a compact spinner (`⣾ refreshing`, then the
+spinner alone), so cached rows never pass for idle ones. Below 30 × 10 a resize
+notice replaces the frame; its quit hint comes from the keymap, so it offers
+`q` only where `q` works and `ctrl+c` inside the filter, menu or a confirmation.
 
 Toasts carry a sequence number and expire through `toastExpiredMsg`; a stale
 expiry cannot clear a newer toast, and rendering also hides a toast past its

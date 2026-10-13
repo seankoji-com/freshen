@@ -101,7 +101,8 @@ the background with busy and result feedback. Navigation never moves to another
 screen merely because you reach the end of a list.
 
 The header shows the owner and how old the current screen's data is ("updated
-8s ago · every 20s"); tabs carry counts of failures (`✗`), running work (`↻`)
+8s ago · every 20s"; on narrow terminals just a spinner while a refresh
+runs); tabs carry counts of failures (`✗`), running work (`↻`)
 and concerns. The breadcrumb row shows the drill-down path, such as
 `Actions › alpha / CI #42 › test`; on narrow terminals it shortens before the
 filter input or the active detail tab does. The status row shows progress,
