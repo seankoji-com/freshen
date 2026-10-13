@@ -26,9 +26,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # setup-go combines restore/save. Public PRs and merge queues must
-          # never run its post-job publisher; Windows uses separate stores below.
-          cache: ${{ runner.os != 'Windows' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # Keep existing branch-scoped caching outside the Windows pilot.
+          # PR merge-ref caches cannot be restored by main or other PRs.
+          # Windows uses separate stores and a trusted-main publisher below.
+          cache: ${{ runner.os != 'Windows' }}
       - name: Prepare isolated Windows Go stores
         if: runner.os == 'Windows'
         id: go-cache
@@ -126,7 +127,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
   lint:
     runs-on: ubuntu-latest
@@ -136,7 +136,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       # No separate install step: `make lint`'s GOLANGCI_LINT variable
       # resolves the binary via `go run .../golangci-lint@version` (the Go
       # module proxy's checksum-verified fetch), the same command a
@@ -157,7 +156,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install GoReleaser
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
