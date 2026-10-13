@@ -207,7 +207,7 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			if target.CurrentBranch == branch {
 				branch = target.DefaultBranch
 			}
-			result.err = git.SwitchBranch(target, branch)
+			result.err = switchBranch(target, branch)
 		case "push":
 			result.err = git.CommitPushPRAndSwitchDefault(ctx, target)
 		case "prune":
@@ -242,8 +242,17 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			result.err = git.DeleteLocalRepo(dir, target.Path)
 		}
 		if target != nil && id != "delete" && id != "copy" && id != "open" {
-			target.CurrentBranch = git.GetOriginalBranch(ctx, target.Path)
-			target.BranchDetails = git.GetRepoBranchDetails(ctx, target.Path, target.DefaultBranch)
+			// The mutation's outcome is already in result. One deadline bounds
+			// the re-read, so a hung git still delivers it and frees BusyAction;
+			// a failed read keeps the last known branch and earlier details.
+			readCtx, cancel := context.WithTimeout(ctx, repoDetailTimeout)
+			if current := getCurrentBranch(readCtx, target.Path); current != "HEAD" {
+				target.CurrentBranch = current
+			} else {
+				target.Logs = append(target.Logs, "Could not re-read the checked-out branch after "+label+"; press r to retry.")
+			}
+			target.BranchDetails = getRepoBranchDetails(readCtx, target.Path, target.DefaultBranch)
+			cancel()
 		}
 		return result
 	}

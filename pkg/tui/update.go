@@ -44,10 +44,14 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.RepoDetailLoading == msg.repo.Path {
 			m.RepoDetailLoading = ""
 		}
-		for _, r := range m.Repos {
-			if r.Path == msg.repo.Path {
-				r.BranchDetails = mergeBranchDetails(r.BranchDetails, msg.repo.BranchDetails)
-				break
+		// A sync or action snapshot that landed while this read ran is newer:
+		// keep it rather than restore branches it removed or a stale status.
+		if msg.rev == m.BranchDetailsRev[msg.repo.Path] {
+			for _, r := range m.Repos {
+				if r.Path == msg.repo.Path {
+					r.BranchDetails = mergeBranchDetails(r.BranchDetails, msg.repo.BranchDetails)
+					break
+				}
 			}
 		}
 		// Start the read that was queued behind this one if its detail is still open.

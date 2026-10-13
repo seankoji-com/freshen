@@ -76,6 +76,13 @@ const (
 	syncTimeout = 10 * time.Minute
 )
 
+// branchReadTimeout bounds one read of a repository's branch state: the
+// checked-out branch, the default branch, the open PR for a branch, the dirty
+// check, or the branch, worktree and status listing. A hung git or gh read
+// fails that read instead of holding a sync, an action's result or the
+// repository detail open. A variable so tests can shorten it.
+var branchReadTimeout = 30 * time.Second
+
 // autoStashSeq makes each auto-stash message unique within this process.
 var autoStashSeq atomic.Uint64
 
@@ -442,11 +449,13 @@ func FetchOrgRepoCounts(parent context.Context, org string) (map[string]RepoCoun
 	return result, fmt.Errorf("gh api graphql repository counts exceeded the page limit for org %s", org)
 }
 
-// GetRepoBranchDetails fetches branches, worktrees, and changed file details.
-// A read that fails records why in its section's *Err field instead of
+// GetRepoBranchDetails fetches branches, worktrees, and changed file details
+// under one branchReadTimeout deadline. A read that fails records why in its section's *Err field instead of
 // reporting an empty section; once ctx ends, the remaining reads are skipped
 // and marked failed.
 func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) BranchWorktreeDetails {
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
 	var details BranchWorktreeDetails
 
 	var branches []string
@@ -791,6 +800,8 @@ func FetchExistingPRURL(ctx context.Context, repoPath, branch string) string {
 	if branch == "" || branch == "HEAD" {
 		return ""
 	}
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url")
 	cmd.Dir = repoPath
 	var out, errOut bytes.Buffer
@@ -815,10 +826,13 @@ func IsGitRepoContext(ctx context.Context, path string) bool {
 }
 
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
+// It returns "HEAD" when the read fails, including at branchReadTimeout.
 func GetOriginalBranch(ctx context.Context, path string) string {
 	if ctx.Err() != nil {
 		return "HEAD"
 	}
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
 
 	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
 	if err == nil && strings.TrimSpace(string(out)) != "" {
@@ -976,6 +990,8 @@ func getDefaultBranch(ctx context.Context, path string, allowGitHub bool) string
 	if ctx.Err() != nil {
 		return "HEAD"
 	}
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
 
 	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "refs/remotes/origin/HEAD")
 	if err == nil {
@@ -1163,10 +1179,12 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		}
 	}
 
-	isDirtyCmd := exec.CommandContext(ctx, "git", "-C", item.Path, "status", "--porcelain")
+	dirtyCtx, cancelDirty := context.WithTimeout(ctx, branchReadTimeout)
+	isDirtyCmd := exec.CommandContext(dirtyCtx, "git", "-C", item.Path, "status", "--porcelain")
 	var dirtyOut bytes.Buffer
 	isDirtyCmd.Stdout = &dirtyOut
 	_ = isDirtyCmd.Run()
+	cancelDirty()
 	hasUnstagedChanges := strings.TrimSpace(dirtyOut.String()) != ""
 	item.HasUnstagedChanges = hasUnstagedChanges
 

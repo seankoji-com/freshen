@@ -94,7 +94,17 @@ the first frame shows them loading. Branch reads run one at a time; opening
 another repository while one is in flight queues it (`RepoDetailQueued`) and the
 completion starts it if that detail is still open. One `repoDetailTimeout`
 deadline covers a read's branch, worktree and status commands, so a hung `git`
-ends the request. `GetRepoBranchDetails` records each failed command in
+ends the request. Every repository branch-state read also bounds itself with
+`git.branchReadTimeout` (30 seconds): `GetOriginalBranch`, the default-branch
+lookup, `FetchExistingPRURL`, the sync's dirty check and `GetRepoBranchDetails`.
+So a sync or clone whose read hangs still finishes and clears `IsSyncing`, and an
+action re-reads branch state under one `repoDetailTimeout` deadline after its
+mutation: a hung read still delivers `actionResultMsg` and clears `BusyAction`,
+keeps the mutation's outcome and the last known branch, and logs the failed
+read. Each sync or action snapshot bumps the repository's `BranchDetailsRev`; a
+detail read records the revision when it starts and is discarded if a snapshot
+landed first, so an older read cannot restore pruned branches or a stale
+working-tree status. `GetRepoBranchDetails` records each failed command in
 `BranchesErr`, `WorktreesErr` or `StatusErr`; the detail states the failure with
 an `r` retry hint instead of "none found" or "working tree is clean", and keeps
 entries from an earlier read under a "From an earlier read" label. Spinner ticks re-render an

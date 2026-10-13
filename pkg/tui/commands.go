@@ -536,7 +536,13 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 		item.DefaultBranch = snapshot.DefaultBranch
 		item.HasUnstagedChanges = snapshot.HasUnstagedChanges
 		item.ExistingPRURL = snapshot.ExistingPRURL
-		item.BranchDetails = snapshot.BranchDetails
+		// A section the snapshot could not read keeps its earlier entries,
+		// which the detail labels alongside the failure.
+		item.BranchDetails = mergeBranchDetails(item.BranchDetails, snapshot.BranchDetails)
+		if m.BranchDetailsRev == nil {
+			m.BranchDetailsRev = make(map[string]uint64)
+		}
+		m.BranchDetailsRev[item.Path]++
 		item.Stashed = snapshot.Stashed
 		item.DraftPRURL = snapshot.DraftPRURL
 		item.ErrorErr = snapshot.ErrorErr
@@ -652,7 +658,12 @@ func (m Model) actionsPollInterval() time.Duration {
 	return max(jobQueueTickInterval, time.Duration(6*len(m.Repos)+active)*1200*time.Millisecond)
 }
 
-type repoDetailsLoadedMsg struct{ repo *git.RepoItem }
+// repoDetailsLoadedMsg carries a branch read and the repository's
+// BranchDetailsRev when it started.
+type repoDetailsLoadedMsg struct {
+	repo *git.RepoItem
+	rev  uint64
+}
 
 // loadRepoDetail starts every request the open repository detail needs, then
 // renders it, so the first frame already shows their loading state.
@@ -681,6 +692,7 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 	}
 	m.RepoDetailQueued = ""
 	m.RepoDetailLoading = repo.Path
+	rev := m.BranchDetailsRev[repo.Path]
 	parent := m.ctx
 	if parent == nil {
 		parent = context.Background()
@@ -691,13 +703,19 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 	return func() tea.Msg {
 		defer cancel()
 		repo.BranchDetails = getRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
-		return repoDetailsLoadedMsg{repo: repo}
+		return repoDetailsLoadedMsg{repo: repo, rev: rev}
 	}
 }
 
 // getRepoBranchDetails is the branch and worktree read, swappable so tests
 // can block or fail it.
 var getRepoBranchDetails = git.GetRepoBranchDetails
+
+// getCurrentBranch and switchBranch are swappable for the same reason.
+var (
+	getCurrentBranch = git.GetOriginalBranch
+	switchBranch     = git.SwitchBranch
+)
 
 // repoDetailTimeout bounds one repository's branch, worktree and status
 // reads together.

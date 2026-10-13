@@ -178,9 +178,10 @@ type Model struct {
 	BusyAction         string
 	LastActionsRefresh time.Time
 	RunLoading         bool
-	RepoDetailLoading  string // repository path whose branch details are being read
-	RepoDetailQueued   string // repository path to read once RepoDetailLoading completes
-	LogLoading         string // job ID whose log request is in flight
+	RepoDetailLoading  string            // repository path whose branch details are being read
+	RepoDetailQueued   string            // repository path to read once RepoDetailLoading completes
+	BranchDetailsRev   map[string]uint64 // per repository path, snapshots that replaced its branch details; a detail read started before the latest is discarded
+	LogLoading         string            // job ID whose log request is in flight
 	LogLoadingSince    time.Time
 	LogSeq             uint64            // identity of the newest log request; older responses are discarded
 	EmptyLogs          map[string]bool   // job IDs whose last log fetch succeeded with no lines
@@ -266,6 +267,7 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		Concurrency:          concurrency,
 		Repos:                make([]*git.RepoItem, 0),
 		RemovedRepoPaths:     make(map[string]uint64),
+		BranchDetailsRev:     make(map[string]uint64),
 		Runners:              make([]*jobs.RunnerItem, 0),
 		JobQueue:             make([]*jobs.JobItem, 0),
 		SelectedIndex:        0,
