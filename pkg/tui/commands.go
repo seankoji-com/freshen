@@ -539,10 +539,7 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 		// A section the snapshot could not read keeps its earlier entries,
 		// which the detail labels alongside the failure.
 		item.BranchDetails = mergeBranchDetails(item.BranchDetails, snapshot.BranchDetails)
-		if m.BranchDetailsRev == nil {
-			m.BranchDetailsRev = make(map[string]uint64)
-		}
-		m.BranchDetailsRev[item.Path]++
+		m.invalidateBranchReads(item.Path)
 		item.Stashed = snapshot.Stashed
 		item.DraftPRURL = snapshot.DraftPRURL
 		item.ErrorErr = snapshot.ErrorErr
@@ -656,6 +653,15 @@ func (m Model) actionsPollInterval() time.Duration {
 		}
 	}
 	return max(jobQueueTickInterval, time.Duration(6*len(m.Repos)+active)*1200*time.Millisecond)
+}
+
+// invalidateBranchReads advances path's BranchDetailsRev, so a detail read
+// started before its branch state was replaced is discarded on arrival.
+func (m *Model) invalidateBranchReads(path string) {
+	if m.BranchDetailsRev == nil {
+		m.BranchDetailsRev = make(map[string]uint64)
+	}
+	m.BranchDetailsRev[path]++
 }
 
 // repoDetailsLoadedMsg carries a branch read and the repository's

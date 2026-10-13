@@ -56,7 +56,8 @@ Reviewed on 13 October 2026 against `f324ced`.
 | The under-size notice offered `q quit` during a filter, menu or confirmation, where `q` is ignored; the demo quit on `q` regardless | The notice names the quit binding enabled in the current layer (`ctrl+c` in modal layers), and the demo quits only through enabled bindings |
 | Branch reads ran on the session context with no deadline, so a hung `git` command kept repository detail loading, blocked `r` and stalled the queued repository | One 30-second deadline (`repoDetailTimeout`) covers the branch, worktree and status reads; a timeout ends the request and starts the queued read |
 | Branch reads after an action, and during a sync or clone, ran with no deadline of their own, so a hung `git` held `BusyAction` or `IsSyncing` and blocked further repository operations | Each branch-state read bounds itself (`branchReadTimeout`, 30 seconds); an action's re-read shares one deadline and a timeout keeps the completed mutation's result |
-| A detail read that started before a prune, switch or sync could answer after it and restore deleted branches or report a clean tree | Sync and action snapshots bump `BranchDetailsRev`; a read started before the latest snapshot is discarded |
+| A detail read that started before a prune, switch, sync or branch-changing refresh could answer after it and restore deleted branches, the previous checkout's branches, or a clean tree | Sync and action snapshots, and refreshes that find a new current branch, bump `BranchDetailsRev`; a read started before the latest change is discarded |
+| A sync acted on failed preflight reads: an unbounded checkout check could hang it, a timed-out branch read became `HEAD` and drove a checkout and pull, and a failed dirty check counted as clean, skipping the stash | Each preflight read (checkout, current and default branch, merge, dirty) has its own deadline and must succeed; a failure ends the sync as "Read Err" before anything changes |
 | A failed `git branch`, `git worktree list` or `git status` showed as "none found" or "working tree is clean" | Each section states its failure with an `r` retry hint, and entries kept from an earlier read are labelled |
 | Opening job B while job A's log request ran dropped B's fetch, leaving "Logs not loaded" | Opening a job cancels the request for the job left and starts the open job's at once; `LogSeq` discards the late answer |
 
@@ -79,6 +80,9 @@ narrow-header refresh indicator and the resize notice's quit key in each layer.
 `pkg/tui/handoff_test.go` covers a hung branch read ending at its deadline and
 handing off to the queued repository, failed reads shown as failures rather than
 empty sections, and opening another job while a log request runs.
+`pkg/git/branch_read_test.go` proves each sync preflight read ends at its own
+deadline, and that a sync whose checkout, branch, merge or dirty read hangs or
+fails stops without moving `HEAD`, pulling or stashing.
 `pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
 multi-page fallback ends at the request deadline.
 

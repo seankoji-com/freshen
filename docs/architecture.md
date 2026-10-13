@@ -95,16 +95,23 @@ another repository while one is in flight queues it (`RepoDetailQueued`) and the
 completion starts it if that detail is still open. One `repoDetailTimeout`
 deadline covers a read's branch, worktree and status commands, so a hung `git`
 ends the request. Every repository branch-state read also bounds itself with
-`git.branchReadTimeout` (30 seconds): `GetOriginalBranch`, the default-branch
-lookup, `FetchExistingPRURL`, the sync's dirty check and `GetRepoBranchDetails`.
-So a sync or clone whose read hangs still finishes and clears `IsSyncing`, and an
-action re-reads branch state under one `repoDetailTimeout` deadline after its
+`git.branchReadTimeout` (30 seconds): the checkout check (`IsGitRepo`),
+`GetOriginalBranch`, the default-branch lookup, `FetchExistingPRURL`, the merge
+and dirty checks and `GetRepoBranchDetails`. A sync treats its preflight reads
+(checkout, current branch, default branch, unfinished merge, dirty state) as
+required: if one fails or times out, the sync ends with status `ERROR` / "Read
+Err" and the reason before any clone, checkout, stash or pull, instead of acting
+on a placeholder `HEAD` or assuming a clean tree. A missing directory is not a
+failure; it is the clone case. A hung `GetRepoBranchDetails` only marks its
+sections failed; the sync still finishes and clears `IsSyncing`. An action
+re-reads branch state under one `repoDetailTimeout` deadline after its
 mutation: a hung read still delivers `actionResultMsg` and clears `BusyAction`,
 keeps the mutation's outcome and the last known branch, and logs the failed
-read. Each sync or action snapshot bumps the repository's `BranchDetailsRev`; a
-detail read records the revision when it starts and is discarded if a snapshot
-landed first, so an older read cannot restore pruned branches or a stale
-working-tree status. `GetRepoBranchDetails` records each failed command in
+read. Each sync or action snapshot, and each refresh that finds a repository on
+a different branch, bumps the repository's `BranchDetailsRev`; a detail read
+records the revision when it starts and is discarded if its branch state was
+replaced first, so an older read cannot restore pruned branches, a previous
+checkout's branches or a stale working-tree status. `GetRepoBranchDetails` records each failed command in
 `BranchesErr`, `WorktreesErr` or `StatusErr`; the detail states the failure with
 an `r` retry hint instead of "none found" or "working tree is clean", and keeps
 entries from an earlier read under a "From an earlier read" label. Spinner ticks re-render an

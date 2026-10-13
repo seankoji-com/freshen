@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
@@ -814,10 +815,33 @@ func FetchExistingPRURL(ctx context.Context, repoPath, branch string) string {
 	return strings.TrimSpace(out.String())
 }
 
-// IsGitRepo checks if a directory is a valid git working tree.
+// IsGitRepo checks if a directory is a valid git working tree. A read that
+// fails or passes branchReadTimeout counts as not a working tree.
 func IsGitRepo(path string) bool {
-	cmd := exec.Command("git", "-C", path, "rev-parse", "--is-inside-work-tree")
-	return cmd.Run() == nil
+	ok, err := readIsGitRepo(context.Background(), path)
+	return ok && err == nil
+}
+
+// readIsGitRepo reports whether path is a git working tree, under its own
+// branchReadTimeout deadline. A missing path is simply not one; a read that
+// times out or is cancelled returns an error, so a hung git is never mistaken
+// for a missing checkout.
+func readIsGitRepo(ctx context.Context, path string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
+	if _, err := runner.Run(ctx, "git", "-C", path, "rev-parse", "--is-inside-work-tree"); err == nil {
+		return true, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	return false, nil
 }
 
 func IsGitRepoContext(ctx context.Context, path string) bool {
@@ -828,27 +852,42 @@ func IsGitRepoContext(ctx context.Context, path string) bool {
 // GetOriginalBranch gets current checked out branch name or HEAD commit short hash.
 // It returns "HEAD" when the read fails, including at branchReadTimeout.
 func GetOriginalBranch(ctx context.Context, path string) string {
-	if ctx.Err() != nil {
+	branch, err := readCurrentBranch(ctx, path)
+	if err != nil {
 		return "HEAD"
+	}
+	return branch
+}
+
+// readCurrentBranch returns the checked-out branch, or the short HEAD commit
+// when detached, under its own branchReadTimeout deadline. It returns an error
+// rather than a placeholder when neither can be read.
+func readCurrentBranch(ctx context.Context, path string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
 	defer cancel()
 
 	out, err := runner.Run(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD")
-	if err == nil && strings.TrimSpace(string(out)) != "" {
-		return strings.TrimSpace(string(out))
+	if branch := strings.TrimSpace(string(out)); err == nil && branch != "" {
+		return branch, nil
 	}
-
-	if ctx.Err() != nil {
-		return "HEAD"
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
 
 	out, err = runner.Run(ctx, "git", "-C", path, "rev-parse", "--short", "HEAD")
-	if err == nil && strings.TrimSpace(string(out)) != "" {
-		return strings.TrimSpace(string(out))
+	if commit := strings.TrimSpace(string(out)); err == nil && commit != "" {
+		return commit, nil
 	}
-
-	return "HEAD"
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if err == nil {
+		err = errors.New("git printed no branch or commit for HEAD")
+	}
+	return "", err
 }
 
 // ghDefaultBranch resolves a repo's default branch through each configured
@@ -987,8 +1026,20 @@ func resolveCurrentBranch(ctx context.Context, path string) (string, error) {
 }
 
 func getDefaultBranch(ctx context.Context, path string, allowGitHub bool) string {
-	if ctx.Err() != nil {
+	branch, err := readDefaultBranch(ctx, path, allowGitHub)
+	if err != nil {
 		return "HEAD"
+	}
+	return branch
+}
+
+// readDefaultBranch resolves the default branch from origin/HEAD, then GitHub
+// (when allowGitHub), then a local main or master, and finally the checked-out
+// branch, all under one branchReadTimeout deadline. It returns an error once
+// that deadline passes or the context ends, instead of a guess.
+func readDefaultBranch(ctx context.Context, path string, allowGitHub bool) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
 	defer cancel()
@@ -999,28 +1050,35 @@ func getDefaultBranch(ctx context.Context, path string, allowGitHub bool) string
 		ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
 		ref = strings.TrimPrefix(ref, "origin/")
 		if ref != "" {
-			return ref
+			return ref, nil
 		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
 
 	if allowGitHub {
 		if branch, err := ghDefaultBranch(ctx, path); err == nil {
 			if branch = strings.TrimSpace(branch); branch != "" {
-				return branch
+				return branch, nil
 			}
 		} else {
 			slog.Warn("gh repo view failed", "path", path, "error", err)
 		}
 	}
 
-	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
-		return "main"
-	}
-	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
-		return "master"
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
 
-	return GetOriginalBranch(ctx, path)
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/main"); err == nil {
+		return "main", nil
+	}
+	if _, err := runner.Run(ctx, "git", "-C", path, "show-ref", "--verify", "--quiet", "refs/heads/master"); err == nil {
+		return "master", nil
+	}
+
+	return readCurrentBranch(ctx, path)
 }
 
 // SyncProgress receives a snapshot of a repository after each state change
@@ -1105,13 +1163,12 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	item.Status = StatusSyncing
 	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)
 
-	origBranch := GetOriginalBranch(ctx, item.Path)
-	item.OriginalBranch = origBranch
-	item.CurrentBranch = origBranch
-	defaultBranch := GetDefaultBranch(ctx, item.Path)
-	item.DefaultBranch = defaultBranch
-
-	if !IsGitRepo(item.Path) {
+	isRepo, readErr := readIsGitRepo(ctx, item.Path)
+	if readErr != nil {
+		s.finish(StatusError, "Read Err", "󰅙 Could not tell whether '%s' is a git checkout (%s); nothing was changed.", item.Path, readFailure(readErr))
+		return
+	}
+	if !isRepo {
 		target := item.URL
 		if target == "" && item.GHRepoName != "" {
 			target = item.GHRepoName
@@ -1148,8 +1205,8 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		}
 
 		item.IsNew = false
-		origBranch = GetOriginalBranch(ctx, item.Path)
-		defaultBranch = GetDefaultBranch(ctx, item.Path)
+		origBranch := GetOriginalBranch(ctx, item.Path)
+		defaultBranch := GetDefaultBranch(ctx, item.Path)
 		item.OriginalBranch = origBranch
 		item.CurrentBranch = origBranch
 		item.DefaultBranch = defaultBranch
@@ -1163,9 +1220,31 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	ctx, cancel := context.WithTimeout(ctx, syncTimeout)
 	defer cancel()
 
+	// Every read that decides what the sync does must succeed: acting on a
+	// placeholder branch or an unread dirty state could check out, pull or
+	// skip the stash wrongly. Each read has its own branchReadTimeout.
+	origBranch, readErr := readCurrentBranch(ctx, item.Path)
+	if readErr != nil {
+		s.finish(StatusError, "Read Err", "󰅙 Could not read the checked-out branch (%s); nothing was changed.", readFailure(readErr))
+		return
+	}
+	item.OriginalBranch = origBranch
+	item.CurrentBranch = origBranch
+	defaultBranch, readErr := readDefaultBranch(ctx, item.Path, true)
+	if readErr != nil {
+		s.finish(StatusError, "Read Err", "󰅙 Could not read the default branch (%s); nothing was changed.", readFailure(readErr))
+		return
+	}
+	item.DefaultBranch = defaultBranch
+
 	// An unfinished merge belongs to the user: pulling or rebasing would fail
 	// on it, and cleaning up after that failure would abort their merge.
-	if mergeInProgress(ctx, item.Path) {
+	merging, readErr := readMergeInProgress(ctx, item.Path)
+	if readErr != nil {
+		s.finish(StatusError, "Read Err", "󰅙 Could not check '%s' for an unfinished merge (%s); nothing was changed.", item.Path, readFailure(readErr))
+		return
+	}
+	if merging {
 		s.finish(StatusError, "Merge Pending", "󰅙 '%s' has an unfinished merge (MERGE_HEAD exists). Commit or abort it, then sync again; nothing was changed.", item.Path)
 		return
 	}
@@ -1179,13 +1258,11 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		}
 	}
 
-	dirtyCtx, cancelDirty := context.WithTimeout(ctx, branchReadTimeout)
-	isDirtyCmd := exec.CommandContext(dirtyCtx, "git", "-C", item.Path, "status", "--porcelain")
-	var dirtyOut bytes.Buffer
-	isDirtyCmd.Stdout = &dirtyOut
-	_ = isDirtyCmd.Run()
-	cancelDirty()
-	hasUnstagedChanges := strings.TrimSpace(dirtyOut.String()) != ""
+	hasUnstagedChanges, readErr := readDirty(ctx, item.Path)
+	if readErr != nil {
+		s.finish(StatusError, "Read Err", "󰅙 Could not check '%s' for local changes (%s); nothing was stashed or pulled.", item.Path, readFailure(readErr))
+		return
+	}
 	item.HasUnstagedChanges = hasUnstagedChanges
 
 	s.log(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges)
@@ -1453,6 +1530,49 @@ func restoreStash(ctx context.Context, path, sha string) error {
 // mergeInProgress reports whether the repository has an unfinished merge.
 func mergeInProgress(ctx context.Context, path string) bool {
 	return exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD").Run() == nil
+}
+
+// readMergeInProgress is mergeInProgress for a sync's preflight: it has its
+// own branchReadTimeout deadline and returns an error when git fails for any
+// reason other than MERGE_HEAD being absent.
+func readMergeInProgress(ctx context.Context, path string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
+	_, err := runner.Run(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+	if err == nil {
+		return true, nil
+	}
+	// rev-parse -q --verify exits 1, silently, for a ref that does not exist.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	return false, err
+}
+
+// readDirty reports whether the working tree has staged, unstaged or
+// untracked changes, under its own branchReadTimeout deadline. A failed read
+// is an error, never "clean".
+func readDirty(ctx context.Context, path string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
+	out, err := runner.Run(ctx, "git", "-C", path, "status", "--porcelain")
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// readFailure is a one-line reason for a failed preflight read.
+func readFailure(err error) string {
+	first, _, _ := strings.Cut(gitReadFailure(err), "\n")
+	return strings.TrimSpace(first)
 }
 
 func shortSHA(sha string) string {

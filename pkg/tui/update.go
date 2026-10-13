@@ -492,6 +492,10 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 				}
 				if fresh.CurrentBranch == old.CurrentBranch {
 					fresh.BranchDetails = old.BranchDetails
+				} else {
+					// The checkout moved: a detail read started before this
+					// refresh describes the previous branch.
+					m.invalidateBranchReads(fresh.Path)
 				}
 				break
 			}

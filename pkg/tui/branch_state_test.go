@@ -65,8 +65,8 @@ func TestBlockedPostActionReadDeliversResult(t *testing.T) {
 	}
 }
 
-// A detail read that started before a prune or sync snapshot answers after
-// it. The older read must not restore deleted branches or report a stale
+// A detail read that started before a prune or sync snapshot, or before a
+// refresh that found the checkout on another branch, answers after it. The older read must not restore deleted branches or report a stale
 // working tree; a read started after the snapshot still applies.
 func TestStaleBranchReadCannotOverwriteNewerSnapshot(t *testing.T) {
 	for _, tc := range []struct {
@@ -79,6 +79,16 @@ func TestStaleBranchReadCannotOverwriteNewerSnapshot(t *testing.T) {
 		}},
 		{"sync", func(m *Model, snapshot *git.RepoItem) {
 			next, _ := m.Update(repoSyncMsg{repo: snapshot, snapshots: make(chan *git.RepoItem), bulk: true})
+			*m = next.(Model)
+		}},
+		{"refresh", func(m *Model, snapshot *git.RepoItem) {
+			// An organization refresh finds the checkout on another branch.
+			snapshot.CurrentBranch = "main"
+			repos := []*git.RepoItem{snapshot}
+			for _, r := range m.Repos[1:] {
+				repos = append(repos, r.Clone())
+			}
+			next, _ := m.Update(orgSyncedMsg{repos: repos})
 			*m = next.(Model)
 		}},
 	} {
