@@ -320,30 +320,38 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 
 // handleLoadedJobLogsMsg applies the response to the newest log request and
 // always re-renders, so no outcome (lines, error or an empty log) can leave
-// the detail showing "Loading logs…".
+// the detail showing "Loading logs…". Only the newest outcome is recorded: a
+// failure or empty answer keeps the previous tail but replaces any earlier
+// error or empty note, so the detail never shows an outcome that no longer
+// holds.
 func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
 	if msg.seq != m.LogSeq {
 		slog.Debug("discarding superseded log response", "jobID", msg.jobID, "seq", msg.seq, "current", m.LogSeq)
 		return
 	}
 	m.LogLoading = ""
+	m.cancelLogFetch = nil
 	if msg.err != nil {
 		slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
 	}
 	if m.EmptyLogs == nil {
 		m.EmptyLogs = make(map[string]bool)
 	}
+	if m.LogErrors == nil {
+		m.LogErrors = make(map[string]string)
+	}
 	for _, j := range m.JobQueue {
 		if j.ID != msg.jobID {
 			continue
 		}
+		delete(m.EmptyLogs, msg.jobID)
+		delete(m.LogErrors, msg.jobID)
 		switch {
 		case len(msg.logs) > 0:
 			j.Logs = msg.logs
 			j.GHJobID = msg.ghJobID
-			delete(m.EmptyLogs, msg.jobID)
 		case msg.err != nil:
-			j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
+			m.LogErrors[msg.jobID] = msg.err.Error()
 		default:
 			m.EmptyLogs[msg.jobID] = true
 		}
@@ -574,6 +582,9 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Viewport.Width = max(2, msg.Width-2)
 	m.Viewport.Height = max(1, msg.Height-headerRows-footerRows)
 	m.sizeSearch()
+	// Help rows rewrap at the new width, so keep the stored offset within the
+	// new range rather than only clamping what is drawn.
+	m.HelpOffset = min(m.HelpOffset, m.helpMaxOffset())
 
 	m.updateViewport()
 }

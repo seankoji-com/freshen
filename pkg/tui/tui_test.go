@@ -301,9 +301,13 @@ func TestHandleLoadedJobLogsMsg(t *testing.T) {
 		m.JobQueue = []*jobs.JobItem{{ID: "#1", Name: "repo1 / ci / build", RunID: 1}}
 		m.handleLoadedJobLogsMsg(loadedJobLogsMsg{jobID: "#1", err: errors.New("connection reset")})
 
-		logs := m.JobQueue[0].Logs
-		if len(logs) != 1 || !strings.Contains(logs[0], "log fetch failed") || !strings.Contains(logs[0], "connection reset") {
-			t.Errorf("expected job Logs to surface the fetch error, got %v", logs)
+		m.OpenJobID = "#1"
+		m.ActiveFocus = FocusJobs
+		if got := m.LogErrors["#1"]; !strings.Contains(got, "connection reset") {
+			t.Errorf("expected the fetch error recorded for the job, got %q", got)
+		}
+		if view := m.logStatusLine(m.JobQueue[0]); !strings.Contains(view, "Log fetch failed: connection reset. Press r to retry.") {
+			t.Errorf("expected the job detail to surface the fetch error, got %q", view)
 		}
 	})
 

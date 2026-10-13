@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -116,12 +117,18 @@ type loadedJobLogsMsg struct {
 
 // fetchJobLogs is the log download, swappable so tests can count requests and
 // control completion order.
-var fetchJobLogs = jobs.FetchJobLogs
+var fetchJobLogs = jobs.FetchJobLogsContext
 
-// logFetchStuckAfter is when an unanswered log request stops blocking new
-// ones. gh calls time out after 30s, so a live request has answered by then;
-// a later response is discarded by its sequence number.
-const logFetchStuckAfter = 45 * time.Second
+// logFetchTimeout bounds a whole log request. The direct download and every
+// jobs-list page of the step-status fallback share one context, so a request
+// answers within this time even when each gh call is slow, and LogLoading
+// always clears.
+const logFetchTimeout = 40 * time.Second
+
+// logFetchStuckAfter is a backstop for a response that never arrives despite
+// that deadline. The stuck request is cancelled before a new one starts, and
+// its late response is discarded by its sequence number.
+const logFetchStuckAfter = logFetchTimeout + 5*time.Second
 
 // startLogFetch marks a log request for job in flight and returns it. Only one
 // log request runs at a time, so polling cannot stack requests behind a slow
@@ -134,12 +141,25 @@ func (m *Model) startLogFetch(job *jobs.JobItem) tea.Cmd {
 	if m.LogLoading != "" && time.Since(m.LogLoadingSince) < logFetchStuckAfter {
 		return nil
 	}
+	if m.cancelLogFetch != nil {
+		m.cancelLogFetch()
+	}
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, logFetchTimeout)
+	m.cancelLogFetch = cancel
 	m.LogSeq++
 	m.LogLoading = job.ID
 	m.LogLoadingSince = time.Now()
 	org, repo, runID, ghJobID, jobName, jobID, seq := m.TargetOrg, job.Repo, job.RunID, job.GHJobID, job.Name, job.ID, m.LogSeq
 	return func() tea.Msg {
-		lines, resolvedGHJobID, err := fetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
+		defer cancel()
+		lines, resolvedGHJobID, err := fetchJobLogs(ctx, org, repo, runID, ghJobID, jobName, 200)
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("no answer from GitHub within %s", logFetchTimeout)
+		}
 		return loadedJobLogsMsg{jobID: jobID, seq: seq, ghJobID: resolvedGHJobID, logs: lines, err: err}
 	}
 }

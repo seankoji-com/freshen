@@ -488,13 +488,19 @@ func (m Model) screenView() string {
 	}
 	if m.ShowHelp {
 		lines := strings.Split(m.helpContent(), "\n")
-		body = strings.Join(lines[min(m.HelpOffset, len(lines)-1):], "\n")
+		body = strings.Join(lines[min(m.HelpOffset, m.helpMaxOffset()):], "\n")
 	}
 	if m.MenuOpen || m.PendingAction != "" {
 		body = ansi.Wrap(m.menuContent(), m.Width-2, "")
 	}
 	body = insetFrame(body, m.Width, m.bodyHeight())
 	return fitFrame(strings.Join([]string{m.headerRow(), m.tabRow(), m.contextRow(), body, " " + m.statusLine(), " " + m.footerView()}, "\n"), m.Width, m.Height)
+}
+
+// helpMaxOffset is the furthest the help overlay can scroll at the current
+// size: its wrapped rows less one screen of body.
+func (m Model) helpMaxOffset() int {
+	return max(0, len(strings.Split(m.helpContent(), "\n"))-m.bodyHeight())
 }
 
 // footerView renders the key hints that fit, always keeping the last one.
@@ -561,8 +567,9 @@ func (m Model) statusLine() string {
 	}
 	if m.ShowHelp {
 		total := len(strings.Split(m.helpContent(), "\n"))
-		shown := min(total, m.HelpOffset+m.bodyHeight())
-		return th.dim.Render(fmt.Sprintf("Keys valid on %s · lines %d–%d of %d", m.screenName(), m.HelpOffset+1, shown, total))
+		offset := min(m.HelpOffset, m.helpMaxOffset())
+		shown := min(total, offset+m.bodyHeight())
+		return th.dim.Render(fmt.Sprintf("Keys valid on %s · lines %d–%d of %d", m.screenName(), offset+1, shown, total))
 	}
 	if m.ActiveFocus == FocusOverview {
 		if m.TargetOrg == "" {

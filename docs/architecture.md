@@ -55,7 +55,9 @@ re-seats its cursor on resize), and repository detail tabs fall back to short
 labels or the active tab alone. `fitCrumbs` then shortens ancestors, collapses
 them to `…`, and only last truncates the current crumb. Detail viewports and
 the help overlay wrap to the body width, so nothing is reachable only past the
-right edge. Below 30 × 10 a resize notice replaces the frame.
+right edge; a resize clamps the help offset to the rewrapped rows. The action
+menu budgets rendered rows, cutting its heading to one row and dropping detail
+first, so the selected action stays visible. Below 30 × 10 a resize notice replaces the frame.
 
 Toasts carry a sequence number and expire through `toastExpiredMsg`; a stale
 expiry cannot clear a newer toast, and rendering also hides a toast past its
@@ -73,10 +75,13 @@ exponential backoff after failures. Read commands have bounded execution. An ope
 running job's log refreshes with one request when its job ID is known; the jobs
 list is fetched only to resolve a name or to build the step-status fallback.
 One log request runs at a time (`LogLoading`); runner ticks and queue
-completions skip while it is in flight, and each request carries `LogSeq` so a
-response overtaken by a newer one (after `logFetchStuckAfter`) is discarded.
-Every log response re-renders the detail; an empty successful log is recorded
-in `EmptyLogs` and stated, not left as "Loading logs…".
+completions skip while it is in flight. The download and any jobs-list pages
+share one context with a `logFetchTimeout` deadline, so the request answers
+within it even when each `gh` call is slow. A request still unanswered after
+`logFetchStuckAfter` is cancelled before a replacement starts, and `LogSeq`
+discards its late response. Every log response re-renders the detail, which
+states only the latest outcome (`LogErrors`, `EmptyLogs`); a tail kept from an
+earlier fetch is labelled, never left as "Loading logs…".
 
 Repository detail starts its requests before rendering (`loadRepoDetail`), so
 the first frame shows them loading. Branch reads run one at a time; opening

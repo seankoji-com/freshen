@@ -1,10 +1,12 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -170,7 +172,7 @@ func stubGH(t *testing.T, handler func(path string) ([]byte, error)) {
 	original := runGH
 	t.Cleanup(func() { runGH = original })
 
-	runGH = func(args ...string) ([]byte, error) {
+	runGH = func(_ context.Context, args ...string) ([]byte, error) {
 		return handler(args[len(args)-1])
 	}
 }
@@ -760,5 +762,68 @@ func TestWithheldKnownJobLogFallsBackWithoutRetrying(t *testing.T) {
 	}
 	if len(calls) != 2 {
 		t.Fatalf("withheld log made %d requests, want 2 (log, jobs list): %v", len(calls), calls)
+	}
+}
+
+// A withheld log's fallback can take several gh calls (the download, then each
+// jobs-list page). They share the caller's context, so its deadline bounds the
+// whole request: a slow page is cut off when the deadline passes and no later
+// page is requested.
+func TestLogFallbackSharesOneDeadline(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	original := runGH
+	t.Cleanup(func() { runGH = original })
+	runGH = func(ctx context.Context, args ...string) ([]byte, error) {
+		path := args[len(args)-1]
+		mu.Lock()
+		calls = append(calls, path)
+		mu.Unlock()
+		switch {
+		case strings.Contains(path, "/logs"):
+			return nil, errors.New("HTTP 404")
+		case !strings.Contains(path, "&page="):
+			page := GHJobsResponse{TotalCount: 3 * jobsPageSize}
+			for i := 0; i < jobsPageSize; i++ {
+				page.Jobs = append(page.Jobs, GHJobInfo{ID: int64(100 + i), Name: fmt.Sprintf("shard %d", i)})
+			}
+			return mustJSON(t, page), nil
+		default: // page 2 is slow; only the request deadline ends it
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := FetchJobLogsContext(ctx, "org", "repo", 3, 7, "build", 10)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("slow fallback err = %v, want the request deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("request outlived its deadline by %s", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("made %d gh calls, want 3 (log, page 1, page 2 cut off): %v", len(calls), calls)
+	}
+}
+
+// A cancelled request starts no further gh process.
+func TestCancelledContextRunsNoGHCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := defaultRunGHCommand(ctx, "api", "/rate_limit"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled gh call err = %v, want context.Canceled", err)
+	}
+	var calls int
+	stubGH(t, func(string) ([]byte, error) { calls++; return nil, errors.New("unreachable") })
+	if _, _, err := FetchJobLogsContext(ctx, "org", "repo", 3, 0, "build", 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled log request err = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("cancelled log request made %d gh calls", calls)
 	}
 }

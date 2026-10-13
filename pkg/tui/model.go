@@ -182,8 +182,10 @@ type Model struct {
 	RepoDetailQueued   string // repository path to read once RepoDetailLoading completes
 	LogLoading         string // job ID whose log request is in flight
 	LogLoadingSince    time.Time
-	LogSeq             uint64          // identity of the newest log request; older responses are discarded
-	EmptyLogs          map[string]bool // job IDs whose last log fetch succeeded with no lines
+	LogSeq             uint64            // identity of the newest log request; older responses are discarded
+	EmptyLogs          map[string]bool   // job IDs whose last log fetch succeeded with no lines
+	LogErrors          map[string]string // job IDs whose last log fetch failed, with the reason
+	cancelLogFetch     context.CancelFunc
 
 	TargetDir              string
 	TargetOrg              string

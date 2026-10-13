@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -226,7 +228,7 @@ func TestEmptyLogResponseEndsLoadingState(t *testing.T) {
 func TestRunningJobLogRefreshIsSingleFlightAndOrdered(t *testing.T) {
 	var calls atomic.Int32
 	original := fetchJobLogs
-	fetchJobLogs = func(_, _ string, _, ghJobID int64, _ string, _ int) ([]string, int64, error) {
+	fetchJobLogs = func(_ context.Context, _, _ string, _, ghJobID int64, _ string, _ int) ([]string, int64, error) {
 		n := calls.Add(1)
 		return []string{map[int32]string{1: "old tail", 2: "new tail"}[n]}, ghJobID, nil
 	}
@@ -382,5 +384,202 @@ func TestNarrowDetailWrapsInsteadOfClipping(t *testing.T) {
 	}
 	if !strings.Contains(content, "\x1b]8;;https://github.com/fixture-org/alpha\x1b\\") {
 		t.Fatalf("wrapping broke the repository link: %q", content)
+	}
+}
+
+// A log request in flight carries one deadline for all its gh calls, and a
+// request that outlives it is cancelled, not abandoned, before a replacement
+// starts: the slow call returns and its late answer is discarded.
+func TestStuckLogRequestIsCancelledBeforeReplacement(t *testing.T) {
+	var calls atomic.Int32
+	inFlight := make(chan context.Context, 1)
+	original := fetchJobLogs
+	fetchJobLogs = func(ctx context.Context, _, _ string, _, ghJobID int64, _ string, _ int) ([]string, int64, error) {
+		if calls.Add(1) == 1 { // a slow multi-call fallback still running
+			inFlight <- ctx
+			<-ctx.Done()
+			return nil, 0, ctx.Err()
+		}
+		return []string{"new tail"}, ghJobID, nil
+	}
+	t.Cleanup(func() { fetchJobLogs = original })
+
+	m := sized(smokeFixtureModel(), 80, 24)
+	press(&m, "2")
+	press(&m, "enter")
+	press(&m, "down")
+	open := press(&m, "enter") // #2, running
+	if m.LogLoading != "#2" {
+		t.Fatalf("running job log request not started: %q", m.LogLoading)
+	}
+	oldDone := make(chan tea.Msg, 1)
+	sendLogResponses(open, oldDone)
+	ctx := <-inFlight
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > logFetchTimeout {
+		t.Fatalf("log request has no request-wide deadline (ok=%v, %s left)", ok, time.Until(deadline))
+	}
+
+	for i := 0; i < 3; i++ {
+		drain(m.handleRunnerJobTickMsg())
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("ticks stacked %d requests behind one in flight", got)
+	}
+
+	m.LogLoadingSince = time.Now().Add(-logFetchStuckAfter - time.Second)
+	replacement := m.handleRunnerJobTickMsg()
+	var old tea.Msg
+	select {
+	case old = <-oldDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stuck request kept running after its replacement started")
+	}
+	for _, msg := range drain(replacement) {
+		next, _ := m.Update(msg)
+		m = next.(Model)
+	}
+	next, _ := m.Update(old)
+	m = next.(Model)
+	if logs := m.openJob().Logs; len(logs) != 1 || logs[0] != "new tail" || m.LogLoading != "" || m.LogErrors["#2"] != "" {
+		t.Fatalf("late cancelled answer changed state: logs=%v loading=%q err=%q", logs, m.LogLoading, m.LogErrors["#2"])
+	}
+}
+
+// sendLogResponses runs cmd and every command it batches without a deadline,
+// delivering each log response to out, so a request can stay in flight while
+// the test drives the model.
+func sendLogResponses(cmd tea.Cmd, out chan<- tea.Msg) {
+	if cmd == nil {
+		return
+	}
+	go func() {
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, c := range batch {
+				sendLogResponses(c, out)
+			}
+			return
+		}
+		if l, ok := msg.(loadedJobLogsMsg); ok {
+			out <- l
+		}
+	}()
+}
+
+// Only the latest log outcome is shown: a successful empty answer clears an
+// earlier error, a kept tail is labelled when a refresh fails or returns
+// nothing, and new lines clear both notes.
+func TestLogOutcomeTransitions(t *testing.T) {
+	m := openCompletedJob(t)
+	reply := func(logs []string, err error) string {
+		t.Helper()
+		next, _ := m.Update(loadedJobLogsMsg{jobID: "#1", seq: m.LogSeq, ghJobID: 11, logs: logs, err: err})
+		m = next.(Model)
+		return stripped(m.jobDetailContent())
+	}
+	refetch := func() {
+		t.Helper()
+		m.startLogFetch(m.openJob())
+		if m.LogLoading != "#1" {
+			t.Fatal("refetch did not start")
+		}
+	}
+	steps := []struct {
+		name      string
+		logs      []string
+		err       error
+		want, not []string
+	}{
+		{"error", nil, errors.New("HTTP 502"), []string{"Log fetch failed: HTTP 502. Press r to retry."}, []string{"Loading logs", "previous tail"}},
+		{"error then empty", nil, nil, []string{"GitHub returned an empty log for this job."}, []string{"HTTP 502", "Loading logs"}},
+		{"lines", []string{"line one"}, nil, []string{"line one"}, []string{"empty log", "previous tail"}},
+		{"lines then empty", nil, nil, []string{"no lines on the latest refresh. Showing the previous tail.", "line one"}, []string{"empty log for this job"}},
+		{"lines then error", nil, errors.New("timeout"), []string{"Log fetch failed: timeout. Press r to retry. Showing the previous tail.", "line one"}, []string{"latest refresh"}},
+		{"recovered", []string{"line two"}, nil, []string{"line two"}, []string{"failed", "previous tail", "line one"}},
+	}
+	for i, step := range steps {
+		if i > 0 {
+			refetch()
+		}
+		view := reply(step.logs, step.err)
+		for _, w := range step.want {
+			if !strings.Contains(view, w) {
+				t.Fatalf("%s: missing %q in:\n%s", step.name, w, view)
+			}
+		}
+		for _, n := range step.not {
+			if strings.Contains(view, n) {
+				t.Fatalf("%s: stale %q in:\n%s", step.name, n, view)
+			}
+		}
+	}
+}
+
+// Resizing with help open keeps the stored scroll offset within the rewrapped
+// help, so the overlay still fills the body and its line count stays ordered.
+func TestHelpOffsetFollowsResize(t *testing.T) {
+	m := sized(smokeFixtureModel(), 30, 10)
+	press(&m, "1")
+	press(&m, "?")
+	press(&m, "end")
+	if m.HelpOffset == 0 {
+		t.Fatal("help did not scroll at 30x10")
+	}
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = next.(Model)
+	lines := strings.Split(m.helpContent(), "\n")
+	if want := max(0, len(lines)-m.bodyHeight()); m.HelpOffset != want {
+		t.Fatalf("offset %d after resize, want %d", m.HelpOffset, want)
+	}
+	frame := strings.Split(stripped(m.View()), "\n")
+	body := frame[headerRows : len(frame)-footerRows]
+	shown := 0
+	for _, row := range body {
+		if strings.TrimSpace(row) != "" {
+			shown++
+		}
+	}
+	if shown < min(len(lines), m.bodyHeight())/2 {
+		t.Fatalf("help shows %d of %d body rows after resize:\n%s", shown, m.bodyHeight(), strings.Join(frame, "\n"))
+	}
+	status := stripped(m.statusLine())
+	want := fmt.Sprintf("lines %d–%d of %d", m.HelpOffset+1, len(lines), len(lines))
+	if !strings.Contains(status, want) {
+		t.Fatalf("status %q, want %q", status, want)
+	}
+}
+
+// A long repository name cannot push the selected action off the menu: the
+// heading is cut to one row and the detail gives way first.
+func TestActionMenuKeepsSelectionWithLongName(t *testing.T) {
+	long := strings.Repeat("very-long-repository-name-", 4) // 104 cells
+	for _, size := range [][2]int{{30, 10}, {31, 11}, {48, 14}, {80, 24}, {200, 50}} {
+		m := smokeFixtureModel()
+		m.Repos[0].Name = long
+		m.Repos[0].GHRepoName = long
+		m = sized(m, size[0], size[1])
+		press(&m, "1")
+		press(&m, " ")
+		if !m.MenuOpen {
+			t.Fatalf("%v: menu did not open", size)
+		}
+		actions := m.menuActions()
+		for i := range actions {
+			frame := stripped(m.View())
+			rows := strings.Split(frame, "\n")
+			if len(rows) != size[1] {
+				t.Fatalf("%v: frame height %d", size, len(rows))
+			}
+			for _, row := range rows {
+				if w := ansi.StringWidth(row); w > size[0] {
+					t.Fatalf("%v: row %d cells wide: %q", size, w, row)
+				}
+			}
+			label := ansi.Truncate(actions[i].label, size[0]-5, "")
+			if !strings.Contains(frame, "› "+label) {
+				t.Fatalf("%v: selected action %q not visible:\n%s", size, actions[i].label, frame)
+			}
+			press(&m, "down")
+		}
 	}
 }

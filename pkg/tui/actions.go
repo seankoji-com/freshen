@@ -83,10 +83,30 @@ func (m Model) menuContent() string {
 	if m.ActionTarget != nil {
 		title += " / " + m.ActionTarget.Name
 	}
-	lines := []string{th.strong.Render(title), ""}
+	// Budget in rendered rows: every row is cut or wrapped to the body width
+	// here, so View's wrap adds none, and the selected action always shows.
+	width := max(1, m.Width-2)
+	fit := func(s string) string { return ansi.Truncate(s, width, "…") }
 	actions := m.menuActions()
-	count := max(1, m.bodyHeight()-5)
+	var tail []string
+	if m.MenuIndex < len(actions) {
+		tail = append(tail, "")
+		tail = append(tail, strings.Split(ansi.Wrap(th.dim.Render(actions[m.MenuIndex].detail), width, ""), "\n")...)
+	}
+	if m.BusyAction != "" {
+		tail = append(tail, "", fit("A repository action is already running."))
+	}
+	head := []string{fit(th.strong.Render(title)), ""}
+	avail := m.bodyHeight()
+	for len(head)+len(tail) >= avail && len(tail) > 0 {
+		tail = tail[:len(tail)-1]
+	}
+	for len(head) >= avail && len(head) > 0 {
+		head = head[:len(head)-1]
+	}
+	count := max(1, avail-len(head)-len(tail))
 	start := max(0, m.MenuIndex-count+1)
+	lines := head
 	for i := start; i < min(len(actions), start+count); i++ {
 		a := actions[i]
 		line := "  " + a.label
@@ -96,15 +116,9 @@ func (m Model) menuContent() string {
 		if a.confirm {
 			line += th.dim.Render("  (asks to confirm)")
 		}
-		lines = append(lines, line)
+		lines = append(lines, fit(line))
 	}
-	if m.MenuIndex < len(actions) {
-		lines = append(lines, "", th.dim.Render(actions[m.MenuIndex].detail))
-	}
-	if m.BusyAction != "" {
-		lines = append(lines, "", "A repository action is already running.")
-	}
-	return strings.Join(lines, "\n")
+	return strings.Join(append(lines, tail...), "\n")
 }
 func (m *Model) requestAction(id string) tea.Cmd {
 	for _, a := range m.menuActions() {

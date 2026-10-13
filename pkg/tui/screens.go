@@ -576,22 +576,40 @@ func (m Model) jobDetailContent() string {
 		fmt.Fprintf(&sb, "%2d  %s %s\n", s.Number, th.status(stepKind(s), fmt.Sprintf("%-11s", state)), s.Name)
 	}
 	sb.WriteString("\n" + th.section.Render("Log tail (last 200 lines)") + "\n\n")
-	switch {
-	case len(j.Logs) > 0: // a refresh keeps the current tail; the header spinner shows it
-	case m.LogLoading == j.ID:
-		sb.WriteString(m.Spinner.View() + " Loading logs…\n")
-	case m.EmptyLogs[j.ID] && j.Status == jobs.JobRunning:
-		sb.WriteString("GitHub returned no log lines yet. The tail refreshes while the job runs.\n")
-	case m.EmptyLogs[j.ID]:
-		sb.WriteString("GitHub returned an empty log for this job. Press r to fetch it again.\n")
-	default:
-		sb.WriteString("Logs not loaded. Press r to retry; GitHub may withhold logs while a job is running.\n")
-	}
+	sb.WriteString(m.logStatusLine(j))
 	for _, line := range j.Logs {
 		sb.WriteString(jobs.SanitizeTerminal(line) + "\n")
 	}
 	return sb.String()
 }
+
+// logStatusLine states the outcome of the open job's latest log request above
+// its tail. A tail kept from an earlier fetch is labelled as such, so an error
+// or empty answer is never hidden behind older lines.
+func (m Model) logStatusLine(j *jobs.JobItem) string {
+	kept := len(j.Logs) > 0
+	switch {
+	case m.LogLoading == j.ID && !kept:
+		return m.Spinner.View() + " Loading logs…\n"
+	case m.LogErrors[j.ID] != "":
+		msg := "Log fetch failed: " + jobs.SanitizeTerminal(m.LogErrors[j.ID]) + ". Press r to retry."
+		if kept {
+			msg += " Showing the previous tail."
+		}
+		return th.toastError.Render(msg) + "\n"
+	case m.EmptyLogs[j.ID] && kept:
+		return "GitHub returned no lines on the latest refresh. Showing the previous tail.\n"
+	case m.EmptyLogs[j.ID] && j.Status == jobs.JobRunning:
+		return "GitHub returned no log lines yet. The tail refreshes while the job runs.\n"
+	case m.EmptyLogs[j.ID]:
+		return "GitHub returned an empty log for this job. Press r to fetch it again.\n"
+	case kept: // a refresh keeps the current tail; the header spinner shows it
+		return ""
+	default:
+		return "Logs not loaded. Press r to retry; GitHub may withhold logs while a job is running.\n"
+	}
+}
+
 func (m Model) runnerDetailContent() string {
 	rs := m.getMatchingRunners()
 	if m.SelectedRunnerIndex >= len(rs) {

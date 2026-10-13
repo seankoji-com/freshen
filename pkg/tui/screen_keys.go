@@ -67,7 +67,7 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case m.ShowHelp:
-		maxOffset := max(0, len(strings.Split(m.helpContent(), "\n"))-m.bodyHeight())
+		maxOffset := m.helpMaxOffset()
 		switch {
 		case key.Matches(msg, k.Help), key.Matches(msg, k.Back):
 			m.ShowHelp = false

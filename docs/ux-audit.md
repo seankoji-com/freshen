@@ -48,6 +48,10 @@ Reviewed on 13 October 2026 against `f324ced`.
 | Help rows were clipped at narrow widths and Home/End did nothing in help | Help rows wrap with a hanging indent; Home/End jump to the top and bottom |
 | Detail text was clipped at narrow widths | Detail viewports wrap to the body width, keeping OSC 8 links intact |
 | The offline demo dropped runner and other fetches but left their loading flags set | The demo completes each dropped request with its seeded data |
+| A log request's 30-second limit applied to each `gh` call, so a slow fallback (download, then several jobs-list pages) could outlive the 45-second backstop and be abandoned while still running | One 40-second deadline covers the whole request; a stuck request is cancelled before its replacement starts |
+| A successful empty log kept an earlier "log fetch failed" line on screen; a failed refresh replaced the last good tail | The detail states only the latest outcome; a kept tail is labelled "Showing the previous tail" |
+| Resizing with help scrolled to the end left one help row and a status of "lines 76–46 of 46" | The help offset is clamped to the rewrapped content on resize |
+| A long repository name wrapped the action menu heading over the selected action at 30 × 10 | The heading is cut to one row and the detail gives way first, so the selected action always shows |
 
 ## Verification
 
@@ -60,8 +64,12 @@ toast expiry and stale expiry, runner-poll call counts, `NO_COLOR` output and
 status glyph coverage. `pkg/tui/feedback_test.go` covers long queries and names
 at 80 × 24, 200 × 50 and 30 × 10, runner failures after toast expiry, the first
 frame of repository detail requests, the repository handoff, empty logs,
-single-flight and out-of-order log responses, wrapped and Home/End-scrolled help,
-wrapped narrow details and the demo's settled requests. `pkg/jobs` tests count `gh` requests for log refreshes.
+single-flight and out-of-order log responses, cancellation of a stuck log request
+before its replacement, error-to-empty and populated-to-empty log transitions,
+wrapped and Home/End-scrolled help, the help offset after a resize, the action
+menu with long names, wrapped narrow details and the demo's settled requests.
+`pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
+multi-page fallback ends at the request deadline.
 
 Regression tests cover run/job drill-down, queue counts, step progress, filtering,
 scrolled mouse selection, frame dimensions, stable selection, confirmation targets,
