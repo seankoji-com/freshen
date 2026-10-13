@@ -145,6 +145,17 @@ type BranchWorktreeDetails struct {
 	RemoteBranches []string
 	Worktrees      []string
 	ChangedFiles   []string
+	// Each *Err names why that section's read failed; empty means it
+	// succeeded. A failed section's slices are empty, so callers can tell an
+	// unreadable section from a genuinely empty one.
+	BranchesErr  string
+	WorktreesErr string
+	StatusErr    string
+}
+
+// Failed reports whether any section's read failed.
+func (d BranchWorktreeDetails) Failed() bool {
+	return d.BranchesErr != "" || d.WorktreesErr != "" || d.StatusErr != ""
 }
 
 // cleanBranchName trims whitespace and strips one leading * or + marker with or without a following space.
@@ -432,66 +443,64 @@ func FetchOrgRepoCounts(parent context.Context, org string) (map[string]RepoCoun
 }
 
 // GetRepoBranchDetails fetches branches, worktrees, and changed file details.
+// A read that fails records why in its section's *Err field instead of
+// reporting an empty section; once ctx ends, the remaining reads are skipped
+// and marked failed.
 func GetRepoBranchDetails(ctx context.Context, path, defaultBranch string) BranchWorktreeDetails {
 	var details BranchWorktreeDetails
 
-	if ctx.Err() != nil {
-		return details
-	}
-
-	// Branches
-	cmd := exec.CommandContext(ctx, "git", "-C", path, "branch", "-a")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		for _, line := range strings.Split(out.String(), "\n") {
-			if trimmed := strings.TrimSpace(line); trimmed != "" {
-				details.Branches = append(details.Branches, trimmed)
-
-				clean := cleanBranchName(trimmed)
-
-				if strings.HasPrefix(clean, "remotes/") {
-					details.RemoteBranches = append(details.RemoteBranches, trimmed)
-				} else {
-					details.LocalBranches = append(details.LocalBranches, trimmed)
-				}
-			}
+	var branches []string
+	branches, details.BranchesErr = readGitLines(ctx, path, "branch", "-a")
+	for _, trimmed := range branches {
+		details.Branches = append(details.Branches, trimmed)
+		if strings.HasPrefix(cleanBranchName(trimmed), "remotes/") {
+			details.RemoteBranches = append(details.RemoteBranches, trimmed)
+		} else {
+			details.LocalBranches = append(details.LocalBranches, trimmed)
 		}
 	}
-
-	if ctx.Err() != nil {
-		return details
-	}
-
-	// Worktrees
-	cmd = exec.CommandContext(ctx, "git", "-C", path, "worktree", "list")
-	out.Reset()
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		for _, line := range strings.Split(out.String(), "\n") {
-			if trimmed := strings.TrimSpace(line); trimmed != "" {
-				details.Worktrees = append(details.Worktrees, trimmed)
-			}
-		}
-	}
-
-	if ctx.Err() != nil {
-		return details
-	}
-
-	// Changed files & status
-	cmd = exec.CommandContext(ctx, "git", "-C", path, "status", "--short")
-	out.Reset()
-	cmd.Stdout = &out
-	if err := cmd.Run(); err == nil {
-		for _, line := range strings.Split(out.String(), "\n") {
-			if trimmed := strings.TrimSpace(line); trimmed != "" {
-				details.ChangedFiles = append(details.ChangedFiles, trimmed)
-			}
-		}
-	}
-
+	details.Worktrees, details.WorktreesErr = readGitLines(ctx, path, "worktree", "list")
+	details.ChangedFiles, details.StatusErr = readGitLines(ctx, path, "status", "--short")
 	return details
+}
+
+// readGitLines runs a read-only git command in path and returns its non-blank
+// output lines, or a one-line reason it failed.
+func readGitLines(ctx context.Context, path string, args ...string) ([]string, string) {
+	if err := ctx.Err(); err != nil {
+		return nil, gitReadFailure(err)
+	}
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", path}, args...)...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errOut
+	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, gitReadFailure(ctxErr)
+		}
+		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
+			first, _, _ := strings.Cut(stderr, "\n")
+			return nil, strings.TrimSpace(first)
+		}
+		return nil, err.Error()
+	}
+	var lines []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines, ""
+}
+
+func gitReadFailure(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "git did not answer before the deadline"
+	case errors.Is(err, context.Canceled):
+		return "read cancelled"
+	}
+	return err.Error()
 }
 
 type PruneResult struct {
@@ -1025,6 +1034,9 @@ func (d BranchWorktreeDetails) clone() BranchWorktreeDetails {
 		RemoteBranches: append([]string(nil), d.RemoteBranches...),
 		Worktrees:      append([]string(nil), d.Worktrees...),
 		ChangedFiles:   append([]string(nil), d.ChangedFiles...),
+		BranchesErr:    d.BranchesErr,
+		WorktreesErr:   d.WorktreesErr,
+		StatusErr:      d.StatusErr,
 	}
 }
 

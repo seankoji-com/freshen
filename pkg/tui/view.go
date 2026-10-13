@@ -116,24 +116,38 @@ func (m *Model) updateViewport() {
 				sb.WriteString(m.Spinner.View() + " Loading branches and worktrees…\n")
 				break
 			}
+			details := item.BranchDetails
+			if details.Failed() {
+				sb.WriteString(th.status(kindWarning, "Some git reads failed.") + " Press r to retry.\n\n")
+			}
 			sb.WriteString(th.dim.Render("X removes clean worktrees and deletes local branches already on a remote, after confirmation.") + "\n\n")
-			listSection := func(heading lipgloss.Style, title string, items []string) {
-				sb.WriteString(heading.Render(fmt.Sprintf("%s (%d)", title, len(items))) + "\n")
-				if len(items) == 0 {
-					sb.WriteString(th.dim.Render("  none found") + "\n")
+			// A failed read never reads as empty: it states the failure and
+			// labels any entries kept from an earlier read.
+			listSection := func(heading lipgloss.Style, title string, items []string, readErr string) {
+				if readErr != "" {
+					sb.WriteString(heading.Render(title) + "  " + th.status(kindWarning, "unavailable") + "\n")
+					sb.WriteString("  " + th.dim.Render("Could not read: "+jobs.SanitizeTerminal(readErr)) + "\n")
+					if len(items) > 0 {
+						sb.WriteString(th.dim.Render(fmt.Sprintf("  From an earlier read (%d):", len(items))) + "\n")
+					}
+				} else {
+					sb.WriteString(heading.Render(fmt.Sprintf("%s (%d)", title, len(items))) + "\n")
+					if len(items) == 0 {
+						sb.WriteString(th.dim.Render("  none found") + "\n")
+					}
 				}
 				for _, entry := range items {
 					sb.WriteString("  " + entry + "\n")
 				}
 				sb.WriteString("\n")
 			}
-			listSection(th.branchHeading, "Local branches", item.BranchDetails.GetLocalBranches())
-			listSection(th.branchHeading, "Remote branches", item.BranchDetails.GetRemoteBranches())
-			listSection(th.worktreeHeading, "Worktrees", item.BranchDetails.Worktrees)
-			if len(item.BranchDetails.ChangedFiles) == 0 {
+			listSection(th.branchHeading, "Local branches", details.GetLocalBranches(), details.BranchesErr)
+			listSection(th.branchHeading, "Remote branches", details.GetRemoteBranches(), details.BranchesErr)
+			listSection(th.worktreeHeading, "Worktrees", details.Worktrees, details.WorktreesErr)
+			if len(details.ChangedFiles) == 0 && details.StatusErr == "" {
 				sb.WriteString(th.warning.Render("Changed files (0)") + "\n  " + th.status(kindSuccess, "working tree is clean") + "\n")
 			} else {
-				listSection(th.warning, "Changed files", item.BranchDetails.ChangedFiles)
+				listSection(th.warning, "Changed files", details.ChangedFiles, details.StatusErr)
 			}
 
 		case TabIssues:

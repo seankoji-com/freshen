@@ -75,7 +75,8 @@ screens do not render runner data, so the poll pauses there; entering Overview o
 Runners refreshes runners when the last attempt is older than the backed-off
 interval. Organisation Actions polling starts at twenty seconds and scales with
 repository/active-run count to budget API calls. Pollers use independent
-exponential backoff after failures. Read commands have bounded execution. An open
+exponential backoff after failures. `gh` reads, log requests and repository
+branch reads run under deadlines. An open
 running job's log refreshes with one request when its job ID is known; the jobs
 list is fetched only to resolve a name or to build the step-status fallback.
 One log request runs at a time (`LogLoading`); runner ticks and queue
@@ -83,14 +84,20 @@ completions skip while it is in flight. The download and any jobs-list pages
 share one context with a `logFetchTimeout` deadline, so the request answers
 within it even when each `gh` call is slow. A request still unanswered after
 `logFetchStuckAfter` is cancelled before a replacement starts, and `LogSeq`
-discards its late response. Every log response re-renders the detail, which
+discards its late response. Opening another job replaces a request in flight
+for the job left the same way, so the open job's log loads at once. Every log response re-renders the detail, which
 states only the latest outcome (`LogErrors`, `EmptyLogs`); a tail kept from an
 earlier fetch is labelled, never left as "Loading logs…".
 
 Repository detail starts its requests before rendering (`loadRepoDetail`), so
 the first frame shows them loading. Branch reads run one at a time; opening
 another repository while one is in flight queues it (`RepoDetailQueued`) and the
-completion starts it if that detail is still open. Spinner ticks re-render an
+completion starts it if that detail is still open. One `repoDetailTimeout`
+deadline covers a read's branch, worktree and status commands, so a hung `git`
+ends the request. `GetRepoBranchDetails` records each failed command in
+`BranchesErr`, `WorktreesErr` or `StatusErr`; the detail states the failure with
+an `r` retry hint instead of "none found" or "working tree is clean", and keeps
+entries from an earlier read under a "From an earlier read" label. Spinner ticks re-render an
 open detail only while it is waiting on a request.
 
 A runner refresh failure leaves a status-row warning on Overview and Runners

@@ -133,12 +133,15 @@ const logFetchStuckAfter = logFetchTimeout + 5*time.Second
 // startLogFetch marks a log request for job in flight and returns it. Only one
 // log request runs at a time, so polling cannot stack requests behind a slow
 // one, and each carries a sequence number so an overtaken response cannot
-// replace newer lines.
+// replace newer lines. Opening another job replaces the request in flight.
 func (m *Model) startLogFetch(job *jobs.JobItem) tea.Cmd {
 	if job == nil || job.RunID == 0 {
 		return nil
 	}
-	if m.LogLoading != "" && time.Since(m.LogLoadingSince) < logFetchStuckAfter {
+	// A request for this job already running answers soon. A request for
+	// another job is from a job the user has left: cancel it so the open
+	// job's log loads now, and LogSeq discards its late response.
+	if m.LogLoading == job.ID && time.Since(m.LogLoadingSince) < logFetchStuckAfter {
 		return nil
 	}
 	if m.cancelLogFetch != nil {
@@ -678,9 +681,40 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 	}
 	m.RepoDetailQueued = ""
 	m.RepoDetailLoading = repo.Path
-	ctx := m.ctx
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	// The deadline covers all three git reads, so a hung command ends the
+	// request, clears RepoDetailLoading and lets a queued read start.
+	ctx, cancel := context.WithTimeout(parent, repoDetailTimeout)
 	return func() tea.Msg {
-		repo.BranchDetails = git.GetRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
+		defer cancel()
+		repo.BranchDetails = getRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
 		return repoDetailsLoadedMsg{repo: repo}
 	}
+}
+
+// getRepoBranchDetails is the branch and worktree read, swappable so tests
+// can block or fail it.
+var getRepoBranchDetails = git.GetRepoBranchDetails
+
+// repoDetailTimeout bounds one repository's branch, worktree and status
+// reads together.
+var repoDetailTimeout = 30 * time.Second
+
+// mergeBranchDetails applies a new read over the cached one. A section whose
+// read failed keeps its cached entries, which the detail labels as earlier
+// data alongside the failure.
+func mergeBranchDetails(cached, fresh git.BranchWorktreeDetails) git.BranchWorktreeDetails {
+	if fresh.BranchesErr != "" {
+		fresh.Branches, fresh.LocalBranches, fresh.RemoteBranches = cached.Branches, cached.LocalBranches, cached.RemoteBranches
+	}
+	if fresh.WorktreesErr != "" {
+		fresh.Worktrees = cached.Worktrees
+	}
+	if fresh.StatusErr != "" {
+		fresh.ChangedFiles = cached.ChangedFiles
+	}
+	return fresh
 }

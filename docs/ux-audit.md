@@ -54,6 +54,9 @@ Reviewed on 13 October 2026 against `f324ced`.
 | A long repository name wrapped the action menu heading over the selected action at 30 × 10 | The heading is cut to one row and the detail gives way first, so the selected action always shows |
 | On narrow terminals the header dropped its data age, spinner included, so a refresh over cached rows showed no loading state | The header falls back to `⣾ refreshing`, then the spinner alone, and truncates the owner before losing it |
 | The under-size notice offered `q quit` during a filter, menu or confirmation, where `q` is ignored; the demo quit on `q` regardless | The notice names the quit binding enabled in the current layer (`ctrl+c` in modal layers), and the demo quits only through enabled bindings |
+| Branch reads ran on the session context with no deadline, so a hung `git` command kept repository detail loading, blocked `r` and stalled the queued repository | One 30-second deadline (`repoDetailTimeout`) covers the branch, worktree and status reads; a timeout ends the request and starts the queued read |
+| A failed `git branch`, `git worktree list` or `git status` showed as "none found" or "working tree is clean" | Each section states its failure with an `r` retry hint, and entries kept from an earlier read are labelled |
+| Opening job B while job A's log request ran dropped B's fetch, leaving "Logs not loaded" | Opening a job cancels the request for the job left and starts the open job's at once; `LogSeq` discards the late answer |
 
 ## Verification
 
@@ -71,6 +74,9 @@ before its replacement, error-to-empty and populated-to-empty log transitions,
 wrapped and Home/End-scrolled help, the help offset after a resize, the action
 menu with long names, wrapped narrow details, the demo's settled requests, the
 narrow-header refresh indicator and the resize notice's quit key in each layer.
+`pkg/tui/handoff_test.go` covers a hung branch read ending at its deadline and
+handing off to the queued repository, failed reads shown as failures rather than
+empty sections, and opening another job while a log request runs.
 `pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
 multi-page fallback ends at the request deadline.
 

@@ -46,7 +46,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		for _, r := range m.Repos {
 			if r.Path == msg.repo.Path {
-				r.BranchDetails = msg.repo.BranchDetails
+				r.BranchDetails = mergeBranchDetails(r.BranchDetails, msg.repo.BranchDetails)
 				break
 			}
 		}
@@ -98,10 +98,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.handleLoadedJobQueueMsg(msg))
 
 	case loadedJobLogsMsg:
+		// Opening a job already replaced any request for another job, so a
+		// response never needs to start the open job's fetch.
 		m.handleLoadedJobLogsMsg(msg)
-		if m.OpenJobID != "" && m.OpenJobID != msg.jobID {
-			cmds = append(cmds, m.fetchOpenJobLogs())
-		}
 
 	case orgSyncedMsg:
 		cmd, early := m.handleOrgSyncedMsg(msg)

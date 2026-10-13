@@ -1587,3 +1587,45 @@ func TestAddAliasOverrideDropsReplacedPair(t *testing.T) {
 		t.Errorf("GetGHRepoName(docs) = %q, want docs (its pair was replaced)", got)
 	}
 }
+
+// A read that fails reports why in its own section instead of returning an
+// empty section that looks like "no branches" or "working tree is clean".
+func TestGetRepoBranchDetailsReportsFailedReads(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	run("init", "-b", "main", repo)
+	run("-C", repo, "config", "user.name", "Freshen Test")
+	run("-C", repo, "config", "user.email", "freshen@example.invalid")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("-C", repo, "add", "README.md")
+	run("-C", repo, "commit", "-m", "fixture")
+
+	ok := GetRepoBranchDetails(context.Background(), repo, "main")
+	if ok.Failed() || len(ok.LocalBranches) != 1 || len(ok.Worktrees) != 1 || len(ok.ChangedFiles) != 0 {
+		t.Fatalf("readable repository: %+v", ok)
+	}
+
+	notRepo := GetRepoBranchDetails(context.Background(), t.TempDir(), "main")
+	for name, reason := range map[string]string{"branches": notRepo.BranchesErr, "worktrees": notRepo.WorktreesErr, "status": notRepo.StatusErr} {
+		if !strings.Contains(reason, "not a git repository") {
+			t.Fatalf("%s failure not reported: %q", name, reason)
+		}
+	}
+	if len(notRepo.Branches)+len(notRepo.Worktrees)+len(notRepo.ChangedFiles) != 0 {
+		t.Fatalf("failed reads returned entries: %+v", notRepo)
+	}
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	late := GetRepoBranchDetails(expired, repo, "main")
+	if late.BranchesErr != "git did not answer before the deadline" || late.WorktreesErr != late.BranchesErr || late.StatusErr != late.BranchesErr {
+		t.Fatalf("deadline not reported for every section: %+v", late)
+	}
+}
