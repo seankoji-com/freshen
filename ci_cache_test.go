@@ -873,3 +873,90 @@ func TestCICacheEnvironmentKeyCase(t *testing.T) {
 		t.Fatal("unrelated inherited variable was dropped along with the folded overrides")
 	}
 }
+
+// manifestFor renders the manifest body restore expects for a kind: the store
+// identity with the kind suffix, exactly as publish writes it.
+func (f *cacheFixture) manifestFor(kind string) string {
+	f.t.Helper()
+	return strings.TrimSuffix(f.outputs[kind], "-"+f.env["GITHUB_SHA"])
+}
+
+// TestCICacheArchiveAllowsAncestorDirectories proves the modules archive
+// re-imports when it carries the implicit parent directories of the nested
+// operand (mod/ and mod/cache/ before mod/cache/download/...). Those are strict
+// ancestors of the already-allowed prefix, so accepting them adds no writable
+// location while keeping the round trip independent of tar's parent-entry
+// behaviour.
+func TestCICacheArchiveAllowsAncestorDirectories(t *testing.T) {
+	f := newCacheFixture(t)
+	f.prepare()
+	f.env["MODULE_MATCHED"], f.env["MODULE_HIT"] = f.outputs["modules"], "true"
+	f.archive("modules", []*tar.Header{
+		{Name: "manifest", Typeflag: tar.TypeReg, Mode: 0o600},
+		{Name: "mod/", Typeflag: tar.TypeDir, Mode: 0o700},
+		{Name: "mod/cache/", Typeflag: tar.TypeDir, Mode: 0o700},
+		{Name: "mod/cache/download/", Typeflag: tar.TypeDir, Mode: 0o700},
+		{Name: "mod/cache/download/fixture.zip", Typeflag: tar.TypeReg, Mode: 0o600},
+	}, []string{f.manifestFor("modules"), "", "", "", "seed"})
+	f.command("restore", true)
+	data, err := os.ReadFile(filepath.Join(f.store, "mod/cache/download/fixture.zip"))
+	if err != nil || string(data) != "seed" {
+		t.Fatalf("restored ancestor-dir archive %q, %v", data, err)
+	}
+}
+
+// TestCICacheModulesArchiveRejectsNonAncestorEscapes scopes that allowance: a
+// sibling under the modules store that is neither the prefix nor one of its
+// ancestors is still refused. The archive carries the real prefix directory too,
+// so a wrongly accepted entry would restore successfully and fail this case
+// instead of passing on an unrelated manifest error.
+func TestCICacheModulesArchiveRejectsNonAncestorEscapes(t *testing.T) {
+	for _, name := range []string{"mod/other/file", "mod/cache/other/file", "modX/cache/file", "other/file", "../escape"} {
+		t.Run(name, func(t *testing.T) {
+			f := newCacheFixture(t)
+			f.prepare()
+			f.env["MODULE_MATCHED"], f.env["MODULE_HIT"] = f.outputs["modules"], "true"
+			f.archive("modules", []*tar.Header{
+				{Name: "manifest", Typeflag: tar.TypeReg, Mode: 0o600},
+				{Name: "mod/cache/download/", Typeflag: tar.TypeDir, Mode: 0o700},
+				{Name: "mod/cache/download/fixture.zip", Typeflag: tar.TypeReg, Mode: 0o600},
+				{Name: name, Typeflag: tar.TypeReg, Mode: 0o600},
+			}, []string{f.manifestFor("modules"), "", "seed", "x"})
+			f.command("restore", false)
+		})
+	}
+}
+
+// TestCICacheRejectionNamesFailedCheck requires the rejection log to name which
+// invariant failed, so a red job is diagnosable from the log alone.
+func TestCICacheRejectionNamesFailedCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		want     string
+		typeflag byte
+	}{
+		{"build/evil\\path", "unsafe path fragment", tar.TypeReg},
+		{"gopath/bin/tool", "outside the allowed set", tar.TypeReg},
+		{"build/link", "neither a regular file nor a directory", tar.TypeSymlink},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCacheFixture(t)
+			f.prepare()
+			f.env["BUILD_MATCHED"], f.env["BUILD_HIT"] = f.outputs["build"], "true"
+			f.archive("build", []*tar.Header{
+				{Name: "manifest", Typeflag: tar.TypeReg, Mode: 0o600},
+				{Name: tc.name, Typeflag: tc.typeflag, Linkname: "../escape", Mode: 0o600},
+			}, []string{f.manifestFor("build"), "x"})
+			cmd := exec.Command("bash", ".github/scripts/go-cache.sh", "restore")
+			cmd.Dir = f.dir
+			cmd.Env = f.childEnv()
+			out, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("archive was accepted: %s", out)
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("rejection %q did not name %q", out, tc.want)
+			}
+		})
+	}
+}
