@@ -16,7 +16,7 @@ func (m *Model) handleKeyQuit() (tea.Cmd, bool) {
 func (m *Model) handleKeySyncAll() tea.Cmd {
 	if !m.IsSyncing && len(m.Repos) > 0 {
 		m.IsSyncing = true
-		m.setToast(" 󰓦 Starting parallel sync for all active repositories...", 1)
+		m.setToast(statusGlyphs[kindRunning]+" Starting parallel sync for all active repositories…", 1)
 		cmd := m.startSyncCmd(m.Repos, true, false)
 		m.updateViewport()
 		return cmd

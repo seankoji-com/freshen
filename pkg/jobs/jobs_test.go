@@ -635,6 +635,8 @@ func TestRunJobPaginationAndExactLogIdentity(t *testing.T) {
 			return mustJSON(t, GHJobsResponse{TotalCount: 51, Jobs: []GHJobInfo{{ID: 51, Name: "last"}}}), nil
 		case strings.Contains(path, "/runs/10/jobs"):
 			return mustJSON(t, first), nil
+		case strings.Contains(path, "/jobs/99/logs"):
+			return nil, fmt.Errorf("HTTP 404: Not Found")
 		default:
 			t.Errorf("unexpected request %s", path)
 			return nil, fmt.Errorf("unexpected request")
@@ -717,5 +719,46 @@ func TestExtraStatusFailureRetainsRecentPage(t *testing.T) {
 	partial, ok := err.(*QueueFetchError)
 	if !ok || !partial.Partial || len(queue) != 30 {
 		t.Fatalf("lost partial page: %d %v", len(queue), err)
+	}
+}
+
+// A log refresh for a job whose ID is known costs one request: the jobs list is
+// not re-fetched merely to confirm the ID. Before, every 10-second refresh of a
+// running job's log made at least two calls.
+func TestKnownJobLogRefreshMakesOneRequest(t *testing.T) {
+	var calls []string
+	stubGH(t, func(path string) ([]byte, error) {
+		calls = append(calls, path)
+		if strings.Contains(path, "/actions/jobs/7/logs") {
+			return []byte("one\ntwo\n"), nil
+		}
+		return mustJSON(t, GHJobsResponse{TotalCount: 1, Jobs: []GHJobInfo{{ID: 7, Name: "build"}}}), nil
+	})
+	lines, id, err := FetchJobLogs("org", "repo", 3, 7, "build", 10)
+	if err != nil || id != 7 || len(lines) != 2 {
+		t.Fatalf("direct log fetch: %v %d %v", lines, id, err)
+	}
+	if len(calls) != 1 || !strings.Contains(calls[0], "/actions/jobs/7/logs") {
+		t.Fatalf("known job ID made %d requests, want 1: %v", len(calls), calls)
+	}
+}
+
+// When GitHub withholds a known job's log, the jobs list is fetched once for the
+// step-status fallback and the log is not requested a second time.
+func TestWithheldKnownJobLogFallsBackWithoutRetrying(t *testing.T) {
+	var calls []string
+	stubGH(t, func(path string) ([]byte, error) {
+		calls = append(calls, path)
+		if strings.Contains(path, "/logs") {
+			return nil, errors.New("HTTP 404")
+		}
+		return mustJSON(t, GHJobsResponse{TotalCount: 1, Jobs: []GHJobInfo{{ID: 7, Name: "build", Status: "in_progress", Steps: []GHJobStep{{Number: 1, Name: "checkout", Status: "completed", Conclusion: "success"}}}}}), nil
+	})
+	lines, id, err := FetchJobLogs("org", "repo", 3, 7, "build", 10)
+	if err != nil || id != 7 || len(lines) != 2 || !strings.Contains(lines[1], "checkout") {
+		t.Fatalf("fallback: %v %d %v", lines, id, err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("withheld log made %d requests, want 2 (log, jobs list): %v", len(calls), calls)
 	}
 }

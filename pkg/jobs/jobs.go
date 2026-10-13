@@ -790,7 +790,18 @@ func runDuration(run GHWorkflowRun) (time.Duration, bool) {
 }
 
 // FetchJobLogs fetches the step log output for a specific running workflow job.
+//
+// When the caller already knows the job's ID (every job opened from a listed
+// run does), the log is requested directly: one API call per refresh instead of
+// listing the run's jobs first. The jobs list is fetched only to resolve a job
+// by name or to build the step-status fallback when GitHub withholds the log,
+// and an explicit ID never falls back to a different job.
 func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
+	if targetGHJobID != 0 {
+		if logOut, err := runGH("api", fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, targetGHJobID)); err == nil {
+			return logTail(logOut, maxLines), targetGHJobID, nil
+		}
+	}
 	infos, err := FetchRunJobs(org, repo, runID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("jobs list: %w", err)
@@ -857,11 +868,13 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 		return nil, 0, fmt.Errorf("no job found for run %d", runID)
 	}
 
-	// Step 2: fetch raw log text
-	logOut, err := runGH(
-		"api",
-		fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID),
-	)
+	// Step 2: fetch raw log text, unless the direct request above already failed.
+	var logOut []byte
+	if targetGHJobID == 0 {
+		logOut, err = runGH("api", fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID))
+	} else {
+		err = fmt.Errorf("log download unavailable")
+	}
 	if err != nil {
 		// Fall back to step names if logs unavailable
 		lines := []string{"Log download unavailable; showing GitHub step status."}
@@ -881,10 +894,14 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 		return lines, jobID, nil
 	}
 
-	// Parse raw log -- take last maxLines non-empty lines
-	raw := string(logOut)
+	return logTail(logOut, maxLines), jobID, nil
+}
+
+// logTail returns the last maxLines non-empty lines of a raw log, sanitised
+// for terminal display.
+func logTail(raw []byte, maxLines int) []string {
 	var lines []string
-	for _, line := range strings.Split(raw, "\n") {
+	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimRight(line, "\r")
 		if line != "" {
 			lines = append(lines, SanitizeTerminal(line))
@@ -893,7 +910,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
-	return lines, jobID, nil
+	return lines
 }
 
 // jobSortKey returns a stable sort key: running first, then by numeric ID.

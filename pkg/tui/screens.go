@@ -6,9 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
@@ -21,22 +20,6 @@ type screenEntry struct {
 type actionRun struct {
 	run  *jobs.RunItem
 	jobs []*jobs.JobItem
-}
-
-type screenTab struct {
-	key   string
-	name  string
-	focus FocusType
-}
-
-func screenTabs(width int) []screenTab {
-	if width < 48 {
-		return []screenTab{{"0", "O", FocusOverview}, {"1", "R", FocusRepos}, {"2", "A", FocusJobs}, {"3", "N", FocusRunners}, {"4", "C", FocusConcerns}}
-	}
-	if width < 72 {
-		return []screenTab{{"0", "Org", FocusOverview}, {"1", "Repos", FocusRepos}, {"2", "CI", FocusJobs}, {"3", "Run", FocusRunners}, {"4", "Concerns", FocusConcerns}}
-	}
-	return []screenTab{{"0", "Overview", FocusOverview}, {"1", "Repositories", FocusRepos}, {"2", "Actions", FocusJobs}, {"3", "Runners", FocusRunners}, {"4", "Concerns", FocusConcerns}}
 }
 
 func countPhrase(count int, singular, plural string) string {
@@ -130,6 +113,33 @@ func completion(items []*jobs.JobItem) (done int) {
 	}
 	return done
 }
+func stepKind(s jobs.GHJobStep) statusKind {
+	switch {
+	case s.Status == "in_progress":
+		return kindRunning
+	case s.Status == "queued" || s.Status == "pending" || s.Status == "waiting":
+		return kindQueued
+	case s.Conclusion == "success":
+		return kindSuccess
+	case s.Conclusion == "failure" || s.Conclusion == "timed_out":
+		return kindFailure
+	case s.Conclusion == "skipped" || s.Conclusion == "cancelled":
+		return kindSkipped
+	}
+	return kindUnknown
+}
+
+// failedStep names the first failing step GitHub reported for a job, the
+// quickest pointer to why a run failed.
+func failedStep(j *jobs.JobItem) string {
+	for _, s := range j.Steps {
+		if stepKind(s) == kindFailure {
+			return fmt.Sprintf("%s failed at step %d: %s", statusGlyphs[kindFailure], s.Number, s.Name)
+		}
+	}
+	return ""
+}
+
 func stepSummary(j *jobs.JobItem) (done int, current string) {
 	for _, step := range j.Steps {
 		if step.Status == "completed" {
@@ -141,19 +151,10 @@ func stepSummary(j *jobs.JobItem) (done int, current string) {
 	}
 	return done, current
 }
+
+// stateBadge renders a job or run status as glyph, label and colour.
 func stateBadge(s jobs.JobStatus) string {
-	c := colorMuted
-	switch s {
-	case jobs.JobRunning:
-		c = colorSecondary
-	case jobs.JobQueued, jobs.JobWaiting:
-		c = colorYellow
-	case jobs.JobPassed:
-		c = colorGreen
-	case jobs.JobFailed:
-		c = colorRed
-	}
-	return lipgloss.NewStyle().Foreground(c).Bold(true).Render(string(s))
+	return th.status(jobKind(s), string(s))
 }
 func (m Model) countBar(done, total int, noun string) string {
 	if total == 0 {
@@ -176,16 +177,16 @@ func (m Model) entries() []screenEntry {
 				}
 				entries = append(entries, screenEntry{
 					key: r.Path + "/" + r.Name, index: i,
-					title: r.Name + "  " + badgeSkipped.Render("counts unknown"), subtitle: detail + " · not ranked",
+					title: r.Name + "  " + th.status(kindUnknown, "counts unknown"), subtitle: detail + " · not ranked",
 				})
 				continue
 			}
 			badges := make([]string, 0, 2)
 			if r.OpenPRsCount > 0 {
-				badges = append(badges, badgePR.Render(countPhrase(r.OpenPRsCount, "open PR", "open PRs")))
+				badges = append(badges, th.pr.Render(countPhrase(r.OpenPRsCount, "open PR", "open PRs")))
 			}
 			if r.OpenIssuesCount > 0 {
-				badges = append(badges, badgeIssue.Render(countPhrase(r.OpenIssuesCount, "open issue", "open issues")))
+				badges = append(badges, th.issue.Render(countPhrase(r.OpenIssuesCount, "open issue", "open issues")))
 			}
 			detail := r.CurrentBranch
 			if detail == "" {
@@ -207,26 +208,52 @@ func (m Model) entries() []screenEntry {
 		}
 	case FocusRepos:
 		for i, r := range m.Repos {
+			parts := make([]string, 0, 5)
+			switch {
+			case r.IsNew:
+				parts = append(parts, "not cloned")
+			case r.CurrentBranch != "":
+				branch := r.CurrentBranch
+				if r.DefaultBranch != "" && r.CurrentBranch != r.DefaultBranch {
+					branch += " (default " + r.DefaultBranch + ")"
+				}
+				parts = append(parts, branch)
+			}
+			if r.HasUnstagedChanges {
+				parts = append(parts, "local changes")
+			}
 			counts := "counts not loaded"
 			if r.HasLoadedCounts {
-				counts = fmt.Sprintf("%d PRs · %d issues", r.OpenPRsCount, r.OpenIssuesCount)
+				counts = countPhrase(r.OpenPRsCount, "PR", "PRs") + " · " + countPhrase(r.OpenIssuesCount, "issue", "issues")
 				if r.CountsStale {
 					counts += " · last successful refresh"
 				}
 			}
+			parts = append(parts, counts)
 			if r.LocalMetadataStale {
-				counts += " · local metadata from last snapshot"
+				parts = append(parts, "local metadata from last snapshot")
+			}
+			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
+				parts = append(parts, r.StatusMsg)
 			}
 			entries = append(entries, screenEntry{key: r.Path + "/" + r.Name, index: i,
-				title: r.Name + "  " + m.renderStatusBadge(r), subtitle: r.CurrentBranch + " · " + counts + " · " + r.StatusMsg})
+				title: r.Name + "  " + m.renderStatusBadge(r), subtitle: strings.Join(parts, " · ")})
 		}
 	case FocusRunners:
 		for i, r := range m.getMatchingRunners() {
-			current := "No assigned job reported"
+			current := "no assigned job reported"
 			if j := findJobForRunner(r, m.JobQueue); j != nil && j.Status == jobs.JobRunning {
-				current = j.Name
+				current = "running " + j.Name
+				if j.Duration != "" && j.Duration != "-" {
+					current += " for " + j.Duration
+				}
 			}
-			entries = append(entries, screenEntry{key: r.ID, index: i, title: r.Name + "  " + string(r.Status), subtitle: r.Platform + " · " + current})
+			kind, label := runnerKind(r.Status)
+			subtitle := r.Platform + " · " + current
+			if len(r.Tags) > 0 {
+				subtitle += " · labels: " + strings.Join(r.Tags, ", ")
+			}
+			entries = append(entries, screenEntry{key: r.ID, index: i, title: r.Name + "  " + th.status(kind, label), subtitle: subtitle})
 		}
 	case FocusJobs:
 		if m.OpenRun != nil {
@@ -238,6 +265,9 @@ func (m Model) entries() []screenEntry {
 				}
 				if j.Status == jobs.JobQueued || j.Status == jobs.JobWaiting {
 					detail = "Not started · labels: " + strings.Join(j.Labels, ", ")
+				}
+				if failed := failedStep(j); failed != "" {
+					detail = strings.TrimPrefix(failed, statusGlyphs[kindFailure]+" ")
 				}
 				if j.Duration != "" && j.Duration != "-" {
 					detail += " · " + j.Duration
@@ -284,7 +314,11 @@ func (m Model) entries() []screenEntry {
 				if r.run.JobsError != "" {
 					progress = "Job details unavailable · r retries"
 				}
-				sub := progress + " · " + r.run.Branch + " · " + r.run.Event
+				sub := progress
+				if timing := runTiming(r.run, time.Now()); timing != "" {
+					sub += " · " + timing
+				}
+				sub += " · " + r.run.Branch + " · " + r.run.Event
 				if r.run.Title != "" {
 					sub += " · " + r.run.Title
 				}
@@ -396,7 +430,7 @@ func (m *Model) moveSelection(delta int) {
 	}
 	m.selectEntry(es[max(0, min(len(es)-1, index+delta))])
 }
-func (m Model) bodyHeight() int { return max(1, m.Height-5) }
+func (m Model) bodyHeight() int { return max(1, m.Height-headerRows-footerRows) }
 func (m Model) visibleEntries() (entries []screenEntry, start, selected int) {
 	es := m.entries()
 	selected = -1
@@ -409,108 +443,6 @@ func (m Model) visibleEntries() (entries []screenEntry, start, selected int) {
 	return es[start:min(len(es), start+count)], start, selected
 }
 func (m Model) detailVisible() bool { return m.Detail || m.OpenJobID != "" }
-func (m Model) screenName() string {
-	switch m.ActiveFocus {
-	case FocusOverview:
-		return "Overview"
-	case FocusConcerns:
-		return "Concerns"
-	case FocusJobs:
-		return "Actions"
-	case FocusRunners:
-		return "Runners"
-	default:
-		return "Repositories"
-	}
-}
-func (m Model) contextLine() string {
-	if m.Filtering {
-		return m.Search.View()
-	}
-	if m.OpenJobID != "" {
-		return "Actions / " + m.OpenRun.Workflow + " / job " + m.OpenJobID + " · steps and log tail"
-	}
-	if m.OpenRun != nil {
-		return fmt.Sprintf("Actions / %s / %s · run #%d · attempt %d · %s", m.OpenRun.Repo, m.OpenRun.Workflow, m.OpenRun.Number, m.OpenRun.Attempt, stateBadge(m.OpenRun.Status))
-	}
-	if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) && m.SelectedIndex >= 0 && m.SelectedIndex < len(m.Repos) {
-		return m.screenName() + " / " + m.Repos[m.SelectedIndex].Name + "  " + m.renderTabBar() + "  [ ] change tab"
-	}
-	if m.Detail {
-		return "Runners / details"
-	}
-	s := m.screenName()
-	if m.ActiveFocus == FocusOverview {
-		if m.TargetOrg == "" {
-			if m.OrgRefreshFailed {
-				return "Overview · degraded local snapshot"
-			}
-			if m.LocalScanFailed {
-				return "Overview · local workspace · metadata incomplete"
-			}
-			return "Overview · local workspace"
-		}
-		if m.OrgRefreshFailed {
-			return "Overview · degraded organization snapshot"
-		}
-		if m.LocalScanFailed {
-			return "Overview · organization snapshot · local metadata incomplete"
-		}
-		return "Overview · live organization snapshot"
-	}
-	if m.ActiveFocus == FocusConcerns {
-		summary := m.buildRepoCountSummary()
-		known := summary.concernRepos
-		if m.TargetOrg == "" {
-			return "Concerns · GitHub owner not configured"
-		}
-		if summary.countsLoaded < summary.repositories {
-			context := fmt.Sprintf("Concerns · %s · counts loaded for %d/%d repositories", countPhrase(known, "known repository", "known repositories"), summary.countsLoaded, summary.repositories)
-			if summary.countsStale > 0 {
-				context += fmt.Sprintf(" · %d from last successful refresh", summary.countsStale)
-			}
-			return context
-		}
-		if summary.countsStale > 0 {
-			return fmt.Sprintf("Concerns · %d repositories · %d open PRs · %d open issues · last successful counts for %d", known, summary.openPRs, summary.openIssues, summary.countsStale)
-		}
-		return fmt.Sprintf("Concerns · %d repositories · %d open PRs · %d open issues", known, summary.openPRs, summary.openIssues)
-	}
-	if m.ActiveFocus == FocusJobs {
-		running, queued, waiting := 0, 0, 0
-		for _, r := range m.actionRuns() {
-			switch r.run.Status {
-			case jobs.JobRunning:
-				running++
-			case jobs.JobQueued:
-				queued++
-			case jobs.JobWaiting:
-				waiting++
-			}
-		}
-		s = fmt.Sprintf("%s runs · %d running · %d queued · %d waiting", []string{"Active", "Needs attention", "Recent"}[m.ActionsFilter], running, queued, waiting)
-	}
-	if m.ActiveFocus == FocusJobs && m.OpenRun == nil {
-		queued := 0
-		for _, j := range m.JobQueue {
-			if !j.IsRunHeader && j.Status == jobs.JobQueued {
-				queued++
-			}
-		}
-		if m.QueueView {
-			s = fmt.Sprintf("Job queue · %d jobs not started · v shows runs", queued)
-		} else {
-			s += fmt.Sprintf(" · %d queued jobs · v queue", queued)
-		}
-	}
-	if m.ActiveFocus == FocusRunners && m.RunnerPermissionDenied {
-		s += " · observed assignments only; fleet access unavailable"
-	}
-	if m.Search.Value() != "" {
-		s += " · filter: " + m.Search.Value()
-	}
-	return s
-}
 func (m Model) listContent() string {
 	es, start, selected := m.visibleEntries()
 	coverageWarning := m.concernsCoverageWarning()
@@ -539,38 +471,46 @@ func (m Model) listContent() string {
 			return coverageWarning + "\n\nNo known concerns. Press r to retry unavailable counts."
 		case m.ActiveFocus == FocusConcerns:
 			return "No open PRs or issues."
+		case (m.ActiveFocus == FocusJobs || m.ActiveFocus == FocusRunners) && m.TargetOrg == "":
+			return "Actions and runners need a GitHub owner. Restart with -owner NAME, or set \"owner\" in config.json."
 		case m.ActiveFocus == FocusJobs && (m.IsJobQueueLoading || m.RunLoading):
 			return m.Spinner.View() + " Loading Actions…"
 		case m.ActiveFocus == FocusJobs && m.OpenRun != nil && m.OpenRun.JobsError != "":
 			return m.OpenRun.JobsError
 		case m.ActiveFocus == FocusJobs && m.JobQueueFetchFailed:
-			return "Actions unavailable or incomplete. Press r to retry."
+			return "Actions unavailable or incomplete: " + m.ActionsCoverage + "\nPress r to retry."
 		case m.ActiveFocus == FocusJobs && m.OpenRun != nil:
 			return "GitHub has not reported any jobs for this run. Press r to refresh."
+		case m.ActiveFocus == FocusJobs && m.QueueView:
+			return "No queued or running jobs. Press v to return to runs, or r to refresh."
 		case m.ActiveFocus == FocusJobs:
-			return "No runs in this view. Press f to change the filter, or r to refresh."
+			return fmt.Sprintf("No %s. Press f to show %s, or r to refresh.", strings.ToLower(m.breadcrumb()[1]), []string{"runs needing attention", "recent runs", "active runs"}[m.ActionsFilter])
 		case m.ActiveFocus == FocusRunners && m.IsRunnersLoading:
 			return m.Spinner.View() + " Loading runners…"
 		case m.ActiveFocus == FocusRunners && m.RunnerPermissionDenied:
 			return "Fleet access unavailable. Runners appear here when observed in job assignments."
 		case m.ActiveFocus == FocusRunners && m.RunnerFetchFailed:
 			return "Runner fetch failed. Press r to retry."
+		case m.ActiveFocus == FocusRunners:
+			return "No self-hosted runners are registered for " + m.TargetOrg + ". GitHub-hosted runners are not listed.\nPress r to refresh."
+		case m.ActiveFocus == FocusRepos:
+			return "No repositories found in " + git.ShortenHomePath(m.TargetDir) + ". Check the workspace path, or press r to refresh."
 		default:
 			return "Nothing to show. Press r to refresh."
 		}
 	}
 	var lines []string
 	if coverageWarning != "" {
-		lines = append(lines, lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(coverageWarning), "")
+		lines = append(lines, th.warning.Render(coverageWarning), "")
 	}
 	for i, e := range es {
-		prefix := "  "
-		title := e.title
+		prefix, title, subtitle := "  ", e.title, th.dim.Render(e.subtitle)
 		if i+start == selected {
-			prefix = "› "
-			title = selectedRowStyle.Render(title)
+			prefix = th.cursor.Render("›") + " "
+			title = th.selected.Render(title)
+			subtitle = th.body.Render(e.subtitle)
 		}
-		lines = append(lines, prefix+title, "  "+lipgloss.NewStyle().Foreground(colorMuted).Render(e.subtitle))
+		lines = append(lines, prefix+title, "  "+subtitle)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -597,136 +537,6 @@ func insetFrame(content string, width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) screenView() string {
-	if m.Width == 0 {
-		return "Starting freshen…"
-	}
-	if m.Width < 30 || m.Height < 10 {
-		return fitFrame("freshen\nResize to at least 30 × 10\nq quit", m.Width, m.Height)
-	}
-	header := " " + titleStyle.Render("freshen")
-	if m.TargetOrg != "" {
-		header += "  " + lipgloss.NewStyle().Foreground(colorMuted).Render(m.TargetOrg)
-	}
-	if m.JobQueueFetchFailed {
-		header += badgeError.Render(" · Actions incomplete")
-	}
-	tabs := ""
-	for _, tab := range screenTabs(m.Width) {
-		style := tabInactiveStyle
-		if tab.focus == m.ActiveFocus {
-			style = tabActiveStyle
-		}
-		tabs += style.Render(tab.key+" "+tab.name) + " "
-	}
-	body := m.listContent()
-	if m.ActiveFocus == FocusOverview {
-		body = m.summaryContent(max(1, m.Width-2), m.bodyHeight())
-	}
-	if m.detailVisible() {
-		body = m.Viewport.View()
-	}
-	if m.ShowHelp {
-		lines := strings.Split(m.helpContent(), "\n")
-		body = strings.Join(lines[min(m.HelpOffset, len(lines)-1):], "\n")
-	}
-	if m.MenuOpen || m.PendingAction != "" {
-		body = ansi.Wrap(m.menuContent(), m.Width-2, "")
-	}
-	body = insetFrame(body, m.Width, m.bodyHeight())
-	status := m.statusLine()
-	return fitFrame(header+"\n"+tabs+"\n "+m.contextLine()+"\n"+body+"\n "+status+"\n "+m.shortHelp(), m.Width, m.Height)
-}
-func (m Model) statusLine() string {
-	if m.BusyAction != "" {
-		return m.Spinner.View() + " " + m.BusyAction + " · navigation remains available"
-	}
-	if m.ToastMsg != "" {
-		return m.ToastMsg + "  (Esc dismiss)"
-	}
-	if m.OrgRefreshFailed && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return "Repository snapshot unavailable · " + m.orgRefreshFailureDetail()
-	}
-	if m.LocalScanUnresponsive && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return "Workspace directory unresponsive · restore it and press r to retry"
-	}
-	if m.LocalScanStuck && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return "Previous local repository scan abandoned · press r to retry"
-	}
-	if m.LocalScanInProgress && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return "Local repository scan still running · automatic refresh will retry after it finishes"
-	}
-	if m.LocalScanFailed && (m.ActiveFocus == FocusOverview || m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return "Local repository metadata incomplete · press r to retry"
-	}
-	if m.JobQueueFetchFailed {
-		return "Actions incomplete · " + m.ActionsCoverage
-	}
-	if m.ActiveFocus == FocusJobs && !m.LastActionsRefresh.IsZero() {
-		return fmt.Sprintf("Updated %s ago · auto-refresh %s · recent history: 30 runs/repository", jobs.FormatDuration(time.Since(m.LastActionsRefresh)), jobs.FormatDuration(m.actionsPollInterval()))
-	}
-	if m.IsSyncing {
-		return m.Spinner.View() + " Synchronising repositories"
-	}
-	if m.ActiveFocus == FocusOverview {
-		if m.TargetOrg == "" {
-			return "Local workspace · set an owner to load Actions and runners"
-		}
-		if m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading {
-			return m.Spinner.View() + " Refreshing organization snapshot"
-		}
-		if !m.LastActionsRefresh.IsZero() {
-			return fmt.Sprintf("Actions updated %s ago · auto-refresh %s", jobs.FormatDuration(time.Since(m.LastActionsRefresh)), jobs.FormatDuration(m.actionsPollInterval()))
-		}
-		return "Live snapshot · repositories 5m · Actions 20s · runners 10s"
-	}
-	if m.detailVisible() {
-		return fmt.Sprintf("%d%% scrolled", int(m.Viewport.ScrollPercent()*100))
-	}
-	es := m.entries()
-	if len(es) == 0 {
-		return "0 items"
-	}
-	return fmt.Sprintf("%d / %d · %s", m.entryIndex(es)+1, len(es), m.screenName())
-}
-func (m Model) shortHelp() string {
-	bindings := []key.Binding{}
-	add := func(k, d string) { bindings = append(bindings, key.NewBinding(key.WithKeys(k), key.WithHelp(k, d))) }
-	if m.PendingAction != "" {
-		add("enter", "confirm")
-		add("esc", "cancel")
-	} else if m.MenuOpen {
-		add("↑↓", "choose")
-		add("enter", "select")
-		add("esc", "close")
-	} else if m.Filtering {
-		add("enter", "apply filter")
-		add("esc", "clear")
-	} else if m.ShowHelp {
-		add("↑↓ / pgdn", "scroll")
-		add("? / esc", "close help")
-	} else if m.ActiveFocus == FocusOverview {
-		add("tab", "screen")
-		add("1/2/3/4", "jump")
-		add("r", "refresh")
-		add("?", "help")
-	} else {
-		add("tab", "screen")
-		add("↑↓", "move")
-		if m.detailVisible() {
-			add("esc", "back")
-		} else {
-			add("enter", "open")
-			add("/", "filter")
-		}
-		add("space", "actions")
-		add("?", "help")
-	}
-	return m.Help.ShortHelpView(bindings)
-}
-func (m Model) helpContent() string {
-	return "Navigation\n\n0 Overview   1 Repositories   2 Actions   3 Runners   4 Concerns\nTab / Shift+Tab change screen\n↑↓ or j/k move within a list; never change screens\nEnter / → open    Esc / ← back\n/ filter list    Home/End first/last    PgUp/PgDn page\n\nOverview\nr refreshes repository, Actions and runner snapshots\nCounts marked unavailable or incomplete are never treated as zero\n\nConcerns\nRepositories with known open PRs or issues, ordered for review\nEnter opens the existing repository detail; r refreshes counts\n\nActions\nSpace opens actions for the selected item\nr refreshes the current screen or detail\nv toggles workflow runs / job queue\nf cycles Active / Needs attention / Recent runs\nEnter on a run opens jobs; Enter on a job opens steps and logs\no opens the selected run, job or repository in GitHub\ny copies the selected URL or runner ID\n\nRepository detail\n[ / ] switch Logs / Branches / Issues / PRs\ns sync selected repository    a sync all (confirmation)\nb switch branch    p commit, push and create PR (confirmation)\nX prune branches/worktrees (confirmation)    d delete archived clone\n\n↑↓ scroll details; PgUp/PgDn scroll a page\n? closes help    q quits    Ctrl+C quits everywhere"
-}
 func (m Model) jobDetailContent() string {
 	j := m.openJob()
 	if j == nil {
@@ -753,6 +563,9 @@ func (m Model) jobDetailContent() string {
 	if j.Duration != "" {
 		fmt.Fprintf(&sb, "Elapsed: %s\n", j.Duration)
 	}
+	if failed := failedStep(j); failed != "" {
+		sb.WriteString(th.toastError.Render(failed) + "\n")
+	}
 	done, _ := stepSummary(j)
 	fmt.Fprintf(&sb, "\n%s\n\n", m.countBar(done, len(j.Steps), "steps"))
 	for _, s := range j.Steps {
@@ -760,9 +573,9 @@ func (m Model) jobDetailContent() string {
 		if s.Conclusion != "" {
 			state = s.Conclusion
 		}
-		fmt.Fprintf(&sb, "%2d  %-12s %s\n", s.Number, state, s.Name)
+		fmt.Fprintf(&sb, "%2d  %s %s\n", s.Number, th.status(stepKind(s), fmt.Sprintf("%-11s", state)), s.Name)
 	}
-	sb.WriteString("\nLog tail (last 200 lines)\n\n")
+	sb.WriteString("\n" + th.section.Render("Log tail (last 200 lines)") + "\n\n")
 	if m.LogLoading == j.ID {
 		sb.WriteString("Loading logs…\n")
 	}
@@ -780,7 +593,8 @@ func (m Model) runnerDetailContent() string {
 		return "Runner no longer available. Esc returns to runners."
 	}
 	r := rs[m.SelectedRunnerIndex]
-	content := fmt.Sprintf("%s  %s\n\nPlatform: %s\nLabels: %s\nID: %s\n", r.Name, r.Status, r.Platform, strings.Join(r.Tags, ", "), r.ID)
+	kind, label := runnerKind(r.Status)
+	content := fmt.Sprintf("%s  %s\n\nPlatform: %s\nLabels: %s\nID: %s\n", th.strong.Render(r.Name), th.status(kind, label), r.Platform, strings.Join(r.Tags, ", "), r.ID)
 	if m.RunnerPermissionDenied {
 		content += "\nObserved job assignment only. Fleet availability is unknown.\n"
 	}

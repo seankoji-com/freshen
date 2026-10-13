@@ -75,7 +75,7 @@ func (m Model) menuContent() string {
 				if m.ActionTarget != nil && a.id == "prune" {
 					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
 				}
-				return "Confirm: " + a.label + "\n\n" + target + "\n\n" + detail + "\n\nEnter confirms · Esc cancels"
+				return th.warning.Render(statusGlyphs[kindWarning]+" Confirm: "+a.label) + "\n\n" + th.strong.Render(target) + "\n\n" + detail + "\n\n" + th.key.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
 			}
 		}
 	}
@@ -83,20 +83,23 @@ func (m Model) menuContent() string {
 	if m.ActionTarget != nil {
 		title += " / " + m.ActionTarget.Name
 	}
-	lines := []string{title, ""}
+	lines := []string{th.strong.Render(title), ""}
 	actions := m.menuActions()
 	count := max(1, m.bodyHeight()-5)
 	start := max(0, m.MenuIndex-count+1)
 	for i := start; i < min(len(actions), start+count); i++ {
 		a := actions[i]
-		prefix := "  "
+		line := "  " + a.label
 		if i == m.MenuIndex {
-			prefix = "› "
+			line = th.cursor.Render("›") + " " + th.selected.Render(a.label)
 		}
-		lines = append(lines, prefix+a.label)
+		if a.confirm {
+			line += th.dim.Render("  (asks to confirm)")
+		}
+		lines = append(lines, line)
 	}
 	if m.MenuIndex < len(actions) {
-		lines = append(lines, "", actions[m.MenuIndex].detail)
+		lines = append(lines, "", th.dim.Render(actions[m.MenuIndex].detail))
 	}
 	if m.BusyAction != "" {
 		lines = append(lines, "", "A repository action is already running.")
@@ -155,8 +158,7 @@ func (m *Model) executeAction(id string) tea.Cmd {
 	if id != "copy" && id != "open" {
 		m.BusyAction = label + " · " + target.Name
 	}
-	m.ToastMsg = ""
-	m.ToastPriority = 0
+	m.clearToast()
 	work := func() actionResultMsg {
 		result := actionResultMsg{id: id, label: label, repo: target}
 		if target != nil {

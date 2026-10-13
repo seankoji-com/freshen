@@ -21,7 +21,35 @@ The interface uses the existing Charm stack: Bubble Tea, Lip Gloss, and Bubbles
 text input, help, viewport, spinner and progress components. It avoids a framework
 migration while replacing the old panel layout and navigation code.
 
+## Navigation, visual design and feedback pass
+
+Reviewed on 13 October 2026 against `f324ced`.
+
+| Finding | Change |
+|---|---|
+| Key handling was a string switch; `?` showed a hand-written page that could drift from it | One `keyMap`; `keys()` enables bindings per context; handler, footer and `?` overlay all read it |
+| `q`, `0`–`4` and Tab did nothing over the help page; `/` did nothing on Overview or in details | Global keys act everywhere outside the filter, menu and confirmation; `/` filters the nearest list |
+| Esc closed an open run before clearing that run's job filter | Esc leaves the innermost layer: job, detail, filter, run, then the message |
+| The context row mixed location and statistics; runner detail read "Runners / details" | A breadcrumb (`Actions › alpha / CI #42 › test`) followed by screen statistics |
+| Colours and styles were built ad hoc in each render function; job states were colour plus word, repository states a Nerd Font glyph only, runner states a word only | `theme.go` owns the palette; every status is glyph, word and colour (`✓ ✗ ↻ ◌ ⊘ ? !`) |
+| Bubbles' progress bar ignored `NO_COLOR` | The bar follows Lip Gloss's environment-aware profile; `NO_COLOR` builds a colourless theme with reverse-video selection |
+| Toasts never expired and could stay until Esc | Info toasts expire after 6 s, errors after 15 s; a sequence number stops a stale expiry clearing a newer toast |
+| Footer hints were truncated from the right, so `?` was the first hint lost on narrow terminals | Hints are fitted with the final hint (`? keys` or the modal escape) always shown |
+| Data age was shown only for Actions | The header shows the current screen's data age and refresh interval |
+| Runners were fetched every 10 s on every screen | The runner poll pauses on screens that do not show runners and refreshes on return |
+| Each running-job log refresh listed the run's jobs before downloading the log | A known job ID downloads the log directly: one request instead of two or more |
+| Runs had no timing; failed jobs gave no reason | Runs show running/waiting/took times; failed jobs name the first failing step; tabs count failures and running work |
+| Empty Runners and Repositories screens said "Nothing to show"; without an owner, Actions and Runners looked empty rather than unconfigured | Empty states name what is empty and the next key to press |
+
 ## Verification
+
+`pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,
+200 × 50, 30 × 10 and other sizes and checks the frame height, row widths,
+header and final footer hint. It also checks that screen keys never shadow global
+keys, that the overlay lists exactly the enabled bindings, that global keys act
+from every drill-down, that confirmations ignore every key but Enter and Esc,
+toast expiry and stale expiry, runner-poll call counts, `NO_COLOR` output and
+status glyph coverage. `pkg/jobs` tests count `gh` requests for log refreshes.
 
 Regression tests cover run/job drill-down, queue counts, step progress, filtering,
 scrolled mouse selection, frame dimensions, stable selection, confirmation targets,
@@ -39,6 +67,6 @@ percentage of wall time remaining; neither is fabricated. Logs are a 200-line ta
 with an explicit step-status fallback when GitHub withholds the download. Workflow
 configuration editing and Actions cancellation/rerun are outside this change.
 
-Run the fixture with `go test -c -o /tmp/freshen-ui.test ./pkg/tui`, then
-`FRESHEN_DEMO=1 /tmp/freshen-ui.test -test.run TestTerminalDemo`. It drops external
+Run the fixture with `go test -c -o "$TMPDIR/freshen-ui.test" ./pkg/tui`, then
+`FRESHEN_DEMO=1 "$TMPDIR/freshen-ui.test" -test.run TestTerminalDemo`. It drops external
 commands and uses seeded data; it cannot exercise real API or git operations.

@@ -18,11 +18,42 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// fetchOrgRunners is the runner API call, swappable so tests can count requests.
+var fetchOrgRunners = jobs.FetchOrgRunners
+
 func (m Model) loadRunnersCmd() tea.Cmd {
+	org := m.TargetOrg
 	return func() tea.Msg {
-		runners, err := jobs.FetchOrgRunners(m.TargetOrg)
+		runners, err := fetchOrgRunners(org)
 		return loadedRunnersMsg{runners: runners, err: err}
 	}
+}
+
+// startRunnerFetch marks a runner request in flight and returns it.
+func (m *Model) startRunnerFetch() tea.Cmd {
+	m.IsRunnersLoading = true
+	m.LastRunnersAttempt = time.Now()
+	return m.loadRunnersCmd()
+}
+
+// runnersVisible reports whether the current screen renders runner data.
+// Repositories, Actions and Concerns do not, so the runner poll pauses there.
+func (m Model) runnersVisible() bool {
+	return m.ActiveFocus == FocusRunners || m.ActiveFocus == FocusOverview
+}
+
+// resumeRunnerPolling refreshes runner data on entering a screen that shows it,
+// unless a request is in flight or the last attempt is within the current
+// (backed-off) poll interval. Runner ticks resume fetching from then on.
+func (m *Model) resumeRunnerPolling() tea.Cmd {
+	if !m.runnersVisible() || m.TargetOrg == "" || m.RunnerPermissionDenied || m.IsRunnersLoading {
+		return nil
+	}
+	interval := backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])
+	if !m.LastRunnersAttempt.IsZero() && time.Since(m.LastRunnersAttempt) < interval {
+		return nil
+	}
+	return m.startRunnerFetch()
 }
 
 type loadedJobQueueMsg struct {
@@ -528,14 +559,50 @@ func (m *Model) noteFetchSuccess(source string) {
 	delete(m.ConsecutiveErrors, source)
 }
 
-// setToast sets a toast message with the given priority. Higher priority toasts
-// (error=2) override lower ones (info=1), and equal priorities replace.
-// Priority 0 clears on next keypress.
-func (m *Model) setToast(msg string, priority int) {
-	if priority >= m.ToastPriority {
-		m.ToastMsg = msg
-		m.ToastPriority = priority
+// Toasts are transient: information expires after toastInfoTTL and errors,
+// which also leave a persistent marker on the relevant screen, after
+// toastErrorTTL. Neither can hide the key hints, which have their own row.
+const (
+	toastInfoTTL  = 6 * time.Second
+	toastErrorTTL = 15 * time.Second
+)
+
+type toastExpiredMsg struct{ seq uint64 }
+
+func toastTTL(priority int) time.Duration {
+	if priority >= 2 {
+		return toastErrorTTL
 	}
+	return toastInfoTTL
+}
+
+// toastVisible reports whether the current toast is still within its lifetime.
+// Rendering checks this too, so a dropped expiry message cannot pin a toast.
+func (m Model) toastVisible(now time.Time) bool {
+	return m.ToastMsg != "" && (m.ToastAt.IsZero() || now.Sub(m.ToastAt) < toastTTL(m.ToastPriority))
+}
+
+// setToast sets a toast message with the given priority. Higher priority toasts
+// (error=2) override lower ones (info=1) while they are visible, and equal
+// priorities replace. Each toast gets a sequence number so only its own expiry
+// message can clear it.
+func (m *Model) setToast(msg string, priority int) {
+	if priority < m.ToastPriority && m.toastVisible(time.Now()) {
+		return
+	}
+	m.ToastMsg = msg
+	m.ToastPriority = priority
+	m.ToastAt = time.Now()
+	m.ToastSeq++
+}
+
+func (m *Model) clearToast() {
+	m.ToastMsg = ""
+	m.ToastPriority = 0
+}
+
+func toastExpireCmd(seq uint64, ttl time.Duration) tea.Cmd {
+	return tea.Tick(ttl, func(time.Time) tea.Msg { return toastExpiredMsg{seq: seq} })
 }
 
 // Budget the organisation sweep to roughly 3,000 requests/hour, leaving room

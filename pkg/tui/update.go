@@ -14,10 +14,30 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// Update dispatches msg and schedules the expiry of any toast it raised.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	before := m.ToastSeq
+	next, cmd := m.update(msg)
+	updated, ok := next.(Model)
+	if !ok {
+		return next, cmd
+	}
+	if updated.ToastSeq != before && updated.ToastMsg != "" {
+		cmd = tea.Batch(cmd, toastExpireCmd(updated.ToastSeq, toastTTL(updated.ToastPriority)))
+	}
+	return updated, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+
+	case toastExpiredMsg:
+		// A newer toast has its own sequence number and expiry.
+		if msg.seq == m.ToastSeq {
+			m.clearToast()
+		}
 
 	case repoDetailsLoadedMsg:
 		m.RepoDetailLoading = ""
@@ -149,11 +169,10 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 		return nil
 	}
 	var cmdsToAdd []tea.Cmd
-	if !m.RunnerPermissionDenied {
-		if !m.IsRunnersLoading {
-			m.IsRunnersLoading = true
-			cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
-		}
+	// Only Overview and Runners render runner data; elsewhere the poll pauses
+	// and changeScreen refreshes it on return.
+	if !m.RunnerPermissionDenied && m.runnersVisible() && !m.IsRunnersLoading {
+		cmdsToAdd = append(cmdsToAdd, m.startRunnerFetch())
 	}
 	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
 	// Refresh logs for selected running job
@@ -193,11 +212,12 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 		} else {
 			m.noteFetchFailure(fetchSourceRunners, runnerJobTickInterval)
 			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
-			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+			m.setToast(fmt.Sprintf("%s Runner fetch failed: %v. Press r on Runners to retry.", statusGlyphs[kindFailure], msg.err), 2)
 		}
 	} else {
 		m.RunnerFetchFailed = false
 		m.RunnerPermissionDenied = false
+		m.LastRunnersRefresh = time.Now()
 		m.noteFetchSuccess(fetchSourceRunners)
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
@@ -318,9 +338,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			if clearErr := clearConfiguredOwner(badOwner); clearErr != nil {
 				slog.Error("failed to clear invalid owner from config", "owner", badOwner, "error", clearErr)
 			}
-			m.setToast(fmt.Sprintf(" %s GitHub owner %q not found — cleared. Restart freshen to set a new one.", iconError, badOwner), 3)
+			m.setToast(fmt.Sprintf("%s GitHub owner %q not found — cleared. Restart freshen to set a new one.", statusGlyphs[kindFailure], badOwner), 3)
 		} else {
-			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+			m.setToast(fmt.Sprintf("%s Fetch failed: %v. Check 'gh auth status'.", statusGlyphs[kindFailure], msg.err), 2)
 		}
 		m.updateViewport()
 		if pendingRefresh {
@@ -365,7 +385,7 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 		}
 		for _, newR := range msg.repos {
 			if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
-				m.setToast(fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
+				m.setToast(fmt.Sprintf("Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
 			}
 		}
 	}
@@ -513,9 +533,8 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Height = msg.Height
 
 	m.Viewport.Width = max(2, msg.Width-2)
-	m.Viewport.Height = max(1, msg.Height-5)
+	m.Viewport.Height = max(1, msg.Height-headerRows-footerRows)
 	m.Search.Width = max(1, msg.Width-6)
-	m.Help.Width = max(1, msg.Width)
 
 	m.updateViewport()
 }
@@ -554,11 +573,11 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 					label := fmt.Sprintf("Run %s / %s #%d", newJ.Repo, newJ.Run.Workflow, newJ.Run.Number)
 					switch newJ.Status {
 					case jobs.JobFailed:
-						m.setToast(label+" failed", 2)
+						m.setToast(statusGlyphs[kindFailure]+" "+label+" failed", 2)
 					case jobs.JobPassed:
-						m.setToast(label+" passed", 1)
+						m.setToast(statusGlyphs[kindSuccess]+" "+label+" passed", 1)
 					case jobs.JobCancelled:
-						m.setToast(label+" cancelled", 1)
+						m.setToast(statusGlyphs[kindSkipped]+" "+label+" cancelled", 1)
 					}
 				}
 				continue
@@ -571,15 +590,15 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
-						m.setToast(fmt.Sprintf(" ❌ Job %s failed (%s) on %s", newJ.ID, newJ.Name, runnerStr), 2)
+						m.setToast(fmt.Sprintf("%s Job %s failed (%s) on %s", statusGlyphs[kindFailure], newJ.ID, newJ.Name, runnerStr), 2)
 					case jobs.JobRunning:
 						runnerStr := newJ.RunnerName
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
-						m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+						m.setToast(fmt.Sprintf("%s Job %s started running on %s", statusGlyphs[kindRunning], newJ.ID, runnerStr), 1)
 					case jobs.JobPassed:
-						m.setToast(fmt.Sprintf(" ✅ Job %s passed (%s)", newJ.ID, newJ.Name), 1)
+						m.setToast(fmt.Sprintf("%s Job %s passed (%s)", statusGlyphs[kindSuccess], newJ.ID, newJ.Name), 1)
 					}
 				}
 			} else {
@@ -589,9 +608,9 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 					if runnerStr == "" {
 						runnerStr = "worker"
 					}
-					m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+					m.setToast(fmt.Sprintf("%s Job %s started running on %s", statusGlyphs[kindRunning], newJ.ID, runnerStr), 1)
 				case jobs.JobQueued:
-					m.setToast(fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name), 1)
+					m.setToast(fmt.Sprintf("%s Job %s queued (%s)", statusGlyphs[kindQueued], newJ.ID, newJ.Name), 1)
 				}
 			}
 		}

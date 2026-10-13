@@ -6,13 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
@@ -75,94 +73,12 @@ func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
 	return d
 }
 
-// --- NerdFont Glyphs & Color Palette ---
+// --- Log highlighting patterns (styles live in theme.go) ---
 var (
-	iconGithub     = "\uea84" //  GitHub Octocat NerdFont Icon
-	iconBranch     = ""
-	iconPR         = "󰏫"
-	iconIssue      = "⊙"
-	iconSuccess    = "󰄬"
-	iconError      = "󰅙"
-	iconRebase     = "󰚰"
-	iconStash      = "󰏖"
-	iconSwitch     = "󰁨"
-	iconTrash      = "🗑️"
-	iconPending    = "•"
-	iconSkipped    = "󰒲" // sleep/moon glyph — safe-only sync left this repo alone
-	iconWorktree   = "󰉓"
-	colorPrimary   = lipgloss.Color("#78B159") // Leaf green
-	colorSecondary = lipgloss.Color("#56BFA8") // Dew mint
-	colorGreen     = lipgloss.Color("#72C98B") // Fresh green
-	colorYellow    = lipgloss.Color("#F59E0B") // Warm Amber
-	colorRed       = lipgloss.Color("#F07178") // Coral red
-	colorBlue      = lipgloss.Color("#3B82F6") // Bright Blue
-	colorMuted     = lipgloss.Color("#7F9087") // Muted sage
-	colorText      = lipgloss.Color("#DCE7E0") // Frosted white
-	colorSurface   = lipgloss.Color("#1E2923") // Deep leaf surface
-
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorPrimary)
-
-	subtitleStyle = lipgloss.NewStyle().
-			Foreground(colorSecondary).
-			Bold(true)
-
-	tabActiveStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(colorText).
-			Underline(true).
-			Padding(0, 1)
-
-	tabInactiveStyle = lipgloss.NewStyle().
-				Foreground(colorMuted).
-				Padding(0, 1)
-
-	badgeUpToDate = lipgloss.NewStyle().
-			Foreground(colorGreen).
-			Bold(true)
-
-	badgeUpdated = lipgloss.NewStyle().
-			Foreground(colorSecondary).
-			Bold(true)
-
-	badgeRebased = lipgloss.NewStyle().
-			Foreground(colorBlue).
-			Bold(true)
-
-	badgeStash = lipgloss.NewStyle().
-			Foreground(colorYellow).
-			Bold(true)
-
-	badgePR = lipgloss.NewStyle().
-		Foreground(colorYellow).
-		Bold(true)
-
-	badgeIssue = lipgloss.NewStyle().
-			Foreground(colorBlue).
-			Bold(true)
-
-	badgeError = lipgloss.NewStyle().
-			Foreground(colorRed).
-			Bold(true)
-
-	badgeArchived = lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Strikethrough(true)
-
-	badgeSkipped = lipgloss.NewStyle().
-			Foreground(colorMuted)
-
-	selectedRowStyle = lipgloss.NewStyle().
-				Background(colorSurface).
-				Foreground(colorText).
-				Bold(true)
-
-	cellStatusIconStyle = lipgloss.NewStyle().Width(2)
-	reTimestamp         = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
-	reCmd               = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
-	reURL               = regexp.MustCompile(`https?://[^\s]+`)
-	reQuoted            = regexp.MustCompile(`'[^']+'`)
+	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
+	reCmd       = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
+	reURL       = regexp.MustCompile(`https?://[^\s]+`)
+	reQuoted    = regexp.MustCompile(`'[^']+'`)
 )
 
 // --- Messages for Bubble Tea Update Loop ---
@@ -247,7 +163,6 @@ type Model struct {
 	ShowHelp           bool
 	Search             textinput.Model
 	Filtering          bool
-	Help               help.Model
 	ScreenCursor       [5]string
 	JobCursor          string
 	OpenRun            *jobs.RunItem
@@ -291,6 +206,10 @@ type Model struct {
 	TotalCount             int
 	ToastMsg               string
 	ToastPriority          int // higher priority overrides lower; 0 = none, 1 = info, 2 = error
+	ToastAt                time.Time
+	ToastSeq               uint64
+	LastRunnersRefresh     time.Time // last successful runner fetch
+	LastRunnersAttempt     time.Time // last runner fetch started, successful or not
 	ConsecutiveErrors      map[string]int
 	RunnerFetchFailed      bool
 	RunnerPermissionDenied bool
@@ -325,12 +244,7 @@ type Model struct {
 func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context, cancel context.CancelFunc, bgWG *sync.WaitGroup) Model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(colorSecondary)
-
-	p := progress.New(
-		progress.WithDefaultGradient(),
-		progress.WithoutPercentage(),
-	)
+	s.Style = th.fg(th.secondary)
 
 	vp := viewport.New(60, 15)
 	vp.KeyMap = viewport.KeyMap{} // Screen navigation and detail scrolling have one owner.
@@ -340,8 +254,8 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 	search.CharLimit = 100
 
 	return Model{
-		TargetDir: targetDir,
-		Search:    search, Help: help.New(),
+		TargetDir:            targetDir,
+		Search:               search,
 		TargetOrg:            targetOrg,
 		Concurrency:          concurrency,
 		Repos:                make([]*git.RepoItem, 0),
@@ -361,7 +275,7 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 		IsJobQueueLoading: targetOrg != "",
 		IsRunnersLoading:  targetOrg != "",
 		Spinner:           s,
-		ProgressBar:       p,
+		ProgressBar:       th.newProgress(),
 		Viewport:          vp,
 		ctx:               ctx,
 		cancel:            cancel,

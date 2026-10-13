@@ -7,19 +7,22 @@ GitHub operations use the authenticated `gh` CLI; repository operations use `git
 |---|---|
 | `pkg/git/git.go` | Repository discovery, clone/sync, branches, worktrees and PR operations |
 | `pkg/jobs/jobs.go` | Typed workflow runs/jobs/steps, polling, result mapping and logs |
-| `pkg/tui/model.go` | Model, messages, polling constants and shared styles |
-| `pkg/tui/screens.go` | Screen entries, identity, layout, progress and detail content |
-| `pkg/tui/screen_keys.go` | Navigation, search, mouse input and run-detail requests |
+| `pkg/tui/model.go` | Model, messages and polling constants |
+| `pkg/tui/theme.go` | The only palette and style definitions; status kinds, glyphs and labels; `NO_COLOR` |
+| `pkg/tui/keymap.go` | Every key binding, enabled per context; footer hints and help-overlay groups |
+| `pkg/tui/chrome.go` | Header, tab row geometry, breadcrumb, status row, footer and help overlay |
+| `pkg/tui/screens.go` | Screen entries, identity, list layout, progress and detail content |
+| `pkg/tui/screen_keys.go` | Key and mouse dispatch, navigation, filtering and run-detail requests |
 | `pkg/tui/actions.go` | Action menus, captured confirmation targets and background results |
-| `pkg/tui/keys.go` | Key dispatch, quit and bulk sync |
+| `pkg/tui/keys.go` | Quit and bulk-sync helpers |
 | `pkg/tui/commands.go` | Background commands, streaming sync snapshots and API budget |
 | `pkg/tui/update.go` | Message dispatch and reconciliation |
-| `pkg/tui/view.go` | Repository details, status styles, runner matching and tag helpers |
+| `pkg/tui/view.go` | Repository detail content, status badges, runner matching and tag helpers |
 
 ## State and navigation
 
-Repositories, Actions and Runners are separate screens. Repository details use
-Logs/Branches/Issues/PRs tabs. Actions has run and job-queue views; a run opens its
+Overview, Repositories, Actions, Runners and Concerns are separate screens.
+Repository details use Logs/Branches/Issues/PRs tabs. Actions has run and job-queue views; a run opens its
 jobs, and a job opens steps and log tail. Stable keys drive selection and mouse
 hit testing. A response for a previously opened run cannot replace another run.
 
@@ -34,12 +37,35 @@ snapshots and return messages. Repository sync uses a semaphore and streams snap
 Destructive confirmation captures the repository before the command starts. A busy
 operation prevents overlapping repository mutations while navigation stays available.
 
+`keyMap` in `keymap.go` defines every binding once. `Model.keys()` enables
+the bindings valid in the current context; the key handler matches only those,
+and the footer and `?` overlay render from the same value, so the help cannot
+list a key the handler ignores. Global bindings (`0`–`4`, Tab, Esc, `/`, `r`,
+`?`, `q`) never share a key with a screen binding and stay active on every
+screen and over the help overlay. The filter input, action menu and
+confirmations are modal: they enable only their own keys plus `Ctrl+C`.
+
+The frame is a header (owner and data age), tab row, breadcrumb row, body,
+status row and key-hint row; `bodyHeight` is the terminal height minus those
+five rows. Every row is clipped to the terminal width. The tab row tries full
+names with count badges, then shorter labels; mouse hit testing uses the same
+spans. Below 30 × 10 a resize notice replaces the frame.
+
+Toasts carry a sequence number and expire through `toastExpiredMsg`; a stale
+expiry cannot clear a newer toast, and rendering also hides a toast past its
+lifetime in case the message is dropped.
+
 ## Polling and failure states
 
 Startup reads metadata. Repository metadata refreshes every five minutes. Runner
-polling uses a ten-second baseline; organisation Actions polling starts at twenty
-seconds and scales with repository/active-run count to budget API calls. Pollers use
-independent exponential backoff after failures. Read commands have bounded execution.
+polling uses a ten-second baseline while Overview or Runners is open. Other
+screens do not render runner data, so the poll pauses there; entering Overview or
+Runners refreshes runners when the last attempt is older than the backed-off
+interval. Organisation Actions polling starts at twenty seconds and scales with
+repository/active-run count to budget API calls. Pollers use independent
+exponential backoff after failures. Read commands have bounded execution. An open
+running job's log refreshes with one request when its job ID is known; the jobs
+list is fetched only to resolve a name or to build the step-status fallback.
 
 Recent runs are bounded to thirty per repository. A full recent page triggers
 separate active-state queries; job lists are paginated. Partial repository failures

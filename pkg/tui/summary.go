@@ -219,7 +219,7 @@ func (m Model) summaryContent(width, height int) string {
 		owner = "Local workspace"
 	}
 
-	title := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(owner)
+	title := th.strong.Render(owner)
 	headline := m.summaryHeadline(s)
 	if width < 52 || height < 18 {
 		repositoriesSummary := fmt.Sprintf("%d local, %d not cloned, %d need attention", s.localRepos, s.newRepos, s.repoProblems)
@@ -244,25 +244,28 @@ func (m Model) summaryContent(width, height int) string {
 		}, "\n"), width, height)
 	}
 
-	repositories := summarySection("Repositories", append([]string{
-		summaryMetric(colorGreen, iconSuccess, fmt.Sprintf("%d local", s.localRepos), fmt.Sprintf("%d not cloned", s.newRepos)),
-		summaryMetric(summaryProblemColor(s.repoProblems), summaryProblemIcon(s.repoProblems), fmt.Sprintf("%d need attention", s.repoProblems), fmt.Sprintf("%d with local changes", s.dirty)),
-	}, m.repositoryConcernRows(s)...), width)
-	actions := summarySection("Actions", m.actionSummaryRows(s), width)
-	runners := summarySection("Runners", m.runnerSummaryRows(s), width)
+	repositoryRows := append([]string{
+		summaryMetric(kindSuccess, fmt.Sprintf("%d local", s.localRepos), fmt.Sprintf("%d not cloned", s.newRepos)),
+		summaryMetric(summaryProblemKind(s.repoProblems), fmt.Sprintf("%d need attention", s.repoProblems), fmt.Sprintf("%d with local changes", s.dirty)),
+	}, m.repositoryConcernRows(s)...)
 
 	var body string
 	if width >= 96 {
+		// Three columns; each section is laid out at its own column width so
+		// rules and rows end inside the column instead of being clipped.
 		gap := 2
 		columnWidth := (width - gap*2) / 3
 		lastWidth := width - columnWidth*2 - gap*2
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			summaryFit(repositories, columnWidth, 4), strings.Repeat(" ", gap),
-			summaryFit(actions, columnWidth, 4), strings.Repeat(" ", gap),
-			summaryFit(runners, lastWidth, 4),
+			summaryFit(summarySection("Repositories", repositoryRows, columnWidth), columnWidth, 4), strings.Repeat(" ", gap),
+			summaryFit(summarySection("Actions", m.actionSummaryRows(s), columnWidth), columnWidth, 4), strings.Repeat(" ", gap),
+			summaryFit(summarySection("Runners", m.runnerSummaryRows(s), lastWidth), lastWidth, 4),
 		)
 	} else {
-		body = lipgloss.JoinVertical(lipgloss.Left, repositories, "", actions, "", runners)
+		body = lipgloss.JoinVertical(lipgloss.Left,
+			summarySection("Repositories", repositoryRows, width), "",
+			summarySection("Actions", m.actionSummaryRows(s), width), "",
+			summarySection("Runners", m.runnerSummaryRows(s), width))
 	}
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, headline, "", body)
@@ -278,18 +281,18 @@ func (m Model) summaryContent(width, height int) string {
 
 func (m Model) repositoryConcernRows(s orgSummary) []string {
 	if m.TargetOrg == "" {
-		return []string{summaryMetric(colorMuted, iconPending, "Review counts unavailable", "set a GitHub owner")}
+		return []string{summaryMetric(kindUnknown, "Review counts unavailable", "set a GitHub owner")}
 	}
 	if s.countsLoaded == 0 && s.repositories > 0 {
 		if m.IsOrgSyncing {
-			return []string{summaryMetric(colorSecondary, m.Spinner.View(), "Loading review counts", "")}
+			return []string{summaryLoading(m, "Loading review counts")}
 		}
-		return []string{summaryMetric(colorMuted, iconPending, "Review counts unavailable", "press r to retry")}
+		return []string{summaryMetric(kindWarning, "Review counts unavailable", "press r to retry")}
 	}
 	concerns := s.openPRs + s.openIssues
-	colour, icon := colorGreen, iconSuccess
+	kind := kindSuccess
 	if concerns > 0 {
-		colour, icon = colorYellow, "!"
+		kind = kindWarning
 	}
 	prs := countPhrase(s.openPRs, "open PR", "open PRs")
 	issues := countPhrase(s.openIssues, "open issue", "open issues")
@@ -304,9 +307,9 @@ func (m Model) repositoryConcernRows(s orgSummary) []string {
 		detail += " · refresh incomplete"
 	}
 	if s.countsLoaded < s.repositories || s.countsStale > 0 || m.RepoCountsFetchFailed {
-		return []string{summaryMetric(colour, icon, "Known: "+prs, detail)}
+		return []string{summaryMetric(kind, "Known: "+prs, detail)}
 	}
-	return []string{summaryMetric(colour, icon, prs, issues)}
+	return []string{summaryMetric(kind, prs, issues)}
 }
 
 func (m Model) summaryHeadline(s orgSummary) string {
@@ -339,7 +342,7 @@ func (m Model) summaryHeadline(s orgSummary) string {
 	if m.LocalScanFailed {
 		headline += " · local metadata incomplete"
 	}
-	return lipgloss.NewStyle().Foreground(colorMuted).Render(headline)
+	return th.dim.Render(headline)
 }
 
 func (m Model) orgRefreshFailureDetail() string {
@@ -351,51 +354,51 @@ func (m Model) orgRefreshFailureDetail() string {
 
 func (m Model) actionSummaryRows(s orgSummary) []string {
 	if m.TargetOrg == "" {
-		return []string{summaryMetric(colorMuted, iconPending, "Not configured", "set a GitHub owner"), ""}
+		return []string{summaryMetric(kindUnknown, "Not configured", "set a GitHub owner"), ""}
 	}
 	if m.IsJobQueueLoading && len(m.JobQueue) == 0 {
-		return []string{summaryMetric(colorSecondary, m.Spinner.View(), "Loading runs", ""), ""}
+		return []string{summaryLoading(m, "Loading runs"), ""}
 	}
 	if m.JobQueueFetchFailed {
 		if len(m.JobQueue) == 0 {
-			return []string{summaryMetric(colorMuted, iconPending, "Actions data unavailable", "press r to retry"), ""}
+			return []string{summaryMetric(kindWarning, "Actions data unavailable", "press r to retry"), ""}
 		}
 		return []string{
-			summaryMetric(colorSecondary, "●", fmt.Sprintf("Known: %d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
-			summaryMetric(colorYellow, "!", "Actions data incomplete", "press r to retry"),
+			summaryMetric(kindRunning, fmt.Sprintf("Known: %d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
+			summaryMetric(kindWarning, "Actions data incomplete", "press r to retry"),
 		}
 	}
 	return []string{
-		summaryMetric(colorSecondary, "●", fmt.Sprintf("%d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
-		summaryMetric(summaryProblemColor(s.failedRuns), summaryProblemIcon(s.failedRuns), fmt.Sprintf("%d recent failures", s.failedRuns), "current snapshot"),
+		summaryMetric(kindRunning, fmt.Sprintf("%d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
+		summaryMetric(summaryProblemKind(s.failedRuns), fmt.Sprintf("%d recent failures", s.failedRuns), "current snapshot"),
 	}
 }
 
 func (m Model) runnerSummaryRows(s orgSummary) []string {
 	if m.TargetOrg == "" {
-		return []string{summaryMetric(colorMuted, iconPending, "Not configured", "set a GitHub owner"), ""}
+		return []string{summaryMetric(kindUnknown, "Not configured", "set a GitHub owner"), ""}
 	}
 	if m.RunnerPermissionDenied {
 		return []string{
-			summaryMetric(colorSecondary, "●", fmt.Sprintf("%d observed busy", s.runnerBusy), "active assignments only"),
-			summaryMetric(colorMuted, iconPending, "Fleet totals unavailable", "runner permission required"),
+			summaryMetric(kindRunning, fmt.Sprintf("%d observed busy", s.runnerBusy), "active assignments only"),
+			summaryMetric(kindUnknown, "Fleet totals unavailable", "runner permission required"),
 		}
 	}
 	if m.IsRunnersLoading && len(m.Runners) == 0 {
-		return []string{summaryMetric(colorSecondary, m.Spinner.View(), "Loading runners", ""), ""}
+		return []string{summaryLoading(m, "Loading runners"), ""}
 	}
 	if m.RunnerFetchFailed {
 		if len(m.Runners) == 0 {
-			return []string{summaryMetric(colorMuted, iconPending, "Runner data unavailable", "press r to retry"), ""}
+			return []string{summaryMetric(kindWarning, "Runner data unavailable", "press r to retry"), ""}
 		}
 		return []string{
-			summaryMetric(colorSecondary, "●", fmt.Sprintf("Known: %d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
-			summaryMetric(colorYellow, "!", "Runner data unavailable", "showing last observed state"),
+			summaryMetric(kindRunning, fmt.Sprintf("Known: %d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
+			summaryMetric(kindWarning, "Runner data unavailable", "showing last observed state"),
 		}
 	}
 	return []string{
-		summaryMetric(colorSecondary, "●", fmt.Sprintf("%d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
-		summaryMetric(summaryProblemColor(s.runnerOffline), summaryProblemIcon(s.runnerOffline), fmt.Sprintf("%d offline", s.runnerOffline), fmt.Sprintf("%d maintenance · %d unknown", s.runnerMaintenance, s.runnerUnknown)),
+		summaryMetric(kindRunning, fmt.Sprintf("%d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
+		summaryMetric(summaryProblemKind(s.runnerOffline), fmt.Sprintf("%d offline", s.runnerOffline), fmt.Sprintf("%d maintenance · %d unknown", s.runnerMaintenance, s.runnerUnknown)),
 	}
 }
 
@@ -451,9 +454,9 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 	}
 	if len(s.attention) == 0 {
 		if m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading {
-			return summaryMetric(colorSecondary, m.Spinner.View(), "Snapshot still loading", "")
+			return summaryLoading(m, "Snapshot still loading")
 		}
-		return summaryMetric(colorGreen, iconSuccess, "Nothing needs attention", "in this snapshot")
+		return summaryMetric(kindSuccess, "Nothing needs attention", "in this snapshot")
 	}
 	renderCount := min(limit, len(s.attention))
 	if len(s.attention) > limit {
@@ -461,20 +464,17 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 	}
 	rows := make([]string, 0, limit)
 	for _, a := range s.attention[:renderCount] {
-		colour := colorMuted
-		icon := iconPending
+		kind := kindUnknown
 		switch a.priority {
 		case 0:
-			colour = colorRed
-			icon = iconError
+			kind = kindFailure
 		case 1:
-			colour = colorYellow
-			icon = "!"
+			kind = kindWarning
 		}
-		rows = append(rows, summaryFit(summaryMetric(colour, icon, a.title, a.detail), width, 1))
+		rows = append(rows, summaryFit(summaryMetric(kind, a.title, a.detail), width, 1))
 	}
 	if remaining := len(s.attention) - renderCount; remaining > 0 {
-		rows = append(rows, summaryFit(summaryMetric(colorMuted, "+", fmt.Sprintf("%d more", remaining), "use 1–4 for details"), width, 1))
+		rows = append(rows, summaryFit(th.dim.Render("+ ")+th.strong.Render(fmt.Sprintf("%d more", remaining))+"  "+th.dim.Render("use 1–4 for details"), width, 1))
 	}
 	return strings.Join(rows, "\n")
 }
@@ -485,35 +485,31 @@ func summarySection(title string, rows []string, width int) string {
 }
 
 func summarySectionHeader(title string, width int) string {
-	styledTitle := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(title)
-	remaining := max(0, width-ansi.StringWidth(title)-1)
-	return styledTitle + " " + lipgloss.NewStyle().Foreground(colorSurface).Render(strings.Repeat("─", remaining))
+	return sectionRule(title, width)
 }
 
-func summaryMetric(colour lipgloss.Color, icon, title, detail string) string {
-	line := lipgloss.NewStyle().Foreground(colour).Render(icon) + " " + lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(title)
+// summaryMetric is one Overview row: status glyph, bold figure, muted detail.
+func summaryMetric(kind statusKind, title, detail string) string {
+	line := th.glyph(kind) + " " + th.strong.Render(title)
 	if detail != "" {
-		line += "  " + lipgloss.NewStyle().Foreground(colorMuted).Render(detail)
+		line += "  " + th.dim.Render(detail)
 	}
 	return line
 }
 
-func summaryProblemColor(count int) lipgloss.Color {
-	if count > 0 {
-		return colorRed
-	}
-	return colorGreen
+func summaryLoading(m Model, title string) string {
+	return m.Spinner.View() + th.strong.Render(title)
 }
 
-func summaryProblemIcon(count int) string {
+func summaryProblemKind(count int) statusKind {
 	if count > 0 {
-		return iconError
+		return kindFailure
 	}
-	return iconSuccess
+	return kindSuccess
 }
 
 func compactSummaryLine(label, value string, width int) string {
-	line := lipgloss.NewStyle().Bold(true).Foreground(colorText).Render(label) + "  " + lipgloss.NewStyle().Foreground(colorMuted).Render(value)
+	line := th.strong.Render(label) + "  " + th.dim.Render(value)
 	return summaryFit(line, width, 1)
 }
 

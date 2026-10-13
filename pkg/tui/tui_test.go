@@ -92,11 +92,11 @@ func TestTabBranchesGroupedRendering(t *testing.T) {
 	m.updateViewport()
 	viewContent := m.Viewport.View()
 
-	if !strings.Contains(viewContent, "Local Branches:") {
-		t.Errorf("expected Viewport to contain 'Local Branches:' header, got:\n%s", viewContent)
+	if !strings.Contains(viewContent, "Local branches (") {
+		t.Errorf("expected Viewport to contain 'Local branches' header, got:\n%s", viewContent)
 	}
-	if !strings.Contains(viewContent, "Remote Branches:") {
-		t.Errorf("expected Viewport to contain 'Remote Branches:' header, got:\n%s", viewContent)
+	if !strings.Contains(viewContent, "Remote branches (") {
+		t.Errorf("expected Viewport to contain 'Remote branches' header, got:\n%s", viewContent)
 	}
 }
 
