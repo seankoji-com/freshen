@@ -94,11 +94,8 @@ func (m Model) keys() keyMap {
 	scrollable := m.ShowHelp || (free && !overview)
 	k.Up.SetEnabled(scrollable || menu)
 	k.Down.SetEnabled(scrollable || menu)
-	for _, b := range []*key.Binding{&k.PageUp, &k.PageDown} {
+	for _, b := range []*key.Binding{&k.PageUp, &k.PageDown, &k.Home, &k.End} {
 		b.SetEnabled(scrollable)
-	}
-	for _, b := range []*key.Binding{&k.Home, &k.End} {
-		b.SetEnabled(free && !overview)
 	}
 	k.Open.SetEnabled(list)
 	for _, b := range []*key.Binding{&k.Menu, &k.Browser, &k.Copy} {

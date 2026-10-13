@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -35,10 +36,7 @@ func (m terminalDemo) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	next, cmd := m.Model.Update(msg)
 	updated := next.(Model)
-	updated.LogLoading = ""
-	updated.RunLoading = false
-	updated.RepoDetailLoading = ""
-	updated.updateViewport()
+	settleDemoRequests(&updated)
 	next = updated
 	if k, ok := msg.(tea.KeyMsg); ok && (k.String() == "q" || k.String() == "ctrl+c") {
 		return next, tea.Quit
@@ -48,6 +46,39 @@ func (m terminalDemo) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return terminalDemo{next.(Model)}, nil
 }
+
+// settleDemoRequests completes, with the seeded data, every request the demo
+// dropped: it runs no commands, so nothing else would clear their loading flags.
+func settleDemoRequests(m *Model) {
+	now := time.Now()
+	m.LogLoading = ""
+	m.RunLoading = false
+	m.RepoDetailLoading = ""
+	m.RepoDetailQueued = ""
+	if m.IsRunnersLoading {
+		m.IsRunnersLoading = false
+		m.RunnerFetchFailed = false
+		m.LastRunnersRefresh = now
+	}
+	if m.IsJobQueueLoading {
+		m.IsJobQueueLoading = false
+		m.LastActionsRefresh = now
+	}
+	if m.IsOrgSyncing {
+		m.IsOrgSyncing = false
+		m.LastOrgRefresh = now
+	}
+	for _, r := range m.Repos {
+		if r.IsLoadingIssues {
+			r.IsLoadingIssues, r.HasLoadedIssues = false, true
+		}
+		if r.IsLoadingPRs {
+			r.IsLoadingPRs, r.HasLoadedPRs = false, true
+		}
+	}
+	m.updateViewport()
+}
+
 func TestTerminalDemo(t *testing.T) {
 	if os.Getenv("FRESHEN_DEMO") != "1" {
 		t.Skip("manual terminal fixture")

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/config"
 	"github.com/seankoji-com/freshen/pkg/git"
@@ -40,11 +41,21 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case repoDetailsLoadedMsg:
-		m.RepoDetailLoading = ""
+		if m.RepoDetailLoading == msg.repo.Path {
+			m.RepoDetailLoading = ""
+		}
 		for _, r := range m.Repos {
 			if r.Path == msg.repo.Path {
 				r.BranchDetails = msg.repo.BranchDetails
 				break
+			}
+		}
+		// Start the read that was queued behind this one if its detail is still open.
+		if queued := m.RepoDetailQueued; queued != "" {
+			m.RepoDetailQueued = ""
+			if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) &&
+				m.SelectedIndex >= 0 && m.SelectedIndex < len(m.Repos) && m.Repos[m.SelectedIndex].Path == queued {
+				cmds = append(cmds, m.loadRepoDetails())
 			}
 		}
 		m.updateViewport()
@@ -112,8 +123,29 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var spinnerCmd tea.Cmd
 	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
 	cmds = append(cmds, spinnerCmd)
+	if _, tick := msg.(spinner.TickMsg); tick && m.detailVisible() && m.detailLoading() {
+		m.updateViewport() // the detail is cached content; animate its spinner
+	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// detailLoading reports whether the open detail is waiting on a request.
+func (m Model) detailLoading() bool {
+	switch m.ActiveFocus {
+	case FocusJobs:
+		return m.LogLoading != ""
+	case FocusRepos, FocusConcerns:
+		if m.RepoDetailLoading != "" || m.RepoDetailQueued != "" {
+			return true
+		}
+		if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
+			return m.IsOrgSyncing
+		}
+		r := m.Repos[m.SelectedIndex]
+		return r.IsLoadingIssues || r.IsLoadingPRs
+	}
+	return false
 }
 
 func (m *Model) handleLoadedIssuesMsg(msg loadedIssuesMsg) {
@@ -286,31 +318,38 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	return cmd
 }
 
+// handleLoadedJobLogsMsg applies the response to the newest log request and
+// always re-renders, so no outcome (lines, error or an empty log) can leave
+// the detail showing "Loading logs…".
 func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
-	if m.LogLoading == msg.jobID {
-		m.LogLoading = ""
+	if msg.seq != m.LogSeq {
+		slog.Debug("discarding superseded log response", "jobID", msg.jobID, "seq", msg.seq, "current", m.LogSeq)
+		return
 	}
+	m.LogLoading = ""
 	if msg.err != nil {
 		slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
 	}
-	if len(msg.logs) > 0 {
-		for _, j := range m.JobQueue {
-			if j.ID == msg.jobID {
-				j.Logs = msg.logs
-				j.GHJobID = msg.ghJobID
-				break
-			}
-		}
-		m.updateViewport()
-	} else if msg.err != nil {
-		for _, j := range m.JobQueue {
-			if j.ID == msg.jobID {
-				j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
-				break
-			}
-		}
-		m.updateViewport()
+	if m.EmptyLogs == nil {
+		m.EmptyLogs = make(map[string]bool)
 	}
+	for _, j := range m.JobQueue {
+		if j.ID != msg.jobID {
+			continue
+		}
+		switch {
+		case len(msg.logs) > 0:
+			j.Logs = msg.logs
+			j.GHJobID = msg.ghJobID
+			delete(m.EmptyLogs, msg.jobID)
+		case msg.err != nil:
+			j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
+		default:
+			m.EmptyLogs[msg.jobID] = true
+		}
+		break
+	}
+	m.updateViewport()
 }
 
 func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
@@ -534,7 +573,7 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 
 	m.Viewport.Width = max(2, msg.Width-2)
 	m.Viewport.Height = max(1, msg.Height-headerRows-footerRows)
-	m.Search.Width = max(1, msg.Width-6)
+	m.sizeSearch()
 
 	m.updateViewport()
 }
@@ -663,7 +702,7 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 }
 
 // triggerLogFetchForSelectedJob returns a log-fetch command if a running job is selected.
-func (m Model) triggerLogFetchForSelectedJob() tea.Cmd {
+func (m *Model) triggerLogFetchForSelectedJob() tea.Cmd {
 	if m.ActiveFocus != FocusJobs {
 		return nil
 	}

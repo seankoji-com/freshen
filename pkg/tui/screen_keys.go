@@ -29,6 +29,7 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			m.moveSelection(0)
 		default:
 			var cmd tea.Cmd
+			m.sizeSearch()
 			m.Search, cmd = m.Search.Update(msg)
 			return cmd
 		}
@@ -78,6 +79,10 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			m.HelpOffset = min(maxOffset, m.HelpOffset+m.bodyHeight())
 		case key.Matches(msg, k.PageUp):
 			m.HelpOffset = max(0, m.HelpOffset-m.bodyHeight())
+		case key.Matches(msg, k.Home):
+			m.HelpOffset = 0
+		case key.Matches(msg, k.End):
+			m.HelpOffset = maxOffset
 		case key.Matches(msg, k.Quit, k.Jump, k.NextScreen, k.PrevScreen, k.Refresh, k.Filter):
 			// Global keys keep their meaning over the overlay: close it and act.
 			m.ShowHelp = false
@@ -100,8 +105,7 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			m.ActiveTab = (m.ActiveTab + 3) % 4
 		}
 		m.Viewport.GotoTop()
-		m.updateViewport()
-		return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+		return m.loadRepoDetail()
 	case key.Matches(msg, k.ToggleQueue):
 		m.QueueView = !m.QueueView
 		m.Search.SetValue("")
@@ -211,6 +215,7 @@ func (m *Model) startFilter() tea.Cmd {
 		m.back()
 	}
 	m.Filtering = true
+	m.sizeSearch()
 	return tea.Batch(cmd, m.Search.Focus())
 }
 
@@ -305,10 +310,10 @@ func (m *Model) openEntry() tea.Cmd {
 		}
 	default:
 		m.Detail = true
-		m.updateViewport()
 		if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
-			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+			return m.loadRepoDetail()
 		}
+		m.updateViewport()
 	}
 	return nil
 }
@@ -350,7 +355,7 @@ func (m *Model) refreshScreen() tea.Cmd {
 		}
 	case FocusRepos, FocusConcerns:
 		if m.Detail {
-			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+			return m.loadRepoDetail()
 		}
 		if m.LocalScanUnresponsive {
 			git.ResetLocalDirectoryScanFailures(m.TargetDir)
@@ -362,12 +367,12 @@ func (m *Model) refreshScreen() tea.Cmd {
 }
 func (m *Model) fetchOpenJobLogs() tea.Cmd {
 	j := m.openJob()
-	if j == nil || j.GHJobID == 0 || m.LogLoading != "" {
+	if j == nil || j.GHJobID == 0 {
 		return nil
 	}
-	m.LogLoading = j.ID
+	cmd := m.startLogFetch(j)
 	m.updateViewport()
-	return m.loadJobLogsCmd(j)
+	return cmd
 }
 
 type runJobsLoadedMsg struct {

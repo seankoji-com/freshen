@@ -169,7 +169,7 @@ func (m Model) freshness() string {
 		if m.TargetOrg == "" {
 			return ""
 		}
-		if m.IsJobQueueLoading || m.RunLoading {
+		if m.IsJobQueueLoading || m.RunLoading || m.LogLoading != "" {
 			refreshing = strings.TrimSpace(m.Spinner.View())
 		}
 		return strings.TrimSpace(refreshing + " " + updated(m.LastActionsRefresh, m.IsJobQueueLoading) + " · every " + compactAgo(m.actionsPollInterval()))
@@ -253,8 +253,40 @@ func (m Model) breadcrumb() []string {
 	return crumbs
 }
 
-func (m Model) breadcrumbView() string {
-	crumbs := m.breadcrumb()
+const crumbSep = " › "
+
+// fitCrumbs shortens a breadcrumb to at most budget cells. The current
+// (last) crumb is kept longest: ancestors are shortened first, then collapsed
+// to "…", and only then is the current crumb itself truncated.
+func fitCrumbs(crumbs []string, budget int) []string {
+	width := func(cs []string) int { return ansi.StringWidth(strings.Join(cs, crumbSep)) }
+	if len(crumbs) == 0 || width(crumbs) <= budget {
+		return crumbs
+	}
+	out := append([]string(nil), crumbs...)
+	for i := range out[:len(out)-1] {
+		out[i] = ansi.Truncate(out[i], 14, "…")
+	}
+	if width(out) <= budget {
+		return out
+	}
+	if len(out) > 2 {
+		out = []string{out[0], "…", out[len(out)-1]}
+	}
+	if width(out) <= budget {
+		return out
+	}
+	last := len(out) - 1
+	prefix := width(out[:last]) + ansi.StringWidth(crumbSep)
+	if last == 0 || budget-prefix < 8 {
+		return []string{ansi.Truncate(out[last], max(1, budget), "…")}
+	}
+	out[last] = ansi.Truncate(out[last], budget-prefix, "…")
+	return out
+}
+
+func (m Model) breadcrumbView(budget int) string {
+	crumbs := fitCrumbs(m.breadcrumb(), budget)
 	parts := make([]string, len(crumbs))
 	for i, c := range crumbs {
 		if i == len(crumbs)-1 {
@@ -263,19 +295,62 @@ func (m Model) breadcrumbView() string {
 			parts[i] = th.crumb.Render(c)
 		}
 	}
-	return strings.Join(parts, th.crumb.Render(" › "))
+	return strings.Join(parts, th.crumb.Render(crumbSep))
+}
+
+// Context row geometry: one leading cell, the breadcrumb, a two-cell gap and
+// a control. The text input renders its prompt, Width cells of text and one
+// cursor cell.
+const (
+	contextGap       = 2
+	searchChrome     = 3 // "/ " prompt plus the cursor cell
+	minSearchWidth   = 8
+	maxFilterCrumbsW = 24
+)
+
+// filterCrumbBudget is the breadcrumb's share of the row while the filter
+// input is open; the input takes the rest.
+func (m Model) filterCrumbBudget() int {
+	return min(maxFilterCrumbsW, max(4, (m.Width-1-contextGap)/3))
+}
+
+// searchWidth is how many query cells the filter input can show beside the
+// breadcrumb without the row overflowing the terminal.
+func (m Model) searchWidth() int {
+	crumbs := ansi.StringWidth(strings.Join(fitCrumbs(m.breadcrumb(), m.filterCrumbBudget()), crumbSep))
+	return max(1, m.Width-1-crumbs-contextGap-searchChrome)
+}
+
+// sizeSearch fits the filter input to the context row. Re-seating the cursor
+// recomputes the input's horizontal scroll so the cursor stays visible after
+// the width shrinks.
+func (m *Model) sizeSearch() {
+	w := m.searchWidth()
+	if m.Search.Width == w {
+		return
+	}
+	m.Search.Width = w
+	pos := m.Search.Position()
+	m.Search.SetCursor(0)
+	m.Search.SetCursor(pos)
 }
 
 // contextRow is the breadcrumb plus what the user needs to read the screen:
-// the filter input while filtering, detail tabs, or summary counts.
+// the filter input while filtering, detail tabs, or summary counts. Controls
+// are sized first and the breadcrumb shortened to the cells that remain, so
+// neither the input's cursor nor the active tab is ever cut off.
 func (m Model) contextRow() string {
-	row := " " + m.breadcrumbView()
+	avail := max(1, m.Width-1)
 	if m.Filtering {
-		return row + "  " + m.Search.View()
+		// The input was sized by sizeSearch; the breadcrumb gets what is left.
+		budget := min(m.filterCrumbBudget(), avail-contextGap-m.Search.Width-searchChrome)
+		return " " + m.breadcrumbView(max(1, budget)) + strings.Repeat(" ", contextGap) + m.Search.View()
 	}
 	if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-		return row + "  " + m.renderTabBar()
+		tabs := m.renderTabBar(max(1, avail-contextGap-8))
+		return " " + m.breadcrumbView(avail-contextGap-ansi.StringWidth(tabs)) + strings.Repeat(" ", contextGap) + tabs
 	}
+	row := " " + m.breadcrumbView(avail)
 	if detail := m.contextSummary(); detail != "" {
 		row += th.dim.Render("  ·  " + detail)
 	}
@@ -373,6 +448,9 @@ func (m Model) contextSummary() string {
 			s = fmt.Sprintf("%d observed busy · fleet access unavailable", summary.runnerBusy)
 		} else {
 			s = fmt.Sprintf("%d busy · %d idle · %d offline", summary.runnerBusy, summary.runnerIdle, summary.runnerOffline)
+			if m.RunnerFetchFailed {
+				s += " · last refresh failed"
+			}
 		}
 	}
 	if m.Search.Value() != "" {
@@ -471,6 +549,13 @@ func (m Model) statusLine() string {
 		return warn("Local repository metadata incomplete · press r to retry")
 	case m.JobQueueFetchFailed:
 		return warn("Actions incomplete · " + m.ActionsCoverage)
+	case m.RunnerFetchFailed && !m.RunnerPermissionDenied && m.runnersVisible():
+		// Outlives the error toast: cached rows must not pass for live ones.
+		shown := "no runner data"
+		if !m.LastRunnersRefresh.IsZero() {
+			shown = "showing runners from " + agoOr(m.LastRunnersRefresh, false)
+		}
+		return warn("Runner refresh failed · " + shown + " · press r to retry")
 	case m.IsSyncing:
 		return m.Spinner.View() + " Synchronising repositories"
 	}
@@ -499,9 +584,35 @@ func (m Model) statusLine() string {
 	return th.dim.Render(position)
 }
 
+// hangingWrap renders text after a lead already indent cells wide, wrapping it
+// to width cells and aligning continuation lines under its first character.
+// When fewer than minText cells remain beside the lead, the text starts on the
+// next line instead, indented by two cells.
+func hangingWrap(lead string, indent int, text string, width int, style func(...string) string) []string {
+	const minText = 10
+	textWidth := width - indent
+	pad := strings.Repeat(" ", indent)
+	var out []string
+	if textWidth < minText {
+		out = append(out, lead)
+		lead, pad, textWidth = "  ", "  ", max(1, width-2)
+	}
+	for i, line := range strings.Split(ansi.Wrap(text, textWidth, ""), "\n") {
+		if i == 0 {
+			out = append(out, lead+style(line))
+		} else {
+			out = append(out, pad+style(line))
+		}
+	}
+	return out
+}
+
 // helpContent is the ? overlay. Its key list is generated from keys(), the
-// same bindings the handlers match, for the screen beneath the overlay.
+// same bindings the handlers match, for the screen beneath the overlay. Every
+// row is wrapped to the body width, so scrolling reaches all of it.
 func (m Model) helpContent() string {
+	width := max(1, m.Width-2)
+	plain := func(s ...string) string { return strings.Join(s, " ") }
 	groups := m.helpGroups()
 	keyWidth := 0
 	for _, g := range groups {
@@ -509,12 +620,14 @@ func (m Model) helpContent() string {
 			keyWidth = max(keyWidth, ansi.StringWidth(b.Help().Key))
 		}
 	}
-	lines := []string{th.strong.Render("Keys for " + strings.Join(m.breadcrumb(), " › ")), ""}
+	lines := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
+	lines = append(lines, "")
 	for _, g := range groups {
 		lines = append(lines, th.section.Render(g.title))
 		for _, b := range g.bindings {
 			k := b.Help().Key
-			lines = append(lines, "  "+th.key.Render(k)+strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)+b.Help().Desc)
+			lead := "  " + th.key.Render(k) + strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)
+			lines = append(lines, hangingWrap(lead, keyWidth+4, b.Help().Desc, width, plain)...)
 		}
 		lines = append(lines, "")
 	}
@@ -531,10 +644,10 @@ func (m Model) helpContent() string {
 		{kindUnknown, "unknown · not synced or not reported"},
 		{kindWarning, "attention · incomplete or stale data"},
 	} {
-		lines = append(lines, "  "+th.glyph(legend.kind)+"  "+legend.text)
+		glyph := th.glyph(legend.kind)
+		lines = append(lines, hangingWrap("  "+glyph+"  ", 4+ansi.StringWidth(glyph), legend.text, width, plain)...)
 	}
-	lines = append(lines, "",
-		th.dim.Render("The filter, action menu and confirmations take every key until Enter or Esc;"),
-		th.dim.Render("Ctrl+C quits from anywhere. Lists never change screen at their ends."))
+	lines = append(lines, "")
+	lines = append(lines, hangingWrap("", 0, "The filter, action menu and confirmations take every key until Enter or Esc; Ctrl+C quits from anywhere. Lists never change screen at their ends.", width, th.dim.Render)...)
 	return strings.Join(lines, "\n")
 }

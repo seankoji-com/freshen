@@ -49,7 +49,13 @@ The frame is a header (owner and data age), tab row, breadcrumb row, body,
 status row and key-hint row; `bodyHeight` is the terminal height minus those
 five rows. Every row is clipped to the terminal width. The tab row tries full
 names with count badges, then shorter labels; mouse hit testing uses the same
-spans. Below 30 × 10 a resize notice replaces the frame.
+spans. On the breadcrumb row the control is sized first: the filter input gets
+the cells left after a breadcrumb capped at a third of the row (`sizeSearch`
+re-seats its cursor on resize), and repository detail tabs fall back to short
+labels or the active tab alone. `fitCrumbs` then shortens ancestors, collapses
+them to `…`, and only last truncates the current crumb. Detail viewports and
+the help overlay wrap to the body width, so nothing is reachable only past the
+right edge. Below 30 × 10 a resize notice replaces the frame.
 
 Toasts carry a sequence number and expire through `toastExpiredMsg`; a stale
 expiry cannot clear a newer toast, and rendering also hides a toast past its
@@ -66,6 +72,21 @@ repository/active-run count to budget API calls. Pollers use independent
 exponential backoff after failures. Read commands have bounded execution. An open
 running job's log refreshes with one request when its job ID is known; the jobs
 list is fetched only to resolve a name or to build the step-status fallback.
+One log request runs at a time (`LogLoading`); runner ticks and queue
+completions skip while it is in flight, and each request carries `LogSeq` so a
+response overtaken by a newer one (after `logFetchStuckAfter`) is discarded.
+Every log response re-renders the detail; an empty successful log is recorded
+in `EmptyLogs` and stated, not left as "Loading logs…".
+
+Repository detail starts its requests before rendering (`loadRepoDetail`), so
+the first frame shows them loading. Branch reads run one at a time; opening
+another repository while one is in flight queues it (`RepoDetailQueued`) and the
+completion starts it if that detail is still open. Spinner ticks re-render an
+open detail only while it is waiting on a request.
+
+A runner refresh failure leaves a status-row warning on Overview and Runners
+with the age of the cached runners and a retry hint, after the error toast
+expires; Runners' summary adds "last refresh failed".
 
 Recent runs are bounded to thirty per repository. A full recent page triggers
 separate active-state queries; job lists are paginated. Partial repository failures

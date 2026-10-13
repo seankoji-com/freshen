@@ -103,9 +103,11 @@ screen merely because you reach the end of a list.
 The header shows the owner and how old the current screen's data is ("updated
 8s ago · every 20s"); tabs carry counts of failures (`✗`), running work (`↻`)
 and concerns. The breadcrumb row shows the drill-down path, such as
-`Actions › alpha / CI #42 › test`. The status row shows progress, warnings and
-transient messages, which expire after 6 seconds (errors after 15); key hints
-for the current screen stay on the last row.
+`Actions › alpha / CI #42 › test`; on narrow terminals it shortens before the
+filter input or the active detail tab does. The status row shows progress,
+persistent warnings (such as a failed runner refresh, with the cached runners'
+age and `r` to retry) and transient messages, which expire after 6 seconds
+(errors after 15); key hints for the current screen stay on the last row.
 
 Status is always a glyph plus a word, never colour alone: `✓` success, `✗`
 failure, `↻` running, `◌` queued or waiting, `⊘` skipped or cancelled, `?`
@@ -122,8 +124,8 @@ assignments with unknown availability. The organisation poll starts at 20
 seconds and slows with workspace size to budget API requests. Runner polling
 pauses on screens that do not show runners and refreshes when you return to
 Overview or Runners. Selected running-job logs refresh with the runner tick
-using one API request; GitHub may provide only step status while logs are
-unavailable.
+using one API request, never more than one at a time; GitHub may provide only
+step status while logs are unavailable, and an empty log is reported as empty.
 
 ### Command Line Options
 

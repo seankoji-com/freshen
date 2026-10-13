@@ -576,10 +576,15 @@ func (m Model) jobDetailContent() string {
 		fmt.Fprintf(&sb, "%2d  %s %s\n", s.Number, th.status(stepKind(s), fmt.Sprintf("%-11s", state)), s.Name)
 	}
 	sb.WriteString("\n" + th.section.Render("Log tail (last 200 lines)") + "\n\n")
-	if m.LogLoading == j.ID {
-		sb.WriteString("Loading logs…\n")
-	}
-	if len(j.Logs) == 0 && m.LogLoading == "" {
+	switch {
+	case len(j.Logs) > 0: // a refresh keeps the current tail; the header spinner shows it
+	case m.LogLoading == j.ID:
+		sb.WriteString(m.Spinner.View() + " Loading logs…\n")
+	case m.EmptyLogs[j.ID] && j.Status == jobs.JobRunning:
+		sb.WriteString("GitHub returned no log lines yet. The tail refreshes while the job runs.\n")
+	case m.EmptyLogs[j.ID]:
+		sb.WriteString("GitHub returned an empty log for this job. Press r to fetch it again.\n")
+	default:
 		sb.WriteString("Logs not loaded. Press r to retry; GitHub may withhold logs while a job is running.\n")
 	}
 	for _, line := range j.Logs {

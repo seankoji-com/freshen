@@ -108,39 +108,51 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 
 type loadedJobLogsMsg struct {
 	jobID   string // JobItem.ID to match
+	seq     uint64 // request identity; see Model.LogSeq
 	ghJobID int64
 	logs    []string
 	err     error
 }
 
-// loadJobLogsCmd fetches real log lines for the given running job.
-func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
+// fetchJobLogs is the log download, swappable so tests can count requests and
+// control completion order.
+var fetchJobLogs = jobs.FetchJobLogs
+
+// logFetchStuckAfter is when an unanswered log request stops blocking new
+// ones. gh calls time out after 30s, so a live request has answered by then;
+// a later response is discarded by its sequence number.
+const logFetchStuckAfter = 45 * time.Second
+
+// startLogFetch marks a log request for job in flight and returns it. Only one
+// log request runs at a time, so polling cannot stack requests behind a slow
+// one, and each carries a sequence number so an overtaken response cannot
+// replace newer lines.
+func (m *Model) startLogFetch(job *jobs.JobItem) tea.Cmd {
 	if job == nil || job.RunID == 0 {
 		return nil
 	}
-	org := m.TargetOrg
-	repo := job.Repo
-	runID := job.RunID
-	ghJobID := job.GHJobID
-	jobName := job.Name
-	jobID := job.ID
+	if m.LogLoading != "" && time.Since(m.LogLoadingSince) < logFetchStuckAfter {
+		return nil
+	}
+	m.LogSeq++
+	m.LogLoading = job.ID
+	m.LogLoadingSince = time.Now()
+	org, repo, runID, ghJobID, jobName, jobID, seq := m.TargetOrg, job.Repo, job.RunID, job.GHJobID, job.Name, job.ID, m.LogSeq
 	return func() tea.Msg {
-		lines, resolvedGHJobID, err := jobs.FetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
-		return loadedJobLogsMsg{jobID: jobID, ghJobID: resolvedGHJobID, logs: lines, err: err}
+		lines, resolvedGHJobID, err := fetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
+		return loadedJobLogsMsg{jobID: jobID, seq: seq, ghJobID: resolvedGHJobID, logs: lines, err: err}
 	}
 }
 
-// loadLogsIfSelectedJobRunning returns a command to fetch fresh logs when the
-// current OVERALL JOB QUEUE selection is a running job, or nil otherwise —
-// used after any keyboard move so a running job's log tail stays current,
-// and a no-op when the selection is a header row or an idle job.
-func (m Model) loadLogsIfSelectedJobRunning() tea.Cmd {
-	if m.ActiveFocus != FocusJobs || m.OpenJobID == "" || m.LogLoading != "" {
+// loadLogsIfSelectedJobRunning refreshes the open job's log tail while the job
+// runs, or returns nil for an idle job or when a request is already in flight.
+func (m *Model) loadLogsIfSelectedJobRunning() tea.Cmd {
+	if m.ActiveFocus != FocusJobs || m.OpenJobID == "" {
 		return nil
 	}
 	j := m.openJob()
 	if j != nil && j.Status == jobs.JobRunning {
-		return m.loadJobLogsCmd(j)
+		return m.startLogFetch(j)
 	}
 	return nil
 }
@@ -619,14 +631,32 @@ func (m Model) actionsPollInterval() time.Duration {
 
 type repoDetailsLoadedMsg struct{ repo *git.RepoItem }
 
+// loadRepoDetail starts every request the open repository detail needs, then
+// renders it, so the first frame already shows their loading state.
+func (m *Model) loadRepoDetail() tea.Cmd {
+	cmd := tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+	m.updateViewport()
+	return cmd
+}
+
+// loadRepoDetails reads the selected repository's branches and worktrees. One
+// read runs at a time; a request for another repository while one is in
+// flight is queued and started when the current one completes.
 func (m *Model) loadRepoDetails() tea.Cmd {
-	if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) || m.RepoDetailLoading != "" {
+	if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 		return nil
 	}
 	repo := m.Repos[m.SelectedIndex].Clone()
 	if repo.IsNew {
 		return nil
 	}
+	if m.RepoDetailLoading != "" {
+		if m.RepoDetailLoading != repo.Path {
+			m.RepoDetailQueued = repo.Path
+		}
+		return nil
+	}
+	m.RepoDetailQueued = ""
 	m.RepoDetailLoading = repo.Path
 	ctx := m.ctx
 	return func() tea.Msg {

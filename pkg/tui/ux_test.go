@@ -35,6 +35,14 @@ var uxStates = []struct {
 	{"filter", func(m *Model) { press(m, "/"); press(m, "al") }},
 	{"menu", func(m *Model) { press(m, " ") }},
 	{"confirm", func(m *Model) { press(m, "X") }},
+	{"long-filter", func(m *Model) { press(m, "/"); press(m, strings.Repeat("abcdefghij", 7)+"wxyz") }},
+	{"long-name-detail", func(m *Model) {
+		m.Repos[0].Name = strings.Repeat("very-long-repository-name-", 6)
+		press(m, "1")
+		press(m, "enter")
+		press(m, "]")
+	}},
+	{"help-end", func(m *Model) { press(m, "?"); press(m, "end") }},
 	{"toast", func(m *Model) {
 		m.setToast(strings.Repeat("A very long error message that must never push the footer away ", 6), 2)
 	}},
@@ -117,7 +125,7 @@ func TestScreenKeysDoNotShadowGlobalKeys(t *testing.T) {
 // is one the handler acts on.
 func TestHelpOverlayIsGeneratedFromHandledBindings(t *testing.T) {
 	for _, st := range uxStates {
-		if st.name == "help" || st.name == "filter" || st.name == "menu" || st.name == "confirm" {
+		if st.name == "help" || st.name == "help-end" || strings.HasSuffix(st.name, "filter") || st.name == "menu" || st.name == "confirm" {
 			continue
 		}
 		m := smokeFixtureModel()
@@ -185,7 +193,7 @@ func isQuit(cmd tea.Cmd) bool {
 // Global keys do the same thing from every screen, drill-down and the help overlay.
 func TestGlobalKeysBehaveIdenticallyEverywhere(t *testing.T) {
 	for _, st := range uxStates {
-		if st.name == "filter" || st.name == "menu" || st.name == "confirm" {
+		if strings.HasSuffix(st.name, "filter") || st.name == "menu" || st.name == "confirm" {
 			continue
 		}
 		m := smokeFixtureModel()
@@ -204,7 +212,7 @@ func TestGlobalKeysBehaveIdenticallyEverywhere(t *testing.T) {
 		m = smokeFixtureModel()
 		st.open(&m)
 		press(&m, "?")
-		if !m.ShowHelp && st.name != "help" {
+		if !m.ShowHelp && !strings.HasPrefix(st.name, "help") {
 			t.Fatalf("%s: ? did not open help", st.name)
 		}
 

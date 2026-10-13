@@ -19,22 +19,28 @@ func Hyperlink(text, url string) string {
 	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text)
 }
 
+// setDetail fills the detail viewport, wrapping every row to its width: the
+// frame clips anything wider, and detail text has no horizontal scroll.
+func (m *Model) setDetail(content string) {
+	m.Viewport.SetContent(ansi.Wrap(content, max(1, m.Viewport.Width), ""))
+}
+
 func (m *Model) updateViewport() {
 	var sb strings.Builder
 
 	switch m.ActiveFocus {
 	case FocusJobs:
-		m.Viewport.SetContent(m.jobDetailContent())
+		m.setDetail(m.jobDetailContent())
 		return
 	case FocusRunners:
-		m.Viewport.SetContent(m.runnerDetailContent())
+		m.setDetail(m.runnerDetailContent())
 		return
 	case FocusRepos, FocusConcerns:
 		if len(m.Repos) == 0 || m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 			if m.IsOrgSyncing {
-				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching GitHub repositories…", m.Spinner.View()))
+				m.setDetail(fmt.Sprintf(" %s Fetching GitHub repositories…", m.Spinner.View()))
 			} else {
-				m.Viewport.SetContent(th.dim.Render(" This repository is no longer in the snapshot. Esc returns to the list."))
+				m.setDetail(th.dim.Render(" This repository is no longer in the snapshot. Esc returns to the list."))
 			}
 			return
 		}
@@ -106,7 +112,7 @@ func (m *Model) updateViewport() {
 			}
 
 		case TabBranches:
-			if m.RepoDetailLoading != "" && m.RepoDetailLoading == item.Path {
+			if item.Path != "" && (m.RepoDetailLoading == item.Path || m.RepoDetailQueued == item.Path) {
 				sb.WriteString(m.Spinner.View() + " Loading branches and worktrees…\n")
 				break
 			}
@@ -180,20 +186,33 @@ func (m *Model) updateViewport() {
 		}
 	}
 
-	m.Viewport.SetContent(sb.String())
+	m.setDetail(sb.String())
+}
+
+// detailTabNames are the repository detail tab labels, longest first.
+var detailTabNames = [][4]string{
+	{"Logs", "Branches", "Issues", "PRs"},
+	{"Log", "Br", "Iss", "PR"},
 }
 
 // renderTabBar shows the repository detail tabs; [ and ] move between them.
-func (m Model) renderTabBar() string {
-	var sb strings.Builder
-	for i, name := range []string{"Logs", "Branches", "Issues", "PRs"} {
-		if TabType(i) == m.ActiveTab {
-			sb.WriteString(th.subTabActive.Render(name))
-		} else {
-			sb.WriteString(th.subTabInactive.Render(name))
+// It uses the longest labels that fit budget cells, falling back to the
+// active tab alone so the current tab is always named.
+func (m Model) renderTabBar(budget int) string {
+	for _, names := range detailTabNames {
+		var sb strings.Builder
+		for i, name := range names {
+			if TabType(i) == m.ActiveTab {
+				sb.WriteString(th.subTabActive.Render(name))
+			} else {
+				sb.WriteString(th.subTabInactive.Render(name))
+			}
+		}
+		if ansi.StringWidth(sb.String()) <= budget {
+			return sb.String()
 		}
 	}
-	return sb.String()
+	return th.subTabActive.Render(detailTabNames[0][m.ActiveTab])
 }
 
 // sectionRule is a heading followed by a rule filling the remaining width.

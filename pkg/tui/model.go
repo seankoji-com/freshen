@@ -178,8 +178,12 @@ type Model struct {
 	BusyAction         string
 	LastActionsRefresh time.Time
 	RunLoading         bool
-	RepoDetailLoading  string
-	LogLoading         string
+	RepoDetailLoading  string // repository path whose branch details are being read
+	RepoDetailQueued   string // repository path to read once RepoDetailLoading completes
+	LogLoading         string // job ID whose log request is in flight
+	LogLoadingSince    time.Time
+	LogSeq             uint64          // identity of the newest log request; older responses are discarded
+	EmptyLogs          map[string]bool // job IDs whose last log fetch succeeded with no lines
 
 	TargetDir              string
 	TargetOrg              string
