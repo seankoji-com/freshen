@@ -714,7 +714,11 @@ func TestCICachePathListSpellings(t *testing.T) {
 func TestCICacheEnvironmentKeyCase(t *testing.T) {
 	hostTools := filepath.Join(t.TempDir(), "host-tools")
 	hostCache := filepath.Join(t.TempDir(), "host-go-cache")
-	t.Setenv("Path", hostTools)
+	// Keep the real PATH entries: on Windows the environment is case-insensitive,
+	// so setting `Path` alone replaces `PATH` and the fixture's own bash/cygpath
+	// lookups stop resolving. Append a distinctive host marker instead, so an
+	// unfolded `Path` would still be visible to the assertions below.
+	t.Setenv("Path", pathList(append(filepath.SplitList(os.Getenv("PATH")), hostTools), string(os.PathListSeparator)))
 	t.Setenv("GoCache", hostCache)
 	t.Setenv("FRESHEN_FIXTURE_UNRELATED", "keep")
 
