@@ -26,7 +26,42 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
+          # Keep existing branch-scoped caching outside the Windows pilot.
+          # PR merge-ref caches cannot be restored by main or other PRs.
+          # Windows uses separate stores and a trusted-main publisher below.
+          cache: ${{ runner.os != 'Windows' }}
+      - name: Prepare isolated Windows Go stores
+        if: runner.os == 'Windows'
+        id: go-cache
+        shell: bash
+        run: bash .github/scripts/go-cache.sh prepare
+      - name: Restore Windows module downloads
+        if: runner.os == 'Windows'
+        id: modules
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .freshen-ci-cache/modules.tar
+          key: ${{ steps.go-cache.outputs.modules }}
+          restore-keys: ${{ steps.go-cache.outputs.modules-prefix }}
+      - name: Restore Windows build objects
+        if: runner.os == 'Windows'
+        id: objects
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .freshen-ci-cache/build.tar
+          key: ${{ steps.go-cache.outputs.build }}
+          restore-keys: ${{ steps.go-cache.outputs.build-prefix }}
+      - name: Validate and unpack Windows Go archives
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash .github/scripts/go-cache.sh restore
+        env:
+          MODULE_PRIMARY: ${{ steps.modules.outputs.cache-primary-key }}
+          MODULE_MATCHED: ${{ steps.modules.outputs.cache-matched-key }}
+          MODULE_HIT: ${{ steps.modules.outputs.cache-hit }}
+          BUILD_PRIMARY: ${{ steps.objects.outputs.cache-primary-key }}
+          BUILD_MATCHED: ${{ steps.objects.outputs.cache-matched-key }}
+          BUILD_HIT: ${{ steps.objects.outputs.cache-hit }}
       - run: go vet ./...
       - run: go test -race "-coverprofile=coverage.out" ./...
       # Coverage reporting starts advisory so converter outages cannot freeze merges.
@@ -59,6 +94,31 @@ jobs:
 
       - name: Build
         run: go build ./...
+      - name: Package successful trusted Windows caches
+        if: success() && runner.os == 'Windows' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: publish-cache
+        shell: bash
+        run: bash .github/scripts/go-cache.sh publish
+        env:
+          JOB_STATUS: ${{ job.status }}
+          MODULE_PRIMARY: ${{ steps.modules.outputs.cache-primary-key }}
+          MODULE_MATCHED: ${{ steps.modules.outputs.cache-matched-key }}
+          MODULE_HIT: ${{ steps.modules.outputs.cache-hit }}
+          BUILD_PRIMARY: ${{ steps.objects.outputs.cache-primary-key }}
+          BUILD_MATCHED: ${{ steps.objects.outputs.cache-matched-key }}
+          BUILD_HIT: ${{ steps.objects.outputs.cache-hit }}
+      - name: Save trusted Windows module downloads
+        if: success() && runner.os == 'Windows' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.publish-cache.outputs.modules == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .freshen-ci-cache/modules.tar
+          key: ${{ steps.go-cache.outputs.modules }}
+      - name: Save trusted Windows build objects
+        if: success() && runner.os == 'Windows' && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.publish-cache.outputs.build == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: .freshen-ci-cache/build.tar
+          key: ${{ steps.go-cache.outputs.build }}
   vulnerabilities:
     timeout-minutes: 15
     runs-on: ubuntu-latest
