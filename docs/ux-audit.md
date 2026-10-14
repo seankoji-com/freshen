@@ -65,6 +65,11 @@ Reviewed on 13 October 2026 against `f324ced`.
 | A sync's final snapshot carried branch details read before its checkout or pull, so the header said `main` while the branch list still marked the feature branch checked out | The sync re-reads branch details after its last change; a failed re-read is labelled as earlier data |
 | A failed `git branch`, `git worktree list` or `git status` showed as "none found" or "working tree is clean" | Each section states its failure with an `r` retry hint, and entries kept from an earlier read are labelled |
 | Opening job B while job A's log request ran dropped B's fetch, leaving "Logs not loaded" | Opening a job cancels the request for the job left and starts the open job's at once; `LogSeq` discards the late answer |
+| Branch reads, pulls, pushes and `gh` calls captured output without `WaitDelay`, so a hook or helper holding the pipes kept the worker waiting after the command exited or was killed | Every `git` and `gh` command starts through `proc.Command` with `WaitDelay`; the exit status decides success |
+| A stopped clone killed only `gh`; the `git` it started could keep writing into the checkout after freshen reported the clone stopped | Each command runs in its own process group (Unix); cancelling kills and waits for the whole group, and a survivor holds the path until it exits |
+| An organization refresh probed each checkout with an unbounded `os.Stat`, and a failed probe made a repository "not cloned" or dropped an archived one | The probe has a deadline and tells missing from unreadable; an unreadable checkout keeps its earlier record or shows "Read Err" with no delete or clone offered |
+| Prune's worktree probes, a clone's directory creation and the archived-repo delete ran with no deadline | Each is bounded; a filesystem change that outlives its deadline holds its path, and every repository operation refuses that path until the change ends |
+| A finished clone kept showing "not cloned" and offering only Clone until the next refresh; a failed post-clone branch read showed as branch `HEAD` | Snapshots carry `IsNew`; unread branches stay unresolved with a "Branch unread" status and a refresh hint |
 
 ## Verification
 
@@ -95,8 +100,17 @@ describe the checkout after it switched. `pkg/tui/branch_state_test.go` covers
 a late refresh after a switch or sync, a branch-changing refresh re-reading the
 open detail, the unread-details message, and hung switch, push and prune
 actions stopped with their finished steps kept.
-`pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
-multi-page fallback ends at the request deadline.
+`pkg/proc/proc_test.go` runs real subprocesses: a child holding stdout cannot
+hold `Wait` past `WaitDelay`, and after cancellation a child the command left
+writing stops. `pkg/git/process_tree_test.go` repeats this through freshen's
+own paths (branch reads and a sync pull with a hook holding the pipes, a stopped
+clone whose child was writing into the checkout), and covers a hung delete
+holding its path against sync, switch, push, prune and delete, a hung clone
+directory, `DirExists`, and post-clone branch-read failures.
+`pkg/tui/refresh_probe_test.go` covers failed and hung refresh probes and a
+clone snapshot followed by an older refresh. `pkg/jobs` tests count `gh`
+requests for log refreshes, prove a slow multi-page fallback ends at the request
+deadline, and run a `gh` whose child holds its output.
 
 Regression tests cover run/job drill-down, queue counts, step progress, filtering,
 scrolled mouse selection, frame dimensions, stable selection, confirmation targets,
@@ -117,3 +131,9 @@ configuration editing and Actions cancellation/rerun are outside this change.
 Run the fixture with `go test -c -o "$TMPDIR/freshen-ui.test" ./pkg/tui`, then
 `FRESHEN_DEMO=1 "$TMPDIR/freshen-ui.test" -test.run TestTerminalDemo`. It drops external
 commands and uses seeded data; it cannot exercise real API or git operations.
+
+A process blocked in the kernel on a hung mount ignores every signal, and Go
+cannot interrupt a blocked filesystem call. freshen stops waiting at the
+deadline and holds the path until the call ends, but it cannot make the call
+end. The non-interactive batch mode (`main.go`) still checks paths with plain
+`os.Stat`.

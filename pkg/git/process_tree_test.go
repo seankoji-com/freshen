@@ -142,6 +142,10 @@ func fileSize(path string) int64 {
 // and the path stays held: sync, switch, prune, publish and another delete
 // all refuse it until the removal ends, then work again.
 func TestDeleteIsBoundedAndHoldsItsPath(t *testing.T) {
+	// Every git and gh call fails at once, so an operation that wrongly
+	// proceeds fails the test instead of reaching GitHub or hanging.
+	wrapCommands(t, map[string]string{"git": "exit 1", "gh": "exit 1"})
+	runnerBlocksOn(t, true, func([]string) bool { return true })
 	workspace := t.TempDir()
 	path := filepath.Join(workspace, "archived")
 	if err := os.Mkdir(path, 0o755); err != nil {
@@ -163,18 +167,23 @@ func TestDeleteIsBoundedAndHoldsItsPath(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	start := time.Now()
-	err := DeleteLocalRepo(ctx, workspace, path)
-	if waited := time.Since(start); waited > 5*time.Second {
-		t.Fatalf("hung delete took %s", waited)
+	returned := make(chan error, 1)
+	go func() { returned <- DeleteLocalRepo(ctx, workspace, path) }()
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hung delete did not return at its deadline")
 	}
 	if !errors.Is(err, ErrUnfinishedChange) || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "still running") {
 		t.Fatalf("hung delete returned %v", err)
 	}
 
 	item := &RepoItem{Name: "archived", Path: path, DefaultBranch: "main", CurrentBranch: "main"}
+	quick, cancelQuick := context.WithTimeout(context.Background(), time.Second)
+	defer cancelQuick()
 	refusals := map[string]error{
-		"delete": DeleteLocalRepo(context.Background(), workspace, path),
+		"delete": DeleteLocalRepo(quick, workspace, path),
 		"switch": SwitchBranch(context.Background(), item.Clone(), "main"),
 		"push":   CommitPushPRAndSwitchDefault(context.Background(), item.Clone()),
 	}

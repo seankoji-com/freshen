@@ -841,8 +841,8 @@ func TestGHCommandBoundsHeldOutput(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the gh wrapper is a POSIX shell script")
 	}
-	sleep, err := exec.LookPath("sleep")
-	if err != nil {
+	sleep, lookErr := exec.LookPath("sleep")
+	if lookErr != nil {
 		t.Skip("sleep not available")
 	}
 	bin := t.TempDir()

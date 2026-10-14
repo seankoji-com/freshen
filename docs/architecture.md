@@ -7,6 +7,7 @@ GitHub operations use the authenticated `gh` CLI; repository operations use `git
 |---|---|
 | `pkg/git/git.go` | Repository discovery, clone/sync, branches, worktrees and PR operations |
 | `pkg/jobs/jobs.go` | Typed workflow runs/jobs/steps, polling, result mapping and logs |
+| `pkg/proc/` | Starts every `git` and `gh` command: `WaitDelay`, own process group, group kill on cancel |
 | `pkg/tui/model.go` | Model, messages and polling constants |
 | `pkg/tui/theme.go` | The only palette and style definitions; status kinds, glyphs and labels; `NO_COLOR` |
 | `pkg/tui/keymap.go` | Every key binding, enabled per context; footer hints and help-overlay groups |
@@ -113,13 +114,34 @@ placeholder `HEAD`, cloning over an unreadable checkout or assuming a clean
 tree. Changes are bounded too: a sync of an existing checkout by `syncTimeout`
 (10 minutes), a first clone by `cloneTimeout` (30 minutes, which reports that a
 partial clone may remain), and a switch by `checkoutTimeout` (2 minutes). The
-TUI runs switch, push and prune under one `repoActionTimeout` (5 minutes); a
-stopped action reports "stopped after", and steps that finished before it (a
-push that landed, branches already deleted) stay in the repository log. The
-shared command runner, used by switch and the preflight reads, and the clone
-commands set `WaitDelay`, so a hook or child process holding the output pipes
-cannot keep a killed command waiting. Quitting cancels all of them. A
-sync re-reads branches, worktrees and changed files after its last change, so
+TUI runs switch, push, prune and the archived-repository delete under one
+`repoActionTimeout` (5 minutes); a stopped action reports "stopped after", and
+steps that finished before it (a push that landed, branches already deleted)
+stay in the repository log. Quitting cancels all of them.
+
+Every `git` and `gh` command in `pkg/git` and `pkg/jobs` starts through
+`proc.Command`. It sets `WaitDelay` (5 seconds), so a hook or helper that
+keeps stdout or stderr open after the command exits cannot hold `Wait`;
+`proc.Run`, `proc.Output` and `proc.CombinedOutput` then let the exit status
+decide success, because the command's own output was already read. On Unix the
+command runs in its own process group: cancelling kills the whole group,
+including the `git` a `gh repo clone` starts, and `Wait` returns only once the
+group has exited or `proc.ReapTimeout` (5 seconds) has passed. On Windows,
+cancelling kills the command itself and `WaitDelay` still applies.
+
+Filesystem changes have deadlines too. Creating a clone's parent directory
+shares the clone's `cloneTimeout`; the delete validates and removes the path
+under the action's deadline; prune's worktree probes each get
+`branchReadTimeout`. Go cannot interrupt a blocked filesystem call, so a change
+that outlives its deadline keeps running in the background. Its path is then
+held (`ErrUnfinishedChange`) until the change ends: sync, switch, push, prune,
+clone and delete refuse that path, and any path inside or above it, with
+"may still be running". A stopped clone whose process group still has a
+member after the kill holds its path the same way. A git process blocked in
+the kernel on a hung mount cannot be killed by any signal; the hold is what
+keeps freshen from acting on that path in the meantime.
+
+A sync re-reads branches, worktrees and changed files after its last change, so
 its final snapshot describes the checkout it left (for example `main` checked
 out after switching from a clean feature branch); a re-read that fails marks
 its sections failed, and the detail labels the entries it keeps as earlier
@@ -140,7 +162,20 @@ Snapshots also bump `RepoStateRev`, which `startOrgRefresh` copies into
 `OrgRefreshRevs`; when the refresh answers, a repository whose revision moved
 in the meantime keeps the snapshot's branch, status, details and logs and
 raises no "branch changed" toast, so a refresh that read the checkout before a
-switch or sync cannot undo it or retarget the next action. `GetRepoBranchDetails` records each failed command in
+switch or sync cannot undo it or retarget the next action. Snapshots carry
+`IsNew`, so a finished clone stops offering "Clone repository" at once and an
+older refresh cannot set it back. If the branch reads after a clone fail, the
+clone is kept, the unread branches stay empty (unresolved) rather than `HEAD`,
+the status reads "Branch unread" and the log asks for a refresh; prune and
+publish refuse an unresolved default branch.
+
+An organization refresh probes each checkout with `git.DirExists` under its own
+deadline. A missing path means "not cloned"; a probe that fails or gets no
+answer does not. The repository keeps its earlier record, marked stale, or, with
+none, is listed as "Read Err" with `CheckoutUnknown` set: an archived one is not
+dropped and offers no delete, and an active one offers only a sync, which
+probes again before it clones or pulls. The refresh reports the failures as
+incomplete local metadata. `GetRepoBranchDetails` records each failed command in
 `BranchesErr`, `WorktreesErr` or `StatusErr`; the detail states the failure with
 an `r` retry hint instead of "none found" or "working tree is clean", and keeps
 entries from an earlier read under a "From an earlier read" label. Spinner ticks re-render an
