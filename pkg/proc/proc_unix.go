@@ -16,6 +16,9 @@ func ownProcessGroup(cmd *exec.Cmd) {
 	cmd.Cancel = func() error { return killGroup(cmd.Process.Pid) }
 }
 
+// stopGroup kills what is left of group pgid once its leader has exited.
+var stopGroup = killGroup
+
 // killGroup kills every process in group pgid and waits up to ReapTimeout for
 // them to exit. The leader is reaped by the Wait that is running alongside;
 // orphaned children are reaped by init.

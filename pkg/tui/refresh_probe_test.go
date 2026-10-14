@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"slices"
@@ -193,5 +194,112 @@ func TestUnprobedRecordNeverClaimsAbsence(t *testing.T) {
 	kept := unprobedRepo(prev, git.GHRepoInfo{Name: "x", IsArchived: true}, "x", "/w/x", errors.New("boom"))
 	if kept.CurrentBranch != "main" || kept.Status != git.StatusUpdated || !kept.IsArchived || !kept.LocalMetadataStale || !kept.CountsStale || kept.CheckoutUnknown {
 		t.Fatalf("earlier record not kept: %+v", kept)
+	}
+}
+
+// stubCheckoutReads answers each checkout read by directory name.
+func stubCheckoutReads(t *testing.T, read func(name string) (git.LocalCheckout, error)) {
+	t.Helper()
+	original := readLocalCheckout
+	readLocalCheckout = func(_ context.Context, path string) (git.LocalCheckout, error) { return read(filepath.Base(path)) }
+	t.Cleanup(func() { readLocalCheckout = original })
+}
+
+// A refresh whose git reads fail keeps what it knew: a checkout check that
+// fails never reads as "not a checkout" (a known repository keeps its state,
+// an unknown one is listed unreadable), a failed branch read never blanks a
+// known branch or reports it changed, and the toast says the local metadata
+// is incomplete. Both the organization and the local-only refresh.
+func TestRefreshKeepsStateWhenCheckoutReadsFail(t *testing.T) {
+	checkErr := errors.New("could not tell whether it is a checkout (fatal: detected dubious ownership)")
+	cases := map[string]struct {
+		alpha     func() (git.LocalCheckout, error)
+		wantAlpha func(t *testing.T, alpha *git.RepoItem)
+	}{
+		"checkout check": {
+			alpha: func() (git.LocalCheckout, error) { return git.LocalCheckout{}, checkErr },
+			wantAlpha: func(t *testing.T, alpha *git.RepoItem) {
+				if alpha.IsNew || alpha.CurrentBranch != "feat/screens" || alpha.DefaultBranch != "main" || alpha.Status != git.StatusUpdated {
+					t.Fatalf("known repository lost its state: %+v", alpha)
+				}
+			},
+		},
+		"current branch": {
+			alpha: func() (git.LocalCheckout, error) {
+				return git.LocalCheckout{IsRepo: true, DefaultBranch: "main"}, errors.New("could not read the checked-out branch (exit status 128)")
+			},
+			wantAlpha: func(t *testing.T, alpha *git.RepoItem) {
+				if alpha.IsNew || alpha.CurrentBranch != "feat/screens" || alpha.DefaultBranch != "main" {
+					t.Fatalf("failed branch read blanked the branch: %+v", alpha)
+				}
+			},
+		},
+		"default branch": {
+			alpha: func() (git.LocalCheckout, error) {
+				return git.LocalCheckout{IsRepo: true, CurrentBranch: "feat/screens"}, errors.New("could not read the default branch (exit status 128)")
+			},
+			wantAlpha: func(t *testing.T, alpha *git.RepoItem) {
+				if alpha.CurrentBranch != "feat/screens" || alpha.DefaultBranch != "main" {
+					t.Fatalf("failed default read blanked the default: %+v", alpha)
+				}
+			},
+		},
+	}
+	for _, org := range []bool{true, false} {
+		for name, tc := range cases {
+			t.Run(fmt.Sprintf("org=%v/%s", org, name), func(t *testing.T) {
+				m := sized(smokeFixtureModel(), 120, 40)
+				m.ctx = context.Background()
+				stubOrgRefresh(t, []git.GHRepoInfo{
+					{Name: "alpha", URL: "https://github.com/fixture-org/alpha"},
+					{Name: "beta", URL: "https://github.com/fixture-org/beta"},
+					{Name: "unknown", URL: "https://github.com/fixture-org/unknown"},
+				}, func(context.Context, string) (bool, error) { return true, nil })
+				scanLocalDirectoryContext = func(context.Context, string) ([]string, error) {
+					return []string{"alpha", "beta", "unknown"}, nil
+				}
+				if !org {
+					m.TargetOrg = ""
+				}
+				stubCheckoutReads(t, func(dir string) (git.LocalCheckout, error) {
+					switch dir {
+					case "alpha":
+						return tc.alpha()
+					case "unknown":
+						return git.LocalCheckout{}, checkErr
+					}
+					return git.LocalCheckout{IsRepo: true, CurrentBranch: "main", DefaultBranch: "main"}, nil
+				})
+
+				msg, ok := m.startOrgRefresh(false, true)().(orgSyncedMsg)
+				if !ok {
+					t.Fatal("refresh did not report")
+				}
+				if msg.localErr == nil || !strings.Contains(msg.localErr.Error(), "alpha: could not") {
+					t.Fatalf("read failure not reported: %v", msg.localErr)
+				}
+				next, _ := m.Update(msg)
+				m = next.(Model)
+
+				alpha := repoNamed(m.Repos, "alpha")
+				if alpha == nil {
+					t.Fatal("known repository dropped when its read failed")
+				}
+				tc.wantAlpha(t, alpha)
+				if !alpha.LocalMetadataStale {
+					t.Fatalf("kept state not marked stale: %+v", alpha)
+				}
+				unknown := repoNamed(m.Repos, "unknown")
+				if unknown == nil || unknown.IsNew || !unknown.CheckoutUnknown || unknown.StatusMsg != "Read Err" {
+					t.Fatalf("unreadable checkout recorded as %+v", unknown)
+				}
+				if beta := repoNamed(m.Repos, "beta"); beta == nil || beta.CurrentBranch != "main" {
+					t.Fatalf("a readable checkout was not refreshed: %+v", beta)
+				}
+				if strings.Contains(m.ToastMsg, "Branch changed") || !strings.Contains(m.ToastMsg, "Local repository metadata is incomplete") {
+					t.Fatalf("toast %q", m.ToastMsg)
+				}
+			})
+		}
 	}
 }

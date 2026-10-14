@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
+	"github.com/seankoji-com/freshen/pkg/proc"
 )
 
 // A completed branch switch whose re-read of branch state hangs still
@@ -359,4 +361,62 @@ func TestHungRepositoryActionIsStopped(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A switch whose git checkout the kernel never lets exit, which no kill can
+// end, still delivers its result soon after the deadline: BusyAction clears
+// and the repository log says the checkout may still be running, instead of
+// the action holding the repository until quit.
+func TestUnreapableSwitchFreesTheRepository(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"branch", "feature"},
+	} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	originalTimeout, originalDelay, originalReap := repoActionTimeout, proc.WaitDelay, proc.ReapTimeout
+	repoActionTimeout, proc.WaitDelay, proc.ReapTimeout = 300*time.Millisecond, 200*time.Millisecond, 200*time.Millisecond
+	release := make(chan struct{})
+	restore := proc.BlockReaping(func(args []string) bool { return slices.Contains(args, "checkout") }, release, 100*time.Millisecond)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		restore()
+		repoActionTimeout, proc.WaitDelay, proc.ReapTimeout = originalTimeout, originalDelay, originalReap
+	})
+
+	m := sized(smokeFixtureModel(), 120, 50)
+	m.Repos[0].Path = dir
+	m.Repos[0].CurrentBranch, m.Repos[0].OriginalBranch, m.Repos[0].DefaultBranch = "main", "feature", "main"
+	m.ActionTarget = m.Repos[0].Clone()
+	cmd := m.executeAction("switch")
+	delivered := make(chan []tea.Msg, 1)
+	go func() { delivered <- runCmd(cmd) }()
+	var msgs []tea.Msg
+	select {
+	case msgs = <-delivered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the switch held its result while the checkout could not be reaped")
+	}
+	for _, msg := range msgs {
+		next, _ := m.Update(msg)
+		m = next.(Model)
+	}
+	if m.BusyAction != "" || !strings.Contains(m.ToastMsg, "failed") {
+		t.Fatalf("switch not reported: busy=%q toast=%q", m.BusyAction, m.ToastMsg)
+	}
+	if !slices.ContainsFunc(m.Repos[0].Logs, func(l string) bool { return strings.Contains(l, "may still be running") }) {
+		t.Fatalf("held checkout not logged: %v", m.Repos[0].Logs)
+	}
+	released = true
+	close(release)
 }

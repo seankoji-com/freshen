@@ -41,13 +41,92 @@ func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
 			return out.Bytes(), fmt.Errorf("%w: %s", err, stderr)
 		}
 		return out.Bytes(), err
 	}
 	return out.Bytes(), nil
+}
+
+// runCmd, outputCmd and combinedCmd are the proc functions of the same
+// names, run on the path the command acts on (see commandPath). A command
+// does not start while an earlier change to an overlapping path is still
+// running; one proc stops waiting for, because it or a process it started
+// could not be stopped, holds its path until every process it started has
+// exited, so nothing else freshen runs can act on that path meanwhile.
+func runCmd(cmd *exec.Cmd) error {
+	if err := checkUnfinished(commandPath(cmd)); err != nil {
+		return err
+	}
+	return holdIfRunning(cmd, proc.Run(cmd))
+}
+
+func outputCmd(cmd *exec.Cmd) ([]byte, error) {
+	if err := checkUnfinished(commandPath(cmd)); err != nil {
+		return nil, err
+	}
+	out, err := proc.Output(cmd)
+	return out, holdIfRunning(cmd, err)
+}
+
+func combinedCmd(cmd *exec.Cmd) ([]byte, error) {
+	if err := checkUnfinished(commandPath(cmd)); err != nil {
+		return nil, err
+	}
+	out, err := proc.CombinedOutput(cmd)
+	return out, holdIfRunning(cmd, err)
+}
+
+// stillRunning reports an error from a command proc stopped waiting for.
+func stillRunning(err error) bool {
+	var running *proc.StillRunningError
+	return errors.As(err, &running)
+}
+
+func holdIfRunning(cmd *exec.Cmd, err error) error {
+	var running *proc.StillRunningError
+	if errors.As(err, &running) {
+		if path := commandPath(cmd); path != "" {
+			holdUntil(path, commandName(cmd), running.Done)
+		}
+	}
+	return err
+}
+
+// commandPath is the path a git or gh command acts on: git's -C directory,
+// a clone's destination, or else the command's working directory ("" when
+// it acts on none, like gh api).
+func commandPath(cmd *exec.Cmd) string {
+	args := cmd.Args[1:]
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-C" {
+			return args[i+1]
+		}
+	}
+	if len(args) >= 3 && (args[0] == "clone" || (args[0] == "repo" && args[1] == "clone")) {
+		return args[len(args)-1]
+	}
+	return cmd.Dir
+}
+
+// commandName is the program and subcommand, e.g. "git pull", for messages
+// about a held path.
+func commandName(cmd *exec.Cmd) string {
+	name := filepath.Base(cmd.Args[0])
+	args := cmd.Args[1:]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-C" {
+			i++
+			continue
+		}
+		if name == "gh" && i+1 < len(args) {
+			return name + " " + args[i] + " " + args[i+1]
+		}
+		return name + " " + args[i]
+	}
+	return name
 }
 
 // runner is the package-level CommandRunner; tests swap it for a fake.
@@ -501,7 +580,7 @@ func readGitLines(ctx context.Context, path string, args ...string) ([]string, s
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, gitReadFailure(ctxErr)
 		}
@@ -585,7 +664,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 
 	// 1. Fetch & prune deleted remote-tracking references from origin
 	// Best-effort: a failure here shouldn't block local branch/worktree cleanup.
-	if err := proc.Run(proc.Command(ctx, "git", "-C", path, "fetch", "--prune", "origin")); err != nil {
+	if err := runCmd(proc.Command(ctx, "git", "-C", path, "fetch", "--prune", "origin")); err != nil {
 		slog.Warn("git fetch --prune failed", "path", path, "error", err)
 	}
 
@@ -600,7 +679,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 	cmdWorktree := proc.Command(ctx, "git", "-C", path, "worktree", "list", "--porcelain", "--expire="+worktreePruneExpire)
 	var wtOut bytes.Buffer
 	cmdWorktree.Stdout = &wtOut
-	if err := proc.Run(cmdWorktree); err != nil {
+	if err := runCmd(cmdWorktree); err != nil {
 		return result, fmt.Errorf("list worktrees: %w", err)
 	}
 	type worktreeRef struct {
@@ -646,7 +725,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 		statusCmd := proc.Command(ctx, "git", "-C", worktree.path, "status", "--porcelain", "--untracked-files=all")
 		var statusOut bytes.Buffer
 		statusCmd.Stdout = &statusOut
-		if err := proc.Run(statusCmd); err != nil {
+		if err := runCmd(statusCmd); err != nil {
 			result.UnavailableWorktrees = append(result.UnavailableWorktrees, worktree.path)
 			result.Failures = append(result.Failures, fmt.Sprintf("inspect worktree %q before removal: %v", worktree.path, err))
 			continue
@@ -656,11 +735,11 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 		}
 	}
 	if len(staleWorktrees) > 0 {
-		if err := proc.Run(proc.Command(ctx, "git", "-C", path, "worktree", "prune", "--expire="+worktreePruneExpire)); err != nil {
+		if err := runCmd(proc.Command(ctx, "git", "-C", path, "worktree", "prune", "--expire="+worktreePruneExpire)); err != nil {
 			result.Failures = append(result.Failures, fmt.Sprintf("prune expired worktree registrations: %v", err))
 		} else {
 			verifyCmd := proc.Command(ctx, "git", "-C", path, "worktree", "list", "--porcelain", "--expire="+worktreePruneExpire)
-			verifyOut, err := proc.Output(verifyCmd)
+			verifyOut, err := outputCmd(verifyCmd)
 			if err != nil {
 				result.Failures = append(result.Failures, fmt.Sprintf("verify pruned worktree registrations: %v", err))
 			} else {
@@ -685,7 +764,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 		if worktree.prunable || slices.Contains(result.UnavailableWorktrees, worktree.path) || slices.Contains(result.DirtyWorktrees, worktree.path) {
 			continue
 		}
-		if err := proc.Run(proc.Command(ctx, "git", "-C", path, "worktree", "remove", worktree.path)); err != nil {
+		if err := runCmd(proc.Command(ctx, "git", "-C", path, "worktree", "remove", worktree.path)); err != nil {
 			result.Failures = append(result.Failures, fmt.Sprintf("remove clean worktree %q: %v", worktree.path, err))
 			continue
 		}
@@ -701,7 +780,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 	cmd := proc.Command(ctx, "git", "-C", path, "branch", "--format=%(refname:short)")
 	var out bytes.Buffer
 	cmd.Stdout = &out
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		return result, err
 	}
 
@@ -713,7 +792,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 				continue
 			}
 			countCmd := proc.Command(ctx, "git", "-C", path, "rev-list", "--count", b, "--not", "--remotes")
-			countOut, err := proc.Output(countCmd)
+			countOut, err := outputCmd(countCmd)
 			if err != nil {
 				result.Failures = append(result.Failures, fmt.Sprintf("inspect local-only commits on branch %q: %v", b, err))
 				continue
@@ -728,7 +807,7 @@ func PruneBranchesAndWorktrees(ctx context.Context, item *RepoItem) (PruneResult
 				continue
 			}
 			delCmd := proc.Command(ctx, "git", "-C", path, "branch", "-D", b)
-			if err := proc.Run(delCmd); err != nil {
+			if err := runCmd(delCmd); err != nil {
 				result.Failures = append(result.Failures, fmt.Sprintf("delete local branch %q: %v", b, err))
 				continue
 			}
@@ -767,7 +846,7 @@ func FetchOpenIssuesList(org, ghRepo string) ([]IssueItem, error) {
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
 			return nil, fmt.Errorf("%w: %s", err, stderr)
 		}
@@ -797,7 +876,7 @@ func FetchOpenPRsList(org, ghRepo string) ([]PRItem, error) {
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
 			return nil, fmt.Errorf("%w: %s", err, stderr)
 		}
@@ -832,7 +911,7 @@ func FetchExistingPRURL(ctx context.Context, repoPath, branch string) string {
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		slog.Warn("gh pr list failed", "path", repoPath, "branch", branch, "error", err, "stderr", strings.TrimSpace(errOut.String()))
 		return ""
 	}
@@ -1000,6 +1079,9 @@ func holdUntil(path, what string, done <-chan struct{}) {
 // checkUnfinished returns an ErrUnfinishedChange error when a held change
 // overlaps path.
 func checkUnfinished(path string) error {
+	if path == "" {
+		return nil
+	}
 	unfinished.Lock()
 	defer unfinished.Unlock()
 	for held := range unfinished.held {
@@ -1019,17 +1101,53 @@ func pathsOverlap(a, b string) bool {
 	return inside(a, b) || inside(b, a)
 }
 
+// startGate decides, exactly once, whether a bounded change starts or is
+// abandoned: the worker claims it just before its first write, the caller
+// when its context ends first. Whoever claims second loses, so a change the
+// caller has reported as not started can never begin afterwards.
+type startGate struct {
+	mu    sync.Mutex
+	state int // 0 undecided, 1 started, 2 abandoned
+}
+
+func (g *startGate) claim(state int) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state == 0 {
+		g.state = state
+	}
+	return g.state == state
+}
+
+// errChangeNotStarted is what a worker returns when the caller abandoned the
+// change before it began.
+var errChangeNotStarted = errors.New("the change was not started")
+
 // changeBounded runs change, a filesystem change to path, and returns when it
-// does or when ctx ends. A change that outlives ctx keeps running, so path is
-// held until it ends and the error says so.
-func changeBounded(ctx context.Context, path, what string, change func() error) error {
+// does or when ctx ends. change must call begin immediately before its first
+// write and return without writing when begin reports false. A context that
+// has ended, or ends before begin, stops the change before it writes
+// anything; a change that has begun and outlives ctx keeps running, so path
+// is held until it ends and the error says so.
+func changeBounded(ctx context.Context, path, what string, change func(begin func() bool) error) error {
 	if err := checkUnfinished(path); err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s of %s was not started (%w); nothing was changed", what, path, err)
+	}
+	gate := &startGate{}
+	begin := func() bool {
+		if ctx.Err() != nil {
+			gate.claim(2)
+			return false
+		}
+		return gate.claim(1)
 	}
 	done := make(chan struct{})
 	var err error
 	go func() {
-		err = change()
+		err = change(begin)
 		close(done)
 	}()
 	select {
@@ -1040,6 +1158,13 @@ func changeBounded(ctx context.Context, path, what string, change func() error) 
 		case <-done:
 			return err
 		default:
+		}
+		if gate.claim(2) {
+			// The worker has not written and never will; it may still be
+			// reading (validating the path), so the path stays held until
+			// it returns, but nothing was changed.
+			holdUntil(path, what+" (stopped before it started)", done)
+			return fmt.Errorf("%s of %s was stopped before it started (%w); nothing was changed", what, path, ctx.Err())
 		}
 		holdUntil(path, what, done)
 		return fmt.Errorf("%w: %s of %s was still running when it was stopped (%w); freshen will not touch the path until it ends", ErrUnfinishedChange, what, path, ctx.Err())
@@ -1123,7 +1248,7 @@ var ghDefaultBranch = func(ctx context.Context, path string) (string, error) {
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
-	if err := proc.Run(cmd); err != nil {
+	if err := runCmd(cmd); err != nil {
 		if stderr := strings.TrimSpace(errOut.String()); stderr != "" {
 			return "", fmt.Errorf("%w: %s", err, stderr)
 		}
@@ -1154,6 +1279,43 @@ func githubRepoTarget(remote string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("remote %q is not a GitHub repository", remote)
+}
+
+// LocalCheckout is what a refresh reads from one checkout.
+type LocalCheckout struct {
+	// IsRepo is false only when the path is confirmed not to be a checkout:
+	// it does not exist, or git rejects a directory without a .git entry.
+	IsRepo        bool
+	CurrentBranch string // "" when it could not be read
+	DefaultBranch string // "" when it could not be read; local tiers only
+}
+
+// ReadLocalCheckout reads whether path is a checkout and, if so, its checked
+// out and default branches, without the networked GitHub tier. Each read has
+// its own branchReadTimeout deadline. A checkout check that fails returns an
+// error and a zero LocalCheckout, so the caller can tell "not a checkout"
+// from "could not tell"; a branch read that fails leaves that branch empty
+// and is reported in the error, which names each failed read.
+func ReadLocalCheckout(ctx context.Context, path string) (LocalCheckout, error) {
+	isRepo, err := readIsGitRepo(ctx, path)
+	if err != nil {
+		return LocalCheckout{}, fmt.Errorf("could not tell whether it is a checkout (%s)", readFailure(err))
+	}
+	if !isRepo {
+		return LocalCheckout{}, nil
+	}
+	checkout := LocalCheckout{IsRepo: true}
+	var failed []string
+	if checkout.CurrentBranch, err = readCurrentBranch(ctx, path); err != nil {
+		failed = append(failed, "checked-out branch ("+readFailure(err)+")")
+	}
+	if checkout.DefaultBranch, err = readDefaultBranch(ctx, path, false); err != nil {
+		failed = append(failed, "default branch ("+readFailure(err)+")")
+	}
+	if len(failed) > 0 {
+		return checkout, fmt.Errorf("could not read the %s", strings.Join(failed, " or the "))
+	}
+	return checkout, nil
 }
 
 // GetDefaultBranch determines default branch (main/master) for a git repository.
@@ -1337,6 +1499,13 @@ func (s *syncSession) log(format string, args ...any) {
 
 // finish records a terminal status alongside its log line, in one snapshot.
 func (s *syncSession) finish(status RepoStatus, statusMsg, format string, args ...any) {
+	if status == StatusError && statusMsg != "Busy" && statusMsg != "Clone Err" {
+		// A command this sync ran could not be stopped and holds the path;
+		// say so, since every later step on it was refused.
+		if err := checkUnfinished(s.item.Path); err != nil {
+			s.item.Logs = append(s.item.Logs, fmt.Sprintf("󰅙 %v", err))
+		}
+	}
 	if s.rereadCtx != nil {
 		s.item.BranchDetails = GetRepoBranchDetails(s.rereadCtx, s.item.Path, s.item.DefaultBranch)
 	}
@@ -1399,7 +1568,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		cloneCtx, cloneCancel := context.WithTimeout(ctx, cloneTimeout)
 		defer cloneCancel()
 		mkdir := mkdirAll
-		if err := changeBounded(cloneCtx, filepath.Dir(item.Path), "creating the directory", func() error {
+		if err := changeBounded(cloneCtx, filepath.Dir(item.Path), "creating the directory", func(begin func() bool) error {
+			if !begin() {
+				return errChangeNotStarted
+			}
 			return mkdir(filepath.Dir(item.Path), 0o755)
 		}); err != nil {
 			s.finish(StatusError, "Clone Err", "󰅙 Failed to create directory: %v", err)
@@ -1410,31 +1582,28 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		var cloneOut bytes.Buffer
 		cloneCmd.Stdout = &cloneOut
 		cloneCmd.Stderr = &cloneOut
-		if err := proc.Run(cloneCmd); err != nil {
-			lastCmd := cloneCmd
-			if item.URL != "" && cloneCtx.Err() == nil {
+		if err := runCmd(cloneCmd); err != nil {
+			// A gh that failed has been reaped with every process it started
+			// (proc.Run), so the git fallback cannot race a git gh left
+			// behind. One that could not be stopped holds the path instead,
+			// and the fallback does not run.
+			if item.URL != "" && cloneCtx.Err() == nil && !stillRunning(err) {
 				gitCloneCmd := proc.Command(cloneCtx, "git", "clone", item.URL, item.Path)
 				var gitCloneOut bytes.Buffer
 				gitCloneCmd.Stdout = &gitCloneOut
 				gitCloneCmd.Stderr = &gitCloneOut
-				err = proc.Run(gitCloneCmd)
+				err = runCmd(gitCloneCmd)
 				cloneOut.WriteString("\n" + gitCloneOut.String())
-				lastCmd = gitCloneCmd
 			}
 			if err != nil {
+				if stillRunning(err) {
+					s.finish(StatusError, "Clone Err", "󰅙 Cloning '%s' stopped, but a process it started is still running; freshen will not touch '%s' until it exits. Then remove the partial clone and sync again.", target, item.Path)
+					return
+				}
 				if cloneCtx.Err() != nil {
 					stopped := "did not finish within " + cloneTimeout.String()
 					if !errors.Is(cloneCtx.Err(), context.DeadlineExceeded) {
 						stopped = "was cancelled"
-					}
-					// Cancelling killed the clone's whole process group; a
-					// member that outlived that, such as a git blocked on
-					// the filesystem, could still write, so the path stays
-					// held until it exits.
-					if proc.Survived(lastCmd) {
-						holdUntil(item.Path, "cloning", proc.Exited(lastCmd))
-						s.finish(StatusError, "Clone Err", "󰅙 Cloning '%s' %s, but a process it started is still running; freshen will not touch '%s' until it exits. Then remove the partial clone and sync again.", target, stopped, item.Path)
-						return
 					}
 					s.finish(StatusError, "Clone Err", "󰅙 Cloning '%s' %s and was stopped; a partial clone may remain at '%s'. Remove it, then sync again.", target, stopped, item.Path)
 					return
@@ -1531,7 +1700,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 			var pullOut bytes.Buffer
 			pullCmd.Stdout = &pullOut
 			pullCmd.Stderr = &pullOut
-			if err := proc.Run(pullCmd); err == nil {
+			if err := runCmd(pullCmd); err == nil {
 				if strings.Contains(pullOut.String(), "Already up to date.") {
 					s.finish(StatusUpToDate, "OK", "󰄬 Successfully pulled '%s'.", defaultBranch)
 				} else {
@@ -1548,7 +1717,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		// Stage untracked files so the stash takes them too. If this fails,
 		// stop: pulling over unprotected untracked files is what the stash
 		// exists to prevent.
-		if out, err := proc.CombinedOutput(proc.Command(ctx, "git", "-C", item.Path, "add", "-A")); err != nil {
+		if out, err := combinedCmd(proc.Command(ctx, "git", "-C", item.Path, "add", "-A")); err != nil {
 			s.finish(StatusError, "Stash Err", "󰅙 git add -A failed, nothing was stashed or pulled: %v %s", err, strings.TrimSpace(string(out)))
 			return
 		}
@@ -1556,7 +1725,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		// restore never touches an entry the user (or another run) made.
 		stashMsg := fmt.Sprintf("freshen auto-stash %s pid %d #%d", time.Now().Format(time.RFC3339Nano), os.Getpid(), autoStashSeq.Add(1))
 		stashCmd := proc.Command(ctx, "git", "-C", item.Path, "stash", "push", "-m", stashMsg)
-		if out, err := proc.CombinedOutput(stashCmd); err != nil {
+		if out, err := combinedCmd(stashCmd); err != nil {
 			s.finish(StatusError, "Stash Err", "󰅙 Failed to stash local changes: %v %s", err, strings.TrimSpace(string(out)))
 			return
 		}
@@ -1599,7 +1768,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		var dirtyPullOut bytes.Buffer
 		pullCmd.Stdout = &dirtyPullOut
 		pullCmd.Stderr = &dirtyPullOut
-		pullErr := proc.Run(pullCmd)
+		pullErr := runCmd(pullCmd)
 
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), CleanupTimeout)
 		defer cleanupCancel()
@@ -1607,7 +1776,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		// sync refused to start with a merge already in progress, so any merge
 		// found here was started by this pull.
 		if pullErr != nil && mergeInProgress(cleanupCtx, item.Path) {
-			if abortOut, abortErr := proc.CombinedOutput(proc.Command(cleanupCtx, "git", "-C", item.Path, "merge", "--abort")); abortErr != nil {
+			if abortOut, abortErr := combinedCmd(proc.Command(cleanupCtx, "git", "-C", item.Path, "merge", "--abort")); abortErr != nil {
 				s.log("󰀪 git merge --abort failed — repository may be left mid-merge: %v %s", abortErr, strings.TrimSpace(string(abortOut)))
 			}
 		}
@@ -1636,7 +1805,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		s.log("󰀪 Feature branch '%s' is clean. Switching the checkout to '%s' (branch '%s' is kept) and running git pull --no-rebase origin %s...", origBranch, defaultBranch, origBranch, defaultBranch)
 
 		coCmd := proc.Command(ctx, "git", "-C", item.Path, "checkout", defaultBranch)
-		if err := proc.Run(coCmd); err != nil {
+		if err := runCmd(coCmd); err != nil {
 			s.finish(StatusError, "Checkout Err", "󰅙 Failed to checkout '%s': %v", defaultBranch, err)
 			return
 		}
@@ -1646,7 +1815,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		var pullOut bytes.Buffer
 		pullCmd.Stdout = &pullOut
 		pullCmd.Stderr = &pullOut
-		if err := proc.Run(pullCmd); err == nil {
+		if err := runCmd(pullCmd); err == nil {
 			s.finish(StatusSwitchedDefault, "Switched", "󰄬 Switched from '%s' to '%s' and pulled.", origBranch, defaultBranch)
 		} else {
 			s.finish(StatusError, "Pull Error", "󰅙 git pull error: %s", pullOut.String())
@@ -1657,7 +1826,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	s.log(" Feature branch '%s' has unstaged changes. Executing git fetch and git rebase origin/%s...", origBranch, defaultBranch)
 
 	// Best-effort: the rebase below still runs against whatever refs are local.
-	if err := proc.Run(proc.Command(ctx, "git", "-C", item.Path, "fetch", "origin")); err != nil {
+	if err := runCmd(proc.Command(ctx, "git", "-C", item.Path, "fetch", "origin")); err != nil {
 		s.log("󰀪 git fetch origin failed (continuing): %v", err)
 	}
 	rebaseTarget := fmt.Sprintf("origin/%s", defaultBranch)
@@ -1669,7 +1838,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	rebaseCmd.Stdout = &rebaseOut
 	rebaseCmd.Stderr = &rebaseOut
 
-	if err := proc.Run(rebaseCmd); err == nil {
+	if err := runCmd(rebaseCmd); err == nil {
 		// A rebase that succeeds but cannot re-apply its autostash still
 		// exits 0; git keeps the changes as a new stash entry and leaves
 		// conflict markers in the tree. Detect that by the entry it adds.
@@ -1696,7 +1865,7 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		// Use a fresh context for the abort so a mid-rebase state isn't left behind
 		// even if the sync itself was cancelled.
 		abortCtx, abortCancel := context.WithTimeout(context.Background(), CleanupTimeout)
-		if abortErr := proc.Run(proc.Command(abortCtx, "git", "-C", item.Path, "rebase", "--abort")); abortErr != nil {
+		if abortErr := runCmd(proc.Command(abortCtx, "git", "-C", item.Path, "rebase", "--abort")); abortErr != nil {
 			s.log("󰀪 git rebase --abort failed — repository may be left mid-rebase: %v", abortErr)
 		}
 		abortCancel()
@@ -1712,7 +1881,7 @@ type stashEntry struct {
 
 // stashEntries lists the stash, newest first.
 func stashEntries(ctx context.Context, path string) ([]stashEntry, error) {
-	out, err := proc.Output(proc.Command(ctx, "git", "-C", path, "stash", "list", "--format=%gd%x00%H%x00%gs"))
+	out, err := outputCmd(proc.Command(ctx, "git", "-C", path, "stash", "list", "--format=%gd%x00%H%x00%gs"))
 	if err != nil {
 		return nil, fmt.Errorf("git stash list: %w", err)
 	}
@@ -1767,7 +1936,7 @@ func restoreStash(ctx context.Context, path, sha string) error {
 	if _, err := stashRefFor(ctx, path, sha); err != nil {
 		return err
 	}
-	if out, err := proc.CombinedOutput(proc.Command(ctx, "git", "-C", path, "stash", "apply", sha)); err != nil {
+	if out, err := combinedCmd(proc.Command(ctx, "git", "-C", path, "stash", "apply", sha)); err != nil {
 		if msg := strings.TrimSpace(string(out)); msg != "" {
 			return fmt.Errorf("%w: %s", err, msg)
 		}
@@ -1778,7 +1947,7 @@ func restoreStash(ctx context.Context, path, sha string) error {
 	if err != nil {
 		return fmt.Errorf("changes re-applied but the stash entry could not be dropped: %w", err)
 	}
-	if out, err := proc.CombinedOutput(proc.Command(ctx, "git", "-C", path, "stash", "drop", ref)); err != nil {
+	if out, err := combinedCmd(proc.Command(ctx, "git", "-C", path, "stash", "drop", ref)); err != nil {
 		return fmt.Errorf("changes re-applied but git stash drop %s failed: %w %s", ref, err, strings.TrimSpace(string(out)))
 	}
 	return nil
@@ -1786,7 +1955,7 @@ func restoreStash(ctx context.Context, path, sha string) error {
 
 // mergeInProgress reports whether the repository has an unfinished merge.
 func mergeInProgress(ctx context.Context, path string) bool {
-	return proc.Run(proc.Command(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD")) == nil
+	return runCmd(proc.Command(ctx, "git", "-C", path, "rev-parse", "-q", "--verify", "MERGE_HEAD")) == nil
 }
 
 // readMergeInProgress is mergeInProgress for a sync's preflight: it has its
@@ -1848,7 +2017,9 @@ func SwitchBranch(ctx context.Context, item *RepoItem, targetBranch string) erro
 	ctx, cancel := context.WithTimeout(ctx, checkoutTimeout)
 	defer cancel()
 	if _, err := runner.Run(ctx, "git", "-C", item.Path, "checkout", targetBranch); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if stillRunning(err) {
+			err = fmt.Errorf("git checkout could not be stopped and may still be running; freshen will not touch %s until it exits, then run git status: %w", item.Path, err)
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
 			err = fmt.Errorf("git checkout was stopped before it finished (%s); run git status before retrying: %w", gitReadFailure(ctxErr), ctxErr)
 		}
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch to branch '%s': %v", targetBranch, err))
@@ -1905,11 +2076,11 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	// add/commit are best-effort: if there's nothing to commit (or the commit
 	// otherwise no-ops), we still want to push whatever's already committed.
 	// Failures are logged rather than swallowed so they aren't invisible.
-	if err := proc.Run(proc.Command(ctx, "git", "-C", item.Path, "add", "-A")); err != nil {
+	if err := runCmd(proc.Command(ctx, "git", "-C", item.Path, "add", "-A")); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git add -A failed (continuing): %v", err))
 	}
 	commitMsg := fmt.Sprintf("WIP: Updates on branch '%s'", branch)
-	if err := proc.Run(proc.Command(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg)); err != nil {
+	if err := runCmd(proc.Command(ctx, "git", "-C", item.Path, "commit", "-m", commitMsg)); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰀪 git commit failed or had nothing to commit (continuing): %v", err))
 	}
 
@@ -1921,7 +2092,7 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	var pushOut bytes.Buffer
 	pushCmd.Stdout = &pushOut
 	pushCmd.Stderr = &pushOut
-	if err := proc.Run(pushCmd); err != nil {
+	if err := runCmd(pushCmd); err != nil {
 		// git reports rejections, auth failures and hook output on stderr; without
 		// capturing it the caller only ever sees "exit status 1".
 		detail := strings.TrimSpace(pushOut.String())
@@ -1945,7 +2116,7 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 		var prOut bytes.Buffer
 		prCmd.Stdout = &prOut
 		prCmd.Stderr = &prOut
-		if err := proc.Run(prCmd); err != nil {
+		if err := runCmd(prCmd); err != nil {
 			item.Logs = append(item.Logs, fmt.Sprintf("󰅙 gh pr create failed: %v — %s", err, strings.TrimSpace(prOut.String())))
 			return fmt.Errorf("gh pr create failed: %w: %s", err, strings.TrimSpace(prOut.String()))
 		}
@@ -1962,7 +2133,7 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 	}
 
 	coCmd := proc.Command(ctx, "git", "-C", item.Path, "checkout", item.DefaultBranch)
-	if err := proc.Run(coCmd); err != nil {
+	if err := runCmd(coCmd); err != nil {
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch back to default branch '%s': %v", item.DefaultBranch, err))
 		return fmt.Errorf("failed to checkout '%s': %w", item.DefaultBranch, err)
 	}
@@ -1983,21 +2154,30 @@ func CloneRepo(org, ghRepoName, targetPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
 	defer cancel()
 	cmd := proc.Command(ctx, "gh", "repo", "clone", fmt.Sprintf("%s/%s", org, ghRepoName), targetPath)
-	return proc.Run(cmd)
+	return runCmd(cmd)
 }
 
 // DeleteLocalRepo removes the local directory for an archived repository. It
-// returns when ctx ends even if the filesystem does not answer; a removal
-// still running then holds path, so nothing else acts on it until it ends.
+// returns when ctx ends even if the filesystem does not answer. A context
+// that has already ended, or ends while the path is being validated, stops
+// the delete before anything is removed; a removal already running then
+// holds path, so nothing else acts on it until it ends.
 func DeleteLocalRepo(ctx context.Context, workspace, path string) error {
-	remove := removeAll
-	return changeBounded(ctx, path, "deleting", func() error {
-		if err := ValidateWorkspacePath(workspace, path); err != nil {
+	remove, validate := removeAll, validateWorkspacePath
+	return changeBounded(ctx, path, "deleting", func(begin func() bool) error {
+		if err := validate(workspace, path); err != nil {
 			return err
+		}
+		if !begin() {
+			return errChangeNotStarted
 		}
 		return remove(path)
 	})
 }
+
+// validateWorkspacePath is the containment check DeleteLocalRepo runs before
+// removing anything; tests swap it to block.
+var validateWorkspacePath = ValidateWorkspacePath
 
 // ValidateWorkspacePath rejects paths outside workspace, including existing symlinks.
 func ValidateWorkspacePath(workspace, path string) error {

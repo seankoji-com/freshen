@@ -193,22 +193,41 @@ var (
 // tests swap it to fail or hang.
 var dirExists = git.DirExists
 
-func localRepoBranches(ctx context.Context, path string) (current, defaultBranch string, ok bool) {
-	if ctx.Err() != nil || !git.IsGitRepoContext(ctx, path) {
-		return "", "", false
+// readLocalCheckout reads each checkout's branches during a refresh; tests
+// swap it to fail or hang.
+var readLocalCheckout = git.ReadLocalCheckout
+
+// keepKnownBranches fills the branches a refresh could not read from the
+// previous record of the same checkout and marks the record stale, so a
+// failed read never blanks a branch the list already knew.
+func keepKnownBranches(item, prev *git.RepoItem) {
+	item.LocalMetadataStale = true
+	if prev == nil {
+		return
 	}
-	current = git.GetOriginalBranch(ctx, path)
-	defaultBranch = git.GetDefaultBranchLocal(ctx, path)
-	if ctx.Err() != nil {
-		return "", "", true
+	if item.CurrentBranch == "" {
+		item.CurrentBranch = prev.CurrentBranch
+		item.OriginalBranch = prev.CurrentBranch
 	}
-	if current == "HEAD" {
-		current = ""
+	if item.DefaultBranch == "" {
+		item.DefaultBranch = prev.DefaultBranch
 	}
-	if defaultBranch == "HEAD" {
-		defaultBranch = ""
+}
+
+// unreadLocalRepo is the record for a workspace directory a refresh could not
+// tell is a checkout and has no earlier record of: listed as unreadable, so
+// nothing acts on it as cloned or not cloned.
+func unreadLocalRepo(name, path string, err error) *git.RepoItem {
+	return &git.RepoItem{
+		Name:               name,
+		Path:               path,
+		CheckoutUnknown:    true,
+		LocalMetadataStale: true,
+		Status:             git.StatusError,
+		StatusMsg:          "Read Err",
+		ErrorErr:           err,
+		Logs:               []string{fmt.Sprintf("Could not read %s: %v; press r to retry.", path, err)},
 	}
-	return current, defaultBranch, true
 }
 
 func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git.RepoItem) tea.Cmd {
@@ -220,17 +239,44 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			if err != nil {
 				return orgSyncedMsg{repos: cloneRepoItems(previous), localErr: err, autoSync: autoSync, generation: generation}
 			}
+			previousByPath := make(map[string]*git.RepoItem, len(previous))
+			for _, item := range previous {
+				previousByPath[item.Path] = item
+			}
 			repos := make([]*git.RepoItem, 0, len(entries))
+			var readFailures []string
 			for _, name := range entries {
 				if localCtx.Err() != nil {
 					break
 				}
 				path := filepath.Join(m.TargetDir, name)
-				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
-					repos = append(repos, &git.RepoItem{Name: name, Path: path, CurrentBranch: current, OriginalBranch: current, DefaultBranch: defaultBranch, Status: git.StatusPending, Logs: []string{}})
+				checkout, readErr := readLocalCheckout(localCtx, path)
+				if localCtx.Err() != nil {
+					break
+				}
+				if readErr != nil {
+					readFailures = append(readFailures, fmt.Sprintf("%s: %v", name, readErr))
+				}
+				switch {
+				case readErr != nil && !checkout.IsRepo:
+					// An earlier record comes back through appendMissingRepos.
+					if previousByPath[path] == nil {
+						repos = append(repos, unreadLocalRepo(name, path, readErr))
+					}
+				case checkout.IsRepo:
+					item := &git.RepoItem{Name: name, Path: path, CurrentBranch: checkout.CurrentBranch, OriginalBranch: checkout.CurrentBranch, DefaultBranch: checkout.DefaultBranch, Status: git.StatusPending, Logs: []string{}}
+					if readErr != nil {
+						keepKnownBranches(item, previousByPath[path])
+					}
+					repos = append(repos, item)
 				}
 			}
 			if err := localCtx.Err(); err != nil {
+				return orgSyncedMsg{repos: appendMissingRepos(repos, previous), localErr: err, autoSync: autoSync, generation: generation}
+			}
+			if len(readFailures) > 0 {
+				slog.Warn("could not check local checkouts", "failures", readFailures)
+				err := fmt.Errorf("could not check %d local checkouts: %s", len(readFailures), strings.Join(readFailures, "; "))
 				return orgSyncedMsg{repos: appendMissingRepos(repos, previous), localErr: err, autoSync: autoSync, generation: generation}
 			}
 			return orgSyncedMsg{repos: repos, autoSync: false, generation: generation}
@@ -275,11 +321,11 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			}
 			localPath := filepath.Join(m.TargetDir, localDir)
 
-			localExists, probeErr := dirExists(localCtx, localPath)
-			if probeErr != nil {
-				// Could not tell whether the checkout exists: keep what the
-				// last refresh knew, or list the repository as unreadable,
-				// rather than report it not cloned or drop an archived one.
+			// Could not tell whether the checkout exists, or whether the
+			// directory is one: keep what the last refresh knew, or list the
+			// repository as unreadable, rather than report it not cloned or
+			// drop an archived one.
+			keepUnprobed := func(probeErr error) {
 				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, probeErr))
 				item := unprobedRepo(previousByPath[localPath], ghRepo, localDir, localPath, probeErr)
 				if counts, found := orgCounts[ghRepo.Name]; found {
@@ -290,7 +336,20 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 					item.CountsUpdatedAt = countsFetchedAt
 				}
 				repoMap[localDir] = item
+			}
+			localExists, probeErr := dirExists(localCtx, localPath)
+			if probeErr != nil {
+				keepUnprobed(probeErr)
 				continue
+			}
+			var checkout git.LocalCheckout
+			var readErr error
+			if localExists {
+				checkout, readErr = readLocalCheckout(localCtx, localPath)
+				if readErr != nil && !checkout.IsRepo {
+					keepUnprobed(readErr)
+					continue
+				}
 			}
 
 			if ghRepo.IsArchived && !localExists {
@@ -308,10 +367,14 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 				Logs:       make([]string, 0),
 			}
 
-			if current, defaultBranch, ok := localRepoBranches(localCtx, localPath); ok {
-				item.CurrentBranch = current
-				item.OriginalBranch = current
-				item.DefaultBranch = defaultBranch
+			if checkout.IsRepo {
+				item.CurrentBranch = checkout.CurrentBranch
+				item.OriginalBranch = checkout.CurrentBranch
+				item.DefaultBranch = checkout.DefaultBranch
+				if readErr != nil {
+					probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, readErr))
+					keepKnownBranches(item, previousByPath[localPath])
+				}
 			}
 
 			if counts, found := orgCounts[ghRepo.Name]; found {
@@ -333,31 +396,50 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			if localCtx.Err() != nil {
 				break
 			}
-			if _, exists := repoMap[name]; !exists {
-				path := filepath.Join(m.TargetDir, name)
-				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
-					item := &git.RepoItem{
-						Name:           name,
-						GHRepoName:     git.GetGHRepoName(name),
-						Path:           path,
-						URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch:  current,
-						DefaultBranch:  defaultBranch,
-						OriginalBranch: current,
-						Status:         git.StatusPending,
-						Logs:           make([]string, 0),
+			if _, exists := repoMap[name]; exists {
+				continue
+			}
+			path := filepath.Join(m.TargetDir, name)
+			checkout, readErr := readLocalCheckout(localCtx, path)
+			if localCtx.Err() != nil {
+				break
+			}
+			if readErr != nil {
+				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", name, readErr))
+				if !checkout.IsRepo {
+					// An earlier record comes back through appendMissingRepos.
+					if previousByPath[path] == nil {
+						repoMap[name] = unreadLocalRepo(name, path, readErr)
 					}
-
-					if counts, found := orgCounts[item.GHRepoName]; found {
-						item.OpenIssuesCount = counts.Issues
-						item.OpenPRsCount = counts.PRs
-						item.HasLoadedCounts = true
-						item.CountsUpdatedAt = countsFetchedAt
-					}
-
-					repoMap[name] = item
+					continue
 				}
 			}
+			if !checkout.IsRepo {
+				continue
+			}
+			item := &git.RepoItem{
+				Name:           name,
+				GHRepoName:     git.GetGHRepoName(name),
+				Path:           path,
+				URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
+				CurrentBranch:  checkout.CurrentBranch,
+				DefaultBranch:  checkout.DefaultBranch,
+				OriginalBranch: checkout.CurrentBranch,
+				Status:         git.StatusPending,
+				Logs:           make([]string, 0),
+			}
+			if readErr != nil {
+				keepKnownBranches(item, previousByPath[path])
+			}
+
+			if counts, found := orgCounts[item.GHRepoName]; found {
+				item.OpenIssuesCount = counts.Issues
+				item.OpenPRsCount = counts.PRs
+				item.HasLoadedCounts = true
+				item.CountsUpdatedAt = countsFetchedAt
+			}
+
+			repoMap[name] = item
 		}
 		if err := localCtx.Err(); err != nil && localErr == nil {
 			localErr = err

@@ -436,3 +436,44 @@ func TestSyncStopsHungClone(t *testing.T) {
 		t.Fatalf("stopped clone not reported: %q", last)
 	}
 }
+
+// ReadLocalCheckout tells "not a checkout" from "could not tell", and names
+// each branch read that failed instead of returning a placeholder.
+func TestReadLocalCheckoutReportsFailedReads(t *testing.T) {
+	f := newSyncFixture(t)
+	ctx := context.Background()
+	if got, err := ReadLocalCheckout(ctx, filepath.Join(t.TempDir(), "missing")); err != nil || got.IsRepo {
+		t.Fatalf("missing path: %+v %v", got, err)
+	}
+	if got, err := ReadLocalCheckout(ctx, t.TempDir()); err != nil || got.IsRepo {
+		t.Fatalf("plain directory: %+v %v", got, err)
+	}
+	if got, err := ReadLocalCheckout(ctx, f.work); err != nil || got != (LocalCheckout{IsRepo: true, CurrentBranch: "main", DefaultBranch: "main"}) {
+		t.Fatalf("checkout: %+v %v", got, err)
+	}
+
+	t.Run("checkout check fails", func(t *testing.T) {
+		runnerBlocksOn(t, true, hasArgs("--is-inside-work-tree"))
+		got, err := ReadLocalCheckout(ctx, f.work)
+		if err == nil || got != (LocalCheckout{}) || !strings.Contains(err.Error(), "could not tell whether it is a checkout") {
+			t.Fatalf("got %+v %v", got, err)
+		}
+	})
+	t.Run("current branch fails", func(t *testing.T) {
+		runnerBlocksOn(t, true, func(args []string) bool {
+			return slices.Contains(args, "symbolic-ref") && slices.Contains(args, "--short") || slices.Contains(args, "rev-parse") && slices.Contains(args, "--short")
+		})
+		got, err := ReadLocalCheckout(ctx, f.work)
+		if err == nil || !got.IsRepo || got.CurrentBranch != "" || got.DefaultBranch != "main" || !strings.Contains(err.Error(), "checked-out branch") {
+			t.Fatalf("got %+v %v", got, err)
+		}
+	})
+	t.Run("every branch read fails", func(t *testing.T) {
+		runnerBlocksOn(t, true, func(args []string) bool { return !slices.Contains(args, "--is-inside-work-tree") })
+		got, err := ReadLocalCheckout(ctx, f.work)
+		if err == nil || !got.IsRepo || got.CurrentBranch != "" || got.DefaultBranch != "" ||
+			!strings.Contains(err.Error(), "checked-out branch") || !strings.Contains(err.Error(), "default branch") {
+			t.Fatalf("got %+v %v", got, err)
+		}
+	})
+}

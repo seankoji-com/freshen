@@ -9,3 +9,5 @@ import "os/exec"
 func ownProcessGroup(*exec.Cmd) {}
 
 func groupAlive(int) bool { return false }
+
+var stopGroup = func(int) error { return nil }

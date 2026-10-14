@@ -9,8 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -836,7 +838,9 @@ func TestCancelledContextRunsNoGHCommand(t *testing.T) {
 
 // A gh whose helper keeps stdout open after gh exits cannot hold a runner,
 // job or log request: the call returns once WaitDelay passes, with gh's own
-// output, and gh's exit status deciding the result.
+// output, and gh's exit status deciding the result. The helper outlives the
+// call's bound by far, so returning at all proves the bound, whatever the
+// scheduler's delays; and the helper is stopped with gh.
 func TestGHCommandBoundsHeldOutput(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the gh wrapper is a POSIX shell script")
@@ -846,7 +850,8 @@ func TestGHCommandBoundsHeldOutput(t *testing.T) {
 		t.Skip("sleep not available")
 	}
 	bin := t.TempDir()
-	script := "#!/bin/sh\n" + sleep + " 3 &\necho '{\"ok\":true}'\n"
+	pidFile := filepath.Join(bin, "helper.pid")
+	script := "#!/bin/sh\n" + sleep + " 120 &\necho $! > '" + pidFile + "'\necho '{\"ok\":true}'\n"
 	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -855,12 +860,34 @@ func TestGHCommandBoundsHeldOutput(t *testing.T) {
 	proc.WaitDelay = 200 * time.Millisecond
 	t.Cleanup(func() { proc.WaitDelay = original })
 
-	start := time.Now()
-	out, err := defaultRunGHCommand(context.Background(), "api", "anything")
-	if waited := time.Since(start); waited > 2*time.Second {
-		t.Fatalf("gh call waited %s for the process holding its output", waited)
+	type result struct {
+		out []byte
+		err error
 	}
-	if err != nil || strings.TrimSpace(string(out)) != `{"ok":true}` {
-		t.Fatalf("gh call returned %q, %v", out, err)
+	returned := make(chan result, 1)
+	go func() {
+		out, err := defaultRunGHCommand(context.Background(), "api", "anything")
+		returned <- result{out, err}
+	}()
+	var got result
+	select {
+	case got = <-returned:
+	case <-time.After(60 * time.Second):
+		t.Fatal("gh call waited for the process holding its output")
+	}
+	if got.err != nil || strings.TrimSpace(string(got.out)) != `{"ok":true}` {
+		t.Fatalf("gh call returned %q, %v", got.out, got.err)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := os.FindProcess(pid); err == nil && p.Signal(syscall.Signal(0)) == nil {
+		_ = p.Kill()
+		t.Fatalf("the helper holding gh's output (pid %d) outlived the call", pid)
 	}
 }

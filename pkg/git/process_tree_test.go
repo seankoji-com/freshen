@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,12 +53,14 @@ func shortWaitDelay(t *testing.T) {
 func TestBranchReadsBoundHeldOutput(t *testing.T) {
 	f := newSyncFixture(t)
 	shortWaitDelay(t)
-	wrapCommands(t, map[string]string{"git": `"$SLEEP" 3 &
+	// The child outlives any plausible scheduling delay by far, so the
+	// bound below separates waiting for it from a slow machine.
+	wrapCommands(t, map[string]string{"git": `"$SLEEP" 60 &
 exec "$REAL_GIT" "$@"`})
 
 	start := time.Now()
 	details := GetRepoBranchDetails(context.Background(), f.work, "main")
-	if waited := time.Since(start); waited > 2500*time.Millisecond {
+	if waited := time.Since(start); waited > 30*time.Second {
 		t.Fatalf("three reads took %s; each waited for the child holding stdout", waited)
 	}
 	if details.BranchesErr != "" || details.WorktreesErr != "" || details.StatusErr != "" {
@@ -75,7 +78,7 @@ func TestSyncPullBoundsHeldOutput(t *testing.T) {
 	f.pushUpstream()
 	shortWaitDelay(t)
 	runnerBlocksOn(t, false, func([]string) bool { return false })
-	wrapCommands(t, map[string]string{"git": `if [ "$3" = pull ]; then "$SLEEP" 3 & fi
+	wrapCommands(t, map[string]string{"git": `if [ "$3" = pull ]; then "$SLEEP" 60 & fi
 exec "$REAL_GIT" "$@"`})
 
 	done := make(chan *RepoItem, 1)
@@ -83,7 +86,7 @@ exec "$REAL_GIT" "$@"`})
 	var item *RepoItem
 	select {
 	case item = <-done:
-	case <-time.After(2500 * time.Millisecond):
+	case <-time.After(30 * time.Second):
 		t.Fatal("sync waited for the process holding the pull's output")
 	}
 	if item.Status != StatusUpdated {
@@ -330,5 +333,187 @@ func TestDirExistsTellsMissingFromFailed(t *testing.T) {
 	}
 	if waited := time.Since(start); waited > 5*time.Second {
 		t.Fatalf("hung probe took %s", waited)
+	}
+}
+
+// A delete whose context has already ended, or ends while the path is still
+// being validated, removes nothing: it reports that it was not started, and a
+// validation that finishes after the deadline cannot start the removal.
+func TestCancelledDeleteNeverStartsRemoval(t *testing.T) {
+	newArchived := func(t *testing.T) (workspace, path string) {
+		workspace = t.TempDir()
+		path = filepath.Join(workspace, "archived")
+		if err := os.Mkdir(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return workspace, path
+	}
+	var removed []string
+	originalRemove := removeAll
+	removeAll = func(p string) error {
+		removed = append(removed, p)
+		return originalRemove(p)
+	}
+	t.Cleanup(func() { removeAll = originalRemove })
+
+	t.Run("already cancelled", func(t *testing.T) {
+		removed = nil
+		workspace, path := newArchived(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := DeleteLocalRepo(ctx, workspace, path)
+		if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "nothing was changed") {
+			t.Fatalf("cancelled delete returned %v", err)
+		}
+		// A worker that was started anyway holds the path until it returns;
+		// wait for that before checking it removed nothing.
+		deadline := time.Now().Add(5 * time.Second)
+		for checkUnfinished(path) != nil {
+			if time.Now().After(deadline) {
+				t.Fatal("the path stayed held")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if len(removed) != 0 {
+			t.Fatalf("a cancelled delete started removing %v", removed)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("the directory is gone: %v", err)
+		}
+	})
+
+	t.Run("validation outlives the deadline", func(t *testing.T) {
+		removed = nil
+		workspace, path := newArchived(t)
+		release := make(chan struct{})
+		validated := make(chan struct{})
+		originalValidate := validateWorkspacePath
+		validateWorkspacePath = func(w, p string) error {
+			<-release
+			defer close(validated)
+			return originalValidate(w, p)
+		}
+		t.Cleanup(func() { validateWorkspacePath = originalValidate })
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		err := DeleteLocalRepo(ctx, workspace, path)
+		if err == nil || errors.Is(err, ErrUnfinishedChange) || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "nothing was changed") {
+			t.Fatalf("delete stopped during validation returned %v", err)
+		}
+		// The validation is still reading, so the path stays held until it
+		// returns; nothing may act on it meanwhile.
+		if checkUnfinished(path) == nil {
+			t.Fatal("the path was not held while validation still ran")
+		}
+		close(release)
+		<-validated
+		deadline := time.Now().Add(5 * time.Second)
+		for checkUnfinished(path) != nil {
+			if time.Now().After(deadline) {
+				t.Fatal("the path stayed held after validation returned")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if len(removed) != 0 {
+			t.Fatalf("validation that finished after the deadline started removing %v", removed)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("the directory is gone: %v", err)
+		}
+	})
+}
+
+// A checkout the kernel never lets exit, which no kill can end, still returns
+// the switch soon after its deadline. The checkout's path stays held until
+// the process is finally reaped: a sync refuses it and no other git command,
+// not even a read, starts on it meanwhile.
+func TestUnreapableCheckoutHoldsThePath(t *testing.T) {
+	f := newSyncFixture(t)
+	runGit(t, f.work, "branch", "feature")
+	shortWaitDelay(t)
+	originalReap := proc.ReapTimeout
+	proc.ReapTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { proc.ReapTimeout = originalReap })
+	release := make(chan struct{})
+	restore := proc.BlockReaping(func(args []string) bool { return slices.Contains(args, "checkout") }, release, 100*time.Millisecond)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		restore()
+	})
+
+	item := &RepoItem{Name: "work", Path: f.work, CurrentBranch: "main", DefaultBranch: "main"}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { returned <- SwitchBranch(ctx, item, "feature") }()
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch waited for a checkout that could not be reaped")
+	}
+	if !errors.Is(err, proc.ErrSurvived) || !strings.Contains(err.Error(), "may still be running") {
+		t.Fatalf("SwitchBranch() = %v", err)
+	}
+	if held := checkUnfinished(f.work); held == nil || !strings.Contains(held.Error(), "git checkout") {
+		t.Fatalf("the checkout's path is not held: %v", held)
+	}
+	synced := item.Clone()
+	SyncRepository(context.Background(), synced, nil, false)
+	if synced.StatusMsg != "Busy" {
+		t.Fatalf("sync on the held path: %s %q %v", synced.Status, synced.StatusMsg, synced.Logs)
+	}
+	details := GetRepoBranchDetails(context.Background(), f.work, "main")
+	if !strings.Contains(details.BranchesErr, "has not finished") {
+		t.Fatalf("a read started on the held path: %+v", details)
+	}
+
+	released = true
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for checkUnfinished(f.work) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the path stayed held after the checkout was reaped")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A gh clone that fails while a git it started keeps writing has that git
+// stopped before the git fallback runs, so the fallback never races it on the
+// same path.
+func TestFailedGhCloneStopsItsChildBeforeFallback(t *testing.T) {
+	wrapCommands(t, map[string]string{
+		"gh": `mkdir -p "$4"
+( while :; do echo x >> "$4/marker"; "$SLEEP" 0.02; done ) </dev/null >/dev/null 2>&1 &
+while [ ! -s "$4/marker" ]; do "$SLEEP" 0.01; done
+exit 1`,
+		"git": `if [ "$1" = clone ]; then
+  a=$(wc -c < "$3/marker"); "$SLEEP" 0.3; b=$(wc -c < "$3/marker")
+  echo "$a $b" > "$3.fallback"; exit 1
+fi
+exec "$REAL_GIT" "$@"`,
+	})
+	path := filepath.Join(t.TempDir(), "fresh")
+	item := &RepoItem{Name: "fresh", GHRepoName: "fresh", URL: "https://example.invalid/fresh.git", Path: path, IsNew: true}
+	SyncRepository(context.Background(), item, nil, false)
+	if item.Status != StatusError || !strings.Contains(item.Logs[len(item.Logs)-1], "Failed to clone") {
+		t.Fatalf("sync status %s %q; logs: %v", item.Status, item.StatusMsg, item.Logs)
+	}
+	raw, err := os.ReadFile(path + ".fallback")
+	if err != nil {
+		t.Fatalf("the git fallback did not run: %v", err)
+	}
+	sizes := strings.Fields(string(raw))
+	if len(sizes) != 2 || sizes[0] == "0" || sizes[0] != sizes[1] {
+		t.Fatalf("the clone's child kept writing while the fallback ran: marker sizes %q", raw)
+	}
+	if err := checkUnfinished(path); err != nil {
+		t.Fatalf("a fully stopped clone still holds its path: %v", err)
 	}
 }

@@ -515,9 +515,9 @@ func TestLocalRepoBranchesDiscardExpiredContextSentinels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	current, defaultBranch, ok := localRepoBranches(ctx, t.TempDir())
-	if ok || current != "" || defaultBranch != "" {
-		t.Fatalf("expired branch lookup leaked values into the model: current=%q default=%q ok=%v", current, defaultBranch, ok)
+	checkout, err := readLocalCheckout(ctx, t.TempDir())
+	if err == nil || checkout != (git.LocalCheckout{}) {
+		t.Fatalf("expired branch lookup leaked values into the model: %+v err=%v", checkout, err)
 	}
 }
 
