@@ -1,0 +1,22 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "scripts": [
+    {
+      "name": "Setup Worktree",
+      "command": "node \"$HOME/.local/bin/t3-setup-worktree.mjs\"",
+      "icon": "configure",
+      "runOnWorktreeCreate": true,
+      "async": true
+    },
+    {
+      "name": "Tests",
+      "command": "make test",
+      "icon": "test"
+    },
+    {
+      "name": "Lint",
+      "command": "make lint",
+      "icon": "lint"
+    }
+  ]
+}
