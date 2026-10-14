@@ -70,6 +70,10 @@ Reviewed on 13 October 2026 against `f324ced`.
 | An organization refresh probed each checkout with an unbounded `os.Stat`, and a failed probe made a repository "not cloned" or dropped an archived one | The probe has a deadline and tells missing from unreadable; an unreadable checkout keeps its earlier record or shows "Read Err" with no delete or clone offered |
 | Prune's worktree probes, a clone's directory creation and the archived-repo delete ran with no deadline | Each is bounded; a filesystem change that outlives its deadline holds its path, and every repository operation refuses that path until the change ends |
 | A finished clone kept showing "not cloned" and offering only Clone until the next refresh; a failed post-clone branch read showed as branch `HEAD` | Snapshots carry `IsNew`; unread branches stay unresolved with a "Branch unread" status and a refresh hint |
+| A command blocked in the kernel, which no signal ends, held `proc.Run` (and so `BusyAction` or `IsSyncing`) indefinitely, because `exec.Cmd.Wait` blocks until the process is reaped | `proc.Run` stops waiting shortly after the context ends and returns a `StillRunningError`; the command's path stays held, and no command starts on it, until the process is reaped |
+| A command's leftover children outlived it: a held-output timeout counted as success without stopping them, and a `gh repo clone` that failed while its `git` kept writing went straight to the `git clone` fallback on the same path | When a command exits, `proc.Run` kills what is left of its group before returning; a survivor holds the path. The fallback runs only once gh's children are gone |
+| A cancelled archived-repo delete could still start: the worker launched without checking the context, and a path validation that finished after the deadline went on to `os.RemoveAll` | The delete refuses an ended context, and a start gate decides once whether the removal begins or the caller gave up; a stopped delete removes nothing and says so |
+| Refresh discarded git read failures: a failed checkout check dropped a known repository (local-only) or read as "not a checkout", and failed branch reads blanked known branches with no warning | `git.ReadLocalCheckout` returns its failures; the refresh keeps the previous record or branch, marks it stale, lists unknown directories as "Read Err" and reports incomplete local metadata |
 
 ## Verification
 
@@ -101,14 +105,25 @@ a late refresh after a switch or sync, a branch-changing refresh re-reading the
 open detail, the unread-details message, and hung switch, push and prune
 actions stopped with their finished steps kept.
 `pkg/proc/proc_test.go` runs real subprocesses: a child holding stdout cannot
-hold `Wait` past `WaitDelay`, and after cancellation a child the command left
-writing stops. `pkg/git/process_tree_test.go` repeats this through freshen's
+hold `Wait` past `WaitDelay` and is stopped with the command, after
+cancellation or after the command exits (with status 0 or not) a child the
+command left writing stops, a leftover that survives the kill is reported with
+a `Done` channel, and a command that cannot be reaped (`proc.BlockReaping`
+stands in for a process blocked in the kernel) returns soon after its deadline
+with readable output. `pkg/git/process_tree_test.go` repeats this through freshen's
 own paths (branch reads and a sync pull with a hook holding the pipes, a stopped
 clone whose child was writing into the checkout), and covers a hung delete
 holding its path against sync, switch, push, prune and delete, a hung clone
-directory, `DirExists`, and post-clone branch-read failures.
-`pkg/tui/refresh_probe_test.go` covers failed and hung refresh probes and a
-clone snapshot followed by an older refresh. `pkg/jobs` tests count `gh`
+directory, `DirExists`, and post-clone branch-read failures. It also covers a
+checkout that cannot be reaped (the switch returns, its path is held against a
+sync and against reads, and released once reaped), a failed `gh repo clone`
+whose writing child is stopped before the `git clone` fallback, and a
+cancelled delete, or one whose validation outlives the deadline, removing
+nothing. `TestUnreapableSwitchFreesTheRepository` in
+`pkg/tui/branch_state_test.go` shows the same switch clearing `BusyAction`.
+`pkg/tui/refresh_probe_test.go` covers failed and hung refresh probes, failed
+checkout, current-branch and default-branch reads in organization and
+local-only refreshes, and a clone snapshot followed by an older refresh. `pkg/jobs` tests count `gh`
 requests for log refreshes, prove a slow multi-page fallback ends at the request
 deadline, and run a `gh` whose child holds its output.
 

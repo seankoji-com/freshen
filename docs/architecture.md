@@ -7,7 +7,7 @@ GitHub operations use the authenticated `gh` CLI; repository operations use `git
 |---|---|
 | `pkg/git/git.go` | Repository discovery, clone/sync, branches, worktrees and PR operations |
 | `pkg/jobs/jobs.go` | Typed workflow runs/jobs/steps, polling, result mapping and logs |
-| `pkg/proc/` | Starts every `git` and `gh` command: `WaitDelay`, own process group, group kill on cancel |
+| `pkg/proc/` | Starts every `git` and `gh` command: `WaitDelay`, own process group, group kill on cancel and after exit, a bounded wait for commands that cannot be reaped |
 | `pkg/tui/model.go` | Model, messages and polling constants |
 | `pkg/tui/theme.go` | The only palette and style definitions; status kinds, glyphs and labels; `NO_COLOR` |
 | `pkg/tui/keymap.go` | Every key binding, enabled per context; footer hints and help-overlay groups |
@@ -124,22 +124,46 @@ Every `git` and `gh` command in `pkg/git` and `pkg/jobs` starts through
 keeps stdout or stderr open after the command exits cannot hold `Wait`;
 `proc.Run`, `proc.Output` and `proc.CombinedOutput` then let the exit status
 decide success, because the command's own output was already read. On Unix the
-command runs in its own process group: cancelling kills the whole group,
-including the `git` a `gh repo clone` starts, and `Wait` returns only once the
-group has exited or `proc.ReapTimeout` (5 seconds) has passed. On Windows,
+command runs in its own process group. Cancelling kills the whole group,
+including the `git` a `gh repo clone` starts, and waits up to
+`proc.ReapTimeout` (5 seconds) for it to empty. When the command exits on its
+own, successfully or not, `proc.Run` kills whatever is left of its group the
+same way before returning, so no process a command started outlives it: a `gh
+repo clone` that fails while its `git` child keeps writing has that child
+stopped before the `git clone` fallback runs. `proc.Run` also stops waiting
+`ReapTimeout`+`WaitDelay`+1 second after the context ends, even if the command
+has not been reaped (a process blocked in the kernel on a hung mount ignores
+SIGKILL, and `exec.Cmd.Wait` would block on it); output written after that is
+discarded, so the caller reads its buffers safely. In both cases, a command
+that cannot be stopped, or a leftover that survives the kill, returns a
+`*proc.StillRunningError` (`errors.Is(err, proc.ErrSurvived)`) whose `Done`
+channel closes once the command is reaped and its group is empty. On Windows,
 cancelling kills the command itself and `WaitDelay` still applies.
+
+`pkg/git` runs commands through `runCmd`/`outputCmd`/`combinedCmd`, which
+know the path a command acts on (`git -C <path>`, a clone's destination, or
+the working directory). A `StillRunningError` holds that path
+(`ErrUnfinishedChange`) until `Done` closes, and no command starts on a held
+path, not even a read. So a sync, switch, push or prune whose command could not
+be stopped returns at its deadline, clears `IsSyncing`/`BusyAction`, and its
+log says the command "may still be running"; until the process exits, sync,
+switch, push, prune, clone, delete and branch reads on that path (or any path
+inside or above it) refuse with "may still be running" rather than act
+alongside it.
 
 Filesystem changes have deadlines too. Creating a clone's parent directory
 shares the clone's `cloneTimeout`; the delete validates and removes the path
 under the action's deadline; prune's worktree probes each get
 `branchReadTimeout`. Go cannot interrupt a blocked filesystem call, so a change
-that outlives its deadline keeps running in the background. Its path is then
-held (`ErrUnfinishedChange`) until the change ends: sync, switch, push, prune,
-clone and delete refuse that path, and any path inside or above it, with
-"may still be running". A stopped clone whose process group still has a
-member after the kill holds its path the same way. A git process blocked in
-the kernel on a hung mount cannot be killed by any signal; the hold is what
-keeps freshen from acting on that path in the meantime.
+that outlives its deadline keeps running in the background and its path is
+held the same way until it ends. A change only starts while its context is
+live: `changeBounded` refuses a context that has already ended, and a change
+calls a start gate immediately before its first write. The caller's deadline
+and the gate decide once which comes first, so the archived-repository delete
+never starts `os.RemoveAll` after the action has reported it stopped: a
+cancelled delete, or one whose path validation finishes after the deadline,
+reports "nothing was changed" and removes nothing (the path stays held only
+while validation is still reading).
 
 A sync re-reads branches, worktrees and changed files after its last change, so
 its final snapshot describes the checkout it left (for example `main` checked
@@ -170,8 +194,16 @@ the status reads "Branch unread" and the log asks for a refresh; prune and
 publish refuse an unresolved default branch.
 
 An organization refresh probes each checkout with `git.DirExists` under its own
-deadline. A missing path means "not cloned"; a probe that fails or gets no
-answer does not. The repository keeps its earlier record, marked stale, or, with
+deadline, then reads an existing one with `git.ReadLocalCheckout` (checkout
+check, current branch and local default branch, each under
+`branchReadTimeout`). A missing path means "not cloned" and runs no `git`; a
+probe or checkout check that fails or gets no answer does not mean absent, and
+a branch read that fails never blanks a known branch: the repository keeps the
+previous branch, is marked stale, raises no "branch changed" toast, and the
+failure is reported as incomplete local metadata. The local-only refresh (no
+organization) does the same, so an ordinary git failure no longer drops a known
+repository from the list; an unreadable directory with no earlier record is
+listed as "Read Err". The repository keeps its earlier record, marked stale, or, with
 none, is listed as "Read Err" with `CheckoutUnknown` set: an archived one is not
 dropped and offers no delete, and an active one offers only a sync, which
 probes again before it clones or pulls. The refresh reports the failures as
