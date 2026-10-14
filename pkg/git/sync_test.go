@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -202,6 +203,15 @@ func TestSyncCleanFeatureBranchSurfacesTheSwitch(t *testing.T) {
 	joined := strings.Join(item.Logs, "\n")
 	if !strings.Contains(joined, "Switching the checkout to 'main'") || !strings.Contains(joined, "Switched from 'feature' to 'main'") {
 		t.Errorf("branch switch not surfaced in logs:\n%s", joined)
+	}
+	// The final snapshot's branch details describe the checkout after the
+	// switch, not before it.
+	details := item.BranchDetails
+	if item.CurrentBranch != "main" || !slices.Contains(details.LocalBranches, "* main") || slices.Contains(details.LocalBranches, "* feature") {
+		t.Errorf("branches read before the switch: current=%q %v", item.CurrentBranch, details.LocalBranches)
+	}
+	if len(details.Worktrees) == 0 || !strings.HasSuffix(details.Worktrees[0], "[main]") {
+		t.Errorf("worktrees read before the switch: %v", details.Worktrees)
 	}
 }
 

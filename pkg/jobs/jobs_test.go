@@ -1,12 +1,22 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/proc"
 )
 
 func mustJSON(t *testing.T, v any) []byte {
@@ -170,7 +180,7 @@ func stubGH(t *testing.T, handler func(path string) ([]byte, error)) {
 	original := runGH
 	t.Cleanup(func() { runGH = original })
 
-	runGH = func(args ...string) ([]byte, error) {
+	runGH = func(_ context.Context, args ...string) ([]byte, error) {
 		return handler(args[len(args)-1])
 	}
 }
@@ -635,6 +645,8 @@ func TestRunJobPaginationAndExactLogIdentity(t *testing.T) {
 			return mustJSON(t, GHJobsResponse{TotalCount: 51, Jobs: []GHJobInfo{{ID: 51, Name: "last"}}}), nil
 		case strings.Contains(path, "/runs/10/jobs"):
 			return mustJSON(t, first), nil
+		case strings.Contains(path, "/jobs/99/logs"):
+			return nil, fmt.Errorf("HTTP 404: Not Found")
 		default:
 			t.Errorf("unexpected request %s", path)
 			return nil, fmt.Errorf("unexpected request")
@@ -717,5 +729,165 @@ func TestExtraStatusFailureRetainsRecentPage(t *testing.T) {
 	partial, ok := err.(*QueueFetchError)
 	if !ok || !partial.Partial || len(queue) != 30 {
 		t.Fatalf("lost partial page: %d %v", len(queue), err)
+	}
+}
+
+// A log refresh for a job whose ID is known costs one request: the jobs list is
+// not re-fetched merely to confirm the ID. Before, every 10-second refresh of a
+// running job's log made at least two calls.
+func TestKnownJobLogRefreshMakesOneRequest(t *testing.T) {
+	var calls []string
+	stubGH(t, func(path string) ([]byte, error) {
+		calls = append(calls, path)
+		if strings.Contains(path, "/actions/jobs/7/logs") {
+			return []byte("one\ntwo\n"), nil
+		}
+		return mustJSON(t, GHJobsResponse{TotalCount: 1, Jobs: []GHJobInfo{{ID: 7, Name: "build"}}}), nil
+	})
+	lines, id, err := FetchJobLogs("org", "repo", 3, 7, "build", 10)
+	if err != nil || id != 7 || len(lines) != 2 {
+		t.Fatalf("direct log fetch: %v %d %v", lines, id, err)
+	}
+	if len(calls) != 1 || !strings.Contains(calls[0], "/actions/jobs/7/logs") {
+		t.Fatalf("known job ID made %d requests, want 1: %v", len(calls), calls)
+	}
+}
+
+// When GitHub withholds a known job's log, the jobs list is fetched once for the
+// step-status fallback and the log is not requested a second time.
+func TestWithheldKnownJobLogFallsBackWithoutRetrying(t *testing.T) {
+	var calls []string
+	stubGH(t, func(path string) ([]byte, error) {
+		calls = append(calls, path)
+		if strings.Contains(path, "/logs") {
+			return nil, errors.New("HTTP 404")
+		}
+		return mustJSON(t, GHJobsResponse{TotalCount: 1, Jobs: []GHJobInfo{{ID: 7, Name: "build", Status: "in_progress", Steps: []GHJobStep{{Number: 1, Name: "checkout", Status: "completed", Conclusion: "success"}}}}}), nil
+	})
+	lines, id, err := FetchJobLogs("org", "repo", 3, 7, "build", 10)
+	if err != nil || id != 7 || len(lines) != 2 || !strings.Contains(lines[1], "checkout") {
+		t.Fatalf("fallback: %v %d %v", lines, id, err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("withheld log made %d requests, want 2 (log, jobs list): %v", len(calls), calls)
+	}
+}
+
+// A withheld log's fallback can take several gh calls (the download, then each
+// jobs-list page). They share the caller's context, so its deadline bounds the
+// whole request: a slow page is cut off when the deadline passes and no later
+// page is requested.
+func TestLogFallbackSharesOneDeadline(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	original := runGH
+	t.Cleanup(func() { runGH = original })
+	runGH = func(ctx context.Context, args ...string) ([]byte, error) {
+		path := args[len(args)-1]
+		mu.Lock()
+		calls = append(calls, path)
+		mu.Unlock()
+		switch {
+		case strings.Contains(path, "/logs"):
+			return nil, errors.New("HTTP 404")
+		case !strings.Contains(path, "&page="):
+			page := GHJobsResponse{TotalCount: 3 * jobsPageSize}
+			for i := 0; i < jobsPageSize; i++ {
+				page.Jobs = append(page.Jobs, GHJobInfo{ID: int64(100 + i), Name: fmt.Sprintf("shard %d", i)})
+			}
+			return mustJSON(t, page), nil
+		default: // page 2 is slow; only the request deadline ends it
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := FetchJobLogsContext(ctx, "org", "repo", 3, 7, "build", 10)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("slow fallback err = %v, want the request deadline", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("request outlived its deadline by %s", elapsed)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Fatalf("made %d gh calls, want 3 (log, page 1, page 2 cut off): %v", len(calls), calls)
+	}
+}
+
+// A cancelled request starts no further gh process.
+func TestCancelledContextRunsNoGHCommand(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := defaultRunGHCommand(ctx, "api", "/rate_limit"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled gh call err = %v, want context.Canceled", err)
+	}
+	var calls int
+	stubGH(t, func(string) ([]byte, error) { calls++; return nil, errors.New("unreachable") })
+	if _, _, err := FetchJobLogsContext(ctx, "org", "repo", 3, 0, "build", 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled log request err = %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("cancelled log request made %d gh calls", calls)
+	}
+}
+
+// A gh whose helper keeps stdout open after gh exits cannot hold a runner,
+// job or log request: the call returns once WaitDelay passes, with gh's own
+// output, and gh's exit status deciding the result. The helper outlives the
+// call's bound by far, so returning at all proves the bound, whatever the
+// scheduler's delays; and the helper is stopped with gh.
+func TestGHCommandBoundsHeldOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the gh wrapper is a POSIX shell script")
+	}
+	sleep, lookErr := exec.LookPath("sleep")
+	if lookErr != nil {
+		t.Skip("sleep not available")
+	}
+	bin := t.TempDir()
+	pidFile := filepath.Join(bin, "helper.pid")
+	script := "#!/bin/sh\n" + sleep + " 120 &\necho $! > '" + pidFile + "'\necho '{\"ok\":true}'\n"
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	original := proc.WaitDelay
+	proc.WaitDelay = 200 * time.Millisecond
+	t.Cleanup(func() { proc.WaitDelay = original })
+
+	type result struct {
+		out []byte
+		err error
+	}
+	returned := make(chan result, 1)
+	go func() {
+		out, err := defaultRunGHCommand(context.Background(), "api", "anything")
+		returned <- result{out, err}
+	}()
+	var got result
+	select {
+	case got = <-returned:
+	case <-time.After(60 * time.Second):
+		t.Fatal("gh call waited for the process holding its output")
+	}
+	if got.err != nil || strings.TrimSpace(string(got.out)) != `{"ok":true}` {
+		t.Fatalf("gh call returned %q, %v", got.out, got.err)
+	}
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, err := os.FindProcess(pid); err == nil && p.Signal(syscall.Signal(0)) == nil {
+		_ = p.Kill()
+		t.Fatalf("the helper holding gh's output (pid %d) outlived the call", pid)
 	}
 }

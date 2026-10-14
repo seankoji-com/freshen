@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/proc"
 )
 
 type RunnerStatus string
@@ -219,7 +220,8 @@ const (
 )
 
 // runGH is the indirection point for every gh invocation, so tests can supply
-// canned API responses instead of shelling out.
+// canned API responses instead of shelling out. Cancelling ctx kills the gh
+// process, so a caller's deadline bounds a multi-call operation as a whole.
 var runGH = runGHCommand
 
 // runGHCommand runs gh with the given args, capturing both stdout and stderr.
@@ -228,16 +230,22 @@ var runGH = runGHCommand
 // a fake implementation instead of shelling out to the real gh CLI.
 var runGHCommand = defaultRunGHCommand
 
-func defaultRunGHCommand(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), ghCommandTimeout)
+func defaultRunGHCommand(parent context.Context, args ...string) ([]byte, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(parent, ghCommandTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gh", args...)
+	cmd := proc.Command(ctx, "gh", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err := proc.Run(cmd)
+	if parentErr := parent.Err(); parentErr != nil {
+		return nil, parentErr
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("gh api call timed out after %s: args=%v", ghCommandTimeout, args)
 	}
@@ -452,13 +460,20 @@ func runItem(run GHWorkflowRun, repo string) *RunItem {
 
 // FetchRunJobs retrieves every job in the latest attempt, including terminal results.
 func FetchRunJobs(org, repo string, runID int64) ([]GHJobInfo, error) {
+	return fetchRunJobs(context.Background(), org, repo, runID)
+}
+
+func fetchRunJobs(ctx context.Context, org, repo string, runID int64) ([]GHJobInfo, error) {
 	var result []GHJobInfo
 	for page := 1; ; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		endpoint := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?filter=latest&per_page=%d", org, repo, runID, jobsPageSize)
 		if page > 1 {
 			endpoint += fmt.Sprintf("&page=%d", page)
 		}
-		out, err := runGH("api", endpoint)
+		out, err := runGH(ctx, "api", endpoint)
 		if err != nil {
 			return nil, err
 		}
@@ -486,7 +501,7 @@ func JobsForRun(run *RunItem, infos []GHJobInfo) []*JobItem {
 
 // FetchOrgRunners queries GitHub API for all registered organization runners.
 func FetchOrgRunners(org string) ([]*RunnerItem, error) {
-	out, err := runGH("api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=%d", org, runnersPageSize))
+	out, err := runGH(context.Background(), "api", fmt.Sprintf("/orgs/%s/actions/runners?per_page=%d", org, runnersPageSize))
 	if err != nil {
 		return nil, err
 	}
@@ -697,7 +712,7 @@ func FetchOrgJobQueue(org string, repos []string, refreshRunIDs ...int64) ([]*Jo
 // plus completed-run durations observed on the same unfiltered runs page —
 // see FetchOrgJobQueue for how that history is used.
 func fetchRepoJobQueue(org, repo string, refresh map[int64]bool) ([]*JobItem, map[string][]time.Duration, error) {
-	out, err := runGH(
+	out, err := runGH(context.Background(),
 		"api",
 		fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=%d", org, repo, jobQueueRunsPerRepo),
 	)
@@ -716,7 +731,7 @@ func fetchRepoJobQueue(org, repo string, refresh map[int64]bool) ([]*JobItem, ma
 	activeStates:
 		for _, status := range []string{"queued", "in_progress", "waiting", "pending", "requested"} {
 			for page := 1; ; page++ {
-				out, err := runGH("api", fmt.Sprintf("/repos/%s/%s/actions/runs?status=%s&per_page=100&page=%d", org, repo, status, page))
+				out, err := runGH(context.Background(), "api", fmt.Sprintf("/repos/%s/%s/actions/runs?status=%s&per_page=100&page=%d", org, repo, status, page))
 				if err != nil {
 					coverageErr = err
 					break activeStates
@@ -790,8 +805,29 @@ func runDuration(run GHWorkflowRun) (time.Duration, bool) {
 }
 
 // FetchJobLogs fetches the step log output for a specific running workflow job.
+//
+// When the caller already knows the job's ID (every job opened from a listed
+// run does), the log is requested directly: one API call per refresh instead of
+// listing the run's jobs first. The jobs list is fetched only to resolve a job
+// by name or to build the step-status fallback when GitHub withholds the log,
+// and an explicit ID never falls back to a different job.
 func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
-	infos, err := FetchRunJobs(org, repo, runID)
+	return FetchJobLogsContext(context.Background(), org, repo, runID, targetGHJobID, targetJobName, maxLines)
+}
+
+// FetchJobLogsContext is FetchJobLogs bounded by ctx. The download and every
+// jobs-list page share ctx, so its deadline caps the whole request rather than
+// each gh call, and cancelling it stops the request before its next call.
+func FetchJobLogsContext(ctx context.Context, org, repo string, runID, targetGHJobID int64, targetJobName string, maxLines int) ([]string, int64, error) {
+	if targetGHJobID != 0 {
+		if logOut, err := runGH(ctx, "api", fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, targetGHJobID)); err == nil {
+			return logTail(logOut, maxLines), targetGHJobID, nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	infos, err := fetchRunJobs(ctx, org, repo, runID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("jobs list: %w", err)
 	}
@@ -857,11 +893,13 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 		return nil, 0, fmt.Errorf("no job found for run %d", runID)
 	}
 
-	// Step 2: fetch raw log text
-	logOut, err := runGH(
-		"api",
-		fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID),
-	)
+	// Step 2: fetch raw log text, unless the direct request above already failed.
+	var logOut []byte
+	if targetGHJobID == 0 {
+		logOut, err = runGH(ctx, "api", fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", org, repo, jobID))
+	} else {
+		err = fmt.Errorf("log download unavailable")
+	}
 	if err != nil {
 		// Fall back to step names if logs unavailable
 		lines := []string{"Log download unavailable; showing GitHub step status."}
@@ -881,10 +919,14 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 		return lines, jobID, nil
 	}
 
-	// Parse raw log -- take last maxLines non-empty lines
-	raw := string(logOut)
+	return logTail(logOut, maxLines), jobID, nil
+}
+
+// logTail returns the last maxLines non-empty lines of a raw log, sanitised
+// for terminal display.
+func logTail(raw []byte, maxLines int) []string {
 	var lines []string
-	for _, line := range strings.Split(raw, "\n") {
+	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimRight(line, "\r")
 		if line != "" {
 			lines = append(lines, SanitizeTerminal(line))
@@ -893,7 +935,7 @@ func FetchJobLogs(org, repo string, runID, targetGHJobID int64, targetJobName st
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
-	return lines, jobID, nil
+	return lines
 }
 
 // jobSortKey returns a stable sort key: running first, then by numeric ID.

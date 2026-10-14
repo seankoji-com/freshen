@@ -2,9 +2,10 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
+	"maps"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -18,11 +19,42 @@ import (
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// fetchOrgRunners is the runner API call, swappable so tests can count requests.
+var fetchOrgRunners = jobs.FetchOrgRunners
+
 func (m Model) loadRunnersCmd() tea.Cmd {
+	org := m.TargetOrg
 	return func() tea.Msg {
-		runners, err := jobs.FetchOrgRunners(m.TargetOrg)
+		runners, err := fetchOrgRunners(org)
 		return loadedRunnersMsg{runners: runners, err: err}
 	}
+}
+
+// startRunnerFetch marks a runner request in flight and returns it.
+func (m *Model) startRunnerFetch() tea.Cmd {
+	m.IsRunnersLoading = true
+	m.LastRunnersAttempt = time.Now()
+	return m.loadRunnersCmd()
+}
+
+// runnersVisible reports whether the current screen renders runner data.
+// Repositories, Actions and Concerns do not, so the runner poll pauses there.
+func (m Model) runnersVisible() bool {
+	return m.ActiveFocus == FocusRunners || m.ActiveFocus == FocusOverview
+}
+
+// resumeRunnerPolling refreshes runner data on entering a screen that shows it,
+// unless a request is in flight or the last attempt is within the current
+// (backed-off) poll interval. Runner ticks resume fetching from then on.
+func (m *Model) resumeRunnerPolling() tea.Cmd {
+	if !m.runnersVisible() || m.TargetOrg == "" || m.RunnerPermissionDenied || m.IsRunnersLoading {
+		return nil
+	}
+	interval := backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])
+	if !m.LastRunnersAttempt.IsZero() && time.Since(m.LastRunnersAttempt) < interval {
+		return nil
+	}
+	return m.startRunnerFetch()
 }
 
 type loadedJobQueueMsg struct {
@@ -77,61 +109,125 @@ func (m Model) loadJobQueueCmd() tea.Cmd {
 
 type loadedJobLogsMsg struct {
 	jobID   string // JobItem.ID to match
+	seq     uint64 // request identity; see Model.LogSeq
 	ghJobID int64
 	logs    []string
 	err     error
 }
 
-// loadJobLogsCmd fetches real log lines for the given running job.
-func (m Model) loadJobLogsCmd(job *jobs.JobItem) tea.Cmd {
+// fetchJobLogs is the log download, swappable so tests can count requests and
+// control completion order.
+var fetchJobLogs = jobs.FetchJobLogsContext
+
+// logFetchTimeout bounds a whole log request. The direct download and every
+// jobs-list page of the step-status fallback share one context, so a request
+// answers within this time even when each gh call is slow, and LogLoading
+// always clears.
+const logFetchTimeout = 40 * time.Second
+
+// logFetchStuckAfter is a backstop for a response that never arrives despite
+// that deadline. The stuck request is cancelled before a new one starts, and
+// its late response is discarded by its sequence number.
+const logFetchStuckAfter = logFetchTimeout + 5*time.Second
+
+// startLogFetch marks a log request for job in flight and returns it. Only one
+// log request runs at a time, so polling cannot stack requests behind a slow
+// one, and each carries a sequence number so an overtaken response cannot
+// replace newer lines. Opening another job replaces the request in flight.
+func (m *Model) startLogFetch(job *jobs.JobItem) tea.Cmd {
 	if job == nil || job.RunID == 0 {
 		return nil
 	}
-	org := m.TargetOrg
-	repo := job.Repo
-	runID := job.RunID
-	ghJobID := job.GHJobID
-	jobName := job.Name
-	jobID := job.ID
+	// A request for this job already running answers soon. A request for
+	// another job is from a job the user has left: cancel it so the open
+	// job's log loads now, and LogSeq discards its late response.
+	if m.LogLoading == job.ID && time.Since(m.LogLoadingSince) < logFetchStuckAfter {
+		return nil
+	}
+	if m.cancelLogFetch != nil {
+		m.cancelLogFetch()
+	}
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, logFetchTimeout)
+	m.cancelLogFetch = cancel
+	m.LogSeq++
+	m.LogLoading = job.ID
+	m.LogLoadingSince = time.Now()
+	org, repo, runID, ghJobID, jobName, jobID, seq := m.TargetOrg, job.Repo, job.RunID, job.GHJobID, job.Name, job.ID, m.LogSeq
 	return func() tea.Msg {
-		lines, resolvedGHJobID, err := jobs.FetchJobLogs(org, repo, runID, ghJobID, jobName, 200)
-		return loadedJobLogsMsg{jobID: jobID, ghJobID: resolvedGHJobID, logs: lines, err: err}
+		defer cancel()
+		lines, resolvedGHJobID, err := fetchJobLogs(ctx, org, repo, runID, ghJobID, jobName, 200)
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("no answer from GitHub within %s", logFetchTimeout)
+		}
+		return loadedJobLogsMsg{jobID: jobID, seq: seq, ghJobID: resolvedGHJobID, logs: lines, err: err}
 	}
 }
 
-// loadLogsIfSelectedJobRunning returns a command to fetch fresh logs when the
-// current OVERALL JOB QUEUE selection is a running job, or nil otherwise —
-// used after any keyboard move so a running job's log tail stays current,
-// and a no-op when the selection is a header row or an idle job.
-func (m Model) loadLogsIfSelectedJobRunning() tea.Cmd {
-	if m.ActiveFocus != FocusJobs || m.OpenJobID == "" || m.LogLoading != "" {
+// loadLogsIfSelectedJobRunning refreshes the open job's log tail while the job
+// runs, or returns nil for an idle job or when a request is already in flight.
+func (m *Model) loadLogsIfSelectedJobRunning() tea.Cmd {
+	if m.ActiveFocus != FocusJobs || m.OpenJobID == "" {
 		return nil
 	}
 	j := m.openJob()
 	if j != nil && j.Status == jobs.JobRunning {
-		return m.loadJobLogsCmd(j)
+		return m.startLogFetch(j)
 	}
 	return nil
 }
 
 var scanLocalDirectoryContext = git.ScanLocalDirectoryContext
 
-func localRepoBranches(ctx context.Context, path string) (current, defaultBranch string, ok bool) {
-	if ctx.Err() != nil || !git.IsGitRepoContext(ctx, path) {
-		return "", "", false
+// fetchOrgRepos and fetchOrgRepoCounts read the organization during a
+// refresh; tests swap them so no test reaches GitHub.
+var (
+	fetchOrgRepos      = git.FetchOrgRepos
+	fetchOrgRepoCounts = git.FetchOrgRepoCounts
+)
+
+// dirExists probes each organization repository's checkout during a refresh;
+// tests swap it to fail or hang.
+var dirExists = git.DirExists
+
+// readLocalCheckout reads each checkout's branches during a refresh; tests
+// swap it to fail or hang.
+var readLocalCheckout = git.ReadLocalCheckout
+
+// keepKnownBranches fills the branches a refresh could not read from the
+// previous record of the same checkout and marks the record stale, so a
+// failed read never blanks a branch the list already knew.
+func keepKnownBranches(item, prev *git.RepoItem) {
+	item.LocalMetadataStale = true
+	if prev == nil {
+		return
 	}
-	current = git.GetOriginalBranch(ctx, path)
-	defaultBranch = git.GetDefaultBranchLocal(ctx, path)
-	if ctx.Err() != nil {
-		return "", "", true
+	if item.CurrentBranch == "" {
+		item.CurrentBranch = prev.CurrentBranch
+		item.OriginalBranch = prev.CurrentBranch
 	}
-	if current == "HEAD" {
-		current = ""
+	if item.DefaultBranch == "" {
+		item.DefaultBranch = prev.DefaultBranch
 	}
-	if defaultBranch == "HEAD" {
-		defaultBranch = ""
+}
+
+// unreadLocalRepo is the record for a workspace directory a refresh could not
+// tell is a checkout and has no earlier record of: listed as unreadable, so
+// nothing acts on it as cloned or not cloned.
+func unreadLocalRepo(name, path string, err error) *git.RepoItem {
+	return &git.RepoItem{
+		Name:               name,
+		Path:               path,
+		CheckoutUnknown:    true,
+		LocalMetadataStale: true,
+		Status:             git.StatusError,
+		StatusMsg:          "Read Err",
+		ErrorErr:           err,
+		Logs:               []string{fmt.Sprintf("Could not read %s: %v; press r to retry.", path, err)},
 	}
-	return current, defaultBranch, true
 }
 
 func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git.RepoItem) tea.Cmd {
@@ -143,29 +239,56 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			if err != nil {
 				return orgSyncedMsg{repos: cloneRepoItems(previous), localErr: err, autoSync: autoSync, generation: generation}
 			}
+			previousByPath := make(map[string]*git.RepoItem, len(previous))
+			for _, item := range previous {
+				previousByPath[item.Path] = item
+			}
 			repos := make([]*git.RepoItem, 0, len(entries))
+			var readFailures []string
 			for _, name := range entries {
 				if localCtx.Err() != nil {
 					break
 				}
 				path := filepath.Join(m.TargetDir, name)
-				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
-					repos = append(repos, &git.RepoItem{Name: name, Path: path, CurrentBranch: current, OriginalBranch: current, DefaultBranch: defaultBranch, Status: git.StatusPending, Logs: []string{}})
+				checkout, readErr := readLocalCheckout(localCtx, path)
+				if localCtx.Err() != nil {
+					break
+				}
+				if readErr != nil {
+					readFailures = append(readFailures, fmt.Sprintf("%s: %v", name, readErr))
+				}
+				switch {
+				case readErr != nil && !checkout.IsRepo:
+					// An earlier record comes back through appendMissingRepos.
+					if previousByPath[path] == nil {
+						repos = append(repos, unreadLocalRepo(name, path, readErr))
+					}
+				case checkout.IsRepo:
+					item := &git.RepoItem{Name: name, Path: path, CurrentBranch: checkout.CurrentBranch, OriginalBranch: checkout.CurrentBranch, DefaultBranch: checkout.DefaultBranch, Status: git.StatusPending, Logs: []string{}}
+					if readErr != nil {
+						keepKnownBranches(item, previousByPath[path])
+					}
+					repos = append(repos, item)
 				}
 			}
 			if err := localCtx.Err(); err != nil {
 				return orgSyncedMsg{repos: appendMissingRepos(repos, previous), localErr: err, autoSync: autoSync, generation: generation}
 			}
+			if len(readFailures) > 0 {
+				slog.Warn("could not check local checkouts", "failures", readFailures)
+				err := fmt.Errorf("could not check %d local checkouts: %s", len(readFailures), strings.Join(readFailures, "; "))
+				return orgSyncedMsg{repos: appendMissingRepos(repos, previous), localErr: err, autoSync: autoSync, generation: generation}
+			}
 			return orgSyncedMsg{repos: repos, autoSync: false, generation: generation}
 		}
 		remoteCtx, remoteCancel := context.WithTimeout(m.ctx, orgRemoteRefreshBudget)
-		orgRepos, err := git.FetchOrgRepos(remoteCtx, m.TargetOrg)
+		orgRepos, err := fetchOrgRepos(remoteCtx, m.TargetOrg)
 		if err != nil {
 			remoteCancel()
 			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync, generation: generation}
 		}
 
-		orgCounts, countsErr := git.FetchOrgRepoCounts(remoteCtx, m.TargetOrg)
+		orgCounts, countsErr := fetchOrgRepoCounts(remoteCtx, m.TargetOrg)
 		remoteCancel()
 		countsFetchedAt := time.Now()
 		if countsErr != nil {
@@ -181,6 +304,11 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 		}
 
 		repoMap := make(map[string]*git.RepoItem)
+		previousByPath := make(map[string]*git.RepoItem, len(previous))
+		for _, item := range previous {
+			previousByPath[item.Path] = item
+		}
+		var probeFailures []string
 
 		for _, ghRepo := range orgRepos {
 			localDir, ok := git.GetLocalDirName(ghRepo.Name)
@@ -193,9 +321,35 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			}
 			localPath := filepath.Join(m.TargetDir, localDir)
 
-			localExists := false
-			if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
-				localExists = true
+			// Could not tell whether the checkout exists, or whether the
+			// directory is one: keep what the last refresh knew, or list the
+			// repository as unreadable, rather than report it not cloned or
+			// drop an archived one.
+			keepUnprobed := func(probeErr error) {
+				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, probeErr))
+				item := unprobedRepo(previousByPath[localPath], ghRepo, localDir, localPath, probeErr)
+				if counts, found := orgCounts[ghRepo.Name]; found {
+					item.OpenIssuesCount = counts.Issues
+					item.OpenPRsCount = counts.PRs
+					item.HasLoadedCounts = true
+					item.CountsStale = false
+					item.CountsUpdatedAt = countsFetchedAt
+				}
+				repoMap[localDir] = item
+			}
+			localExists, probeErr := dirExists(localCtx, localPath)
+			if probeErr != nil {
+				keepUnprobed(probeErr)
+				continue
+			}
+			var checkout git.LocalCheckout
+			var readErr error
+			if localExists {
+				checkout, readErr = readLocalCheckout(localCtx, localPath)
+				if readErr != nil && !checkout.IsRepo {
+					keepUnprobed(readErr)
+					continue
+				}
 			}
 
 			if ghRepo.IsArchived && !localExists {
@@ -213,10 +367,14 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 				Logs:       make([]string, 0),
 			}
 
-			if current, defaultBranch, ok := localRepoBranches(localCtx, localPath); ok {
-				item.CurrentBranch = current
-				item.OriginalBranch = current
-				item.DefaultBranch = defaultBranch
+			if checkout.IsRepo {
+				item.CurrentBranch = checkout.CurrentBranch
+				item.OriginalBranch = checkout.CurrentBranch
+				item.DefaultBranch = checkout.DefaultBranch
+				if readErr != nil {
+					probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, readErr))
+					keepKnownBranches(item, previousByPath[localPath])
+				}
 			}
 
 			if counts, found := orgCounts[ghRepo.Name]; found {
@@ -238,34 +396,59 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			if localCtx.Err() != nil {
 				break
 			}
-			if _, exists := repoMap[name]; !exists {
-				path := filepath.Join(m.TargetDir, name)
-				if current, defaultBranch, ok := localRepoBranches(localCtx, path); ok {
-					item := &git.RepoItem{
-						Name:           name,
-						GHRepoName:     git.GetGHRepoName(name),
-						Path:           path,
-						URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
-						CurrentBranch:  current,
-						DefaultBranch:  defaultBranch,
-						OriginalBranch: current,
-						Status:         git.StatusPending,
-						Logs:           make([]string, 0),
+			if _, exists := repoMap[name]; exists {
+				continue
+			}
+			path := filepath.Join(m.TargetDir, name)
+			checkout, readErr := readLocalCheckout(localCtx, path)
+			if localCtx.Err() != nil {
+				break
+			}
+			if readErr != nil {
+				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", name, readErr))
+				if !checkout.IsRepo {
+					// An earlier record comes back through appendMissingRepos.
+					if previousByPath[path] == nil {
+						repoMap[name] = unreadLocalRepo(name, path, readErr)
 					}
-
-					if counts, found := orgCounts[item.GHRepoName]; found {
-						item.OpenIssuesCount = counts.Issues
-						item.OpenPRsCount = counts.PRs
-						item.HasLoadedCounts = true
-						item.CountsUpdatedAt = countsFetchedAt
-					}
-
-					repoMap[name] = item
+					continue
 				}
 			}
+			if !checkout.IsRepo {
+				continue
+			}
+			item := &git.RepoItem{
+				Name:           name,
+				GHRepoName:     git.GetGHRepoName(name),
+				Path:           path,
+				URL:            fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, git.GetGHRepoName(name)),
+				CurrentBranch:  checkout.CurrentBranch,
+				DefaultBranch:  checkout.DefaultBranch,
+				OriginalBranch: checkout.CurrentBranch,
+				Status:         git.StatusPending,
+				Logs:           make([]string, 0),
+			}
+			if readErr != nil {
+				keepKnownBranches(item, previousByPath[path])
+			}
+
+			if counts, found := orgCounts[item.GHRepoName]; found {
+				item.OpenIssuesCount = counts.Issues
+				item.OpenPRsCount = counts.PRs
+				item.HasLoadedCounts = true
+				item.CountsUpdatedAt = countsFetchedAt
+			}
+
+			repoMap[name] = item
 		}
 		if err := localCtx.Err(); err != nil && localErr == nil {
 			localErr = err
+		}
+		if len(probeFailures) > 0 {
+			slog.Warn("could not check local checkouts", "failures", probeFailures)
+			if localErr == nil {
+				localErr = fmt.Errorf("could not check %d local checkouts: %s", len(probeFailures), strings.Join(probeFailures, "; "))
+			}
 		}
 
 		result := make([]*git.RepoItem, 0, len(repoMap))
@@ -299,6 +482,9 @@ func (m *Model) startOrgRefresh(autoSync, notifyCountsErr bool) tea.Cmd {
 	m.IsOrgSyncing = true
 	m.OrgSyncStartedAt = now
 	m.OrgRefreshGeneration++
+	// The refresh reads each checkout from here on; a sync or action
+	// snapshot that lands before it answers is newer for that repository.
+	m.OrgRefreshRevs = maps.Clone(m.RepoStateRev)
 	previous := cloneRepoItems(m.Repos)
 	return m.loadOrgReposCmd(autoSync, m.OrgRefreshGeneration, previous)
 }
@@ -309,6 +495,34 @@ func cloneRepoItems(items []*git.RepoItem) []*git.RepoItem {
 		clones = append(clones, item.Clone())
 	}
 	return clones
+}
+
+// unprobedRepo is the refresh record for a repository whose checkout could not
+// be probed. With an earlier record it keeps that record's local state, marked
+// stale; without one it is listed as unreadable, never as not cloned, so a
+// clone or delete cannot follow from a probe that only failed.
+func unprobedRepo(prev *git.RepoItem, ghRepo git.GHRepoInfo, localDir, localPath string, probeErr error) *git.RepoItem {
+	if prev != nil {
+		item := prev.Clone()
+		item.IsArchived = ghRepo.IsArchived
+		item.URL = ghRepo.URL
+		item.LocalMetadataStale = true
+		item.CountsStale = item.HasLoadedCounts
+		return item
+	}
+	return &git.RepoItem{
+		Name:               localDir,
+		GHRepoName:         ghRepo.Name,
+		Path:               localPath,
+		URL:                ghRepo.URL,
+		IsArchived:         ghRepo.IsArchived,
+		CheckoutUnknown:    true,
+		LocalMetadataStale: true,
+		Status:             git.StatusError,
+		StatusMsg:          "Read Err",
+		ErrorErr:           probeErr,
+		Logs:               []string{fmt.Sprintf("Could not check whether %s is cloned (%v); press r to retry.", localPath, probeErr)},
+	}
 }
 
 func appendMissingRepos(items, previous []*git.RepoItem) []*git.RepoItem {
@@ -463,20 +677,35 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 		if item.Name != snapshot.Name {
 			continue
 		}
-		item.Status = snapshot.Status
-		item.StatusMsg = snapshot.StatusMsg
-		item.OriginalBranch = snapshot.OriginalBranch
-		item.CurrentBranch = snapshot.CurrentBranch
-		item.DefaultBranch = snapshot.DefaultBranch
-		item.HasUnstagedChanges = snapshot.HasUnstagedChanges
-		item.ExistingPRURL = snapshot.ExistingPRURL
-		item.BranchDetails = snapshot.BranchDetails
-		item.Stashed = snapshot.Stashed
-		item.DraftPRURL = snapshot.DraftPRURL
-		item.ErrorErr = snapshot.ErrorErr
-		item.Logs = snapshot.Logs
+		copyRepoState(item, snapshot)
+		// A section the snapshot could not read keeps its earlier entries,
+		// which the detail labels alongside the failure.
+		item.BranchDetails = mergeBranchDetails(item.BranchDetails, snapshot.BranchDetails)
+		m.invalidateBranchReads(item.Path)
+		if m.RepoStateRev == nil {
+			m.RepoStateRev = make(map[string]uint64)
+		}
+		m.RepoStateRev[item.Path]++
 		return
 	}
+}
+
+// copyRepoState copies the fields a sync or action owns, other than
+// BranchDetails, from src onto dst.
+func copyRepoState(dst, src *git.RepoItem) {
+	dst.IsNew = src.IsNew
+	dst.CheckoutUnknown = src.CheckoutUnknown
+	dst.Status = src.Status
+	dst.StatusMsg = src.StatusMsg
+	dst.OriginalBranch = src.OriginalBranch
+	dst.CurrentBranch = src.CurrentBranch
+	dst.DefaultBranch = src.DefaultBranch
+	dst.HasUnstagedChanges = src.HasUnstagedChanges
+	dst.ExistingPRURL = src.ExistingPRURL
+	dst.Stashed = src.Stashed
+	dst.DraftPRURL = src.DraftPRURL
+	dst.ErrorErr = src.ErrorErr
+	dst.Logs = src.Logs
 }
 
 func copyToClipboard(text string) error {
@@ -528,14 +757,50 @@ func (m *Model) noteFetchSuccess(source string) {
 	delete(m.ConsecutiveErrors, source)
 }
 
-// setToast sets a toast message with the given priority. Higher priority toasts
-// (error=2) override lower ones (info=1), and equal priorities replace.
-// Priority 0 clears on next keypress.
-func (m *Model) setToast(msg string, priority int) {
-	if priority >= m.ToastPriority {
-		m.ToastMsg = msg
-		m.ToastPriority = priority
+// Toasts are transient: information expires after toastInfoTTL and errors,
+// which also leave a persistent marker on the relevant screen, after
+// toastErrorTTL. Neither can hide the key hints, which have their own row.
+const (
+	toastInfoTTL  = 6 * time.Second
+	toastErrorTTL = 15 * time.Second
+)
+
+type toastExpiredMsg struct{ seq uint64 }
+
+func toastTTL(priority int) time.Duration {
+	if priority >= 2 {
+		return toastErrorTTL
 	}
+	return toastInfoTTL
+}
+
+// toastVisible reports whether the current toast is still within its lifetime.
+// Rendering checks this too, so a dropped expiry message cannot pin a toast.
+func (m Model) toastVisible(now time.Time) bool {
+	return m.ToastMsg != "" && (m.ToastAt.IsZero() || now.Sub(m.ToastAt) < toastTTL(m.ToastPriority))
+}
+
+// setToast sets a toast message with the given priority. Higher priority toasts
+// (error=2) override lower ones (info=1) while they are visible, and equal
+// priorities replace. Each toast gets a sequence number so only its own expiry
+// message can clear it.
+func (m *Model) setToast(msg string, priority int) {
+	if priority < m.ToastPriority && m.toastVisible(time.Now()) {
+		return
+	}
+	m.ToastMsg = msg
+	m.ToastPriority = priority
+	m.ToastAt = time.Now()
+	m.ToastSeq++
+}
+
+func (m *Model) clearToast() {
+	m.ToastMsg = ""
+	m.ToastPriority = 0
+}
+
+func toastExpireCmd(seq uint64, ttl time.Duration) tea.Cmd {
+	return tea.Tick(ttl, func(time.Time) tea.Msg { return toastExpiredMsg{seq: seq} })
 }
 
 // Budget the organisation sweep to roughly 3,000 requests/hour, leaving room
@@ -550,20 +815,107 @@ func (m Model) actionsPollInterval() time.Duration {
 	return max(jobQueueTickInterval, time.Duration(6*len(m.Repos)+active)*1200*time.Millisecond)
 }
 
-type repoDetailsLoadedMsg struct{ repo *git.RepoItem }
+// invalidateBranchReads advances path's BranchDetailsRev, so a detail read
+// started before its branch state was replaced is discarded on arrival.
+func (m *Model) invalidateBranchReads(path string) {
+	if m.BranchDetailsRev == nil {
+		m.BranchDetailsRev = make(map[string]uint64)
+	}
+	m.BranchDetailsRev[path]++
+}
 
+// repoDetailsLoadedMsg carries a branch read and the repository's
+// BranchDetailsRev when it started.
+type repoDetailsLoadedMsg struct {
+	repo *git.RepoItem
+	rev  uint64
+}
+
+// loadRepoDetail starts every request the open repository detail needs, then
+// renders it, so the first frame already shows their loading state.
+func (m *Model) loadRepoDetail() tea.Cmd {
+	cmd := tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+	m.updateViewport()
+	return cmd
+}
+
+// loadRepoDetails reads the selected repository's branches and worktrees. One
+// read runs at a time; a request for another repository while one is in
+// flight is queued and started when the current one completes.
 func (m *Model) loadRepoDetails() tea.Cmd {
-	if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) || m.RepoDetailLoading != "" {
+	if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 		return nil
 	}
 	repo := m.Repos[m.SelectedIndex].Clone()
 	if repo.IsNew {
 		return nil
 	}
-	m.RepoDetailLoading = repo.Path
-	ctx := m.ctx
-	return func() tea.Msg {
-		repo.BranchDetails = git.GetRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
-		return repoDetailsLoadedMsg{repo: repo}
+	if m.RepoDetailLoading != "" {
+		if m.RepoDetailLoading != repo.Path {
+			m.RepoDetailQueued = repo.Path
+		}
+		return nil
 	}
+	m.RepoDetailQueued = ""
+	m.RepoDetailLoading = repo.Path
+	rev := m.BranchDetailsRev[repo.Path]
+	parent := m.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	// The deadline covers all three git reads, so a hung command ends the
+	// request, clears RepoDetailLoading and lets a queued read start.
+	ctx, cancel := context.WithTimeout(parent, repoDetailTimeout)
+	return func() tea.Msg {
+		defer cancel()
+		repo.BranchDetails = getRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
+		return repoDetailsLoadedMsg{repo: repo, rev: rev}
+	}
+}
+
+// getRepoBranchDetails is the branch and worktree read, swappable so tests
+// can block or fail it.
+var getRepoBranchDetails = git.GetRepoBranchDetails
+
+// getCurrentBranch and the repository actions are swappable for the same
+// reason.
+var (
+	getCurrentBranch = git.GetOriginalBranch
+	switchBranch     = git.SwitchBranch
+	publishRepo      = git.CommitPushPRAndSwitchDefault
+	pruneRepo        = git.PruneBranchesAndWorktrees
+)
+
+// repoActionTimeout bounds the change a switch, push or prune action makes, so
+// a hung git or gh fails the action and frees BusyAction. Steps that finished
+// before the deadline stay done and are listed in the repository log.
+var repoActionTimeout = 5 * time.Minute
+
+// repoDetailTimeout bounds one repository's branch, worktree and status
+// reads together.
+var repoDetailTimeout = 30 * time.Second
+
+// mergeBranchDetails applies a new read over the cached one. A section whose
+// read failed keeps its cached entries, which the detail labels as earlier
+// data alongside the failure.
+func mergeBranchDetails(cached, fresh git.BranchWorktreeDetails) git.BranchWorktreeDetails {
+	if fresh.BranchesErr != "" {
+		fresh.Branches, fresh.LocalBranches, fresh.RemoteBranches = cached.Branches, cached.LocalBranches, cached.RemoteBranches
+	}
+	if fresh.WorktreesErr != "" {
+		fresh.Worktrees = cached.Worktrees
+	}
+	if fresh.StatusErr != "" {
+		fresh.ChangedFiles = cached.ChangedFiles
+	}
+	return fresh
+}
+
+// openRepoDetailPath is the path of the repository whose detail is open, or "".
+func (m Model) openRepoDetailPath() string {
+	if !m.Detail || (m.ActiveFocus != FocusRepos && m.ActiveFocus != FocusConcerns) ||
+		m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
+		return ""
+	}
+	return m.Repos[m.SelectedIndex].Path
 }

@@ -30,7 +30,12 @@ func smokeFixtureModel() Model {
 		{Name: "beta", GHRepoName: "beta", Path: "/tmp/freshen-fixture/beta", CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusPending},
 	}
 	m.Runners = []*jobs.RunnerItem{{ID: "runner-1", Name: "mac-builder", Platform: "macOS/ARM64", Status: jobs.RunnerRunning, Tags: []string{"self-hosted", "ARM64"}}}
-	r := &jobs.RunItem{ID: 100, Number: 42, Attempt: 1, Repo: "alpha", Workflow: "CI", Title: "Build the new screens", Branch: "feat/screens", Event: "pull_request", Status: jobs.JobRunning, JobsKnown: true}
+	now := time.Now()
+	m.LastOrgRefresh = now.Add(-2 * time.Minute)
+	m.LastActionsRefresh = now.Add(-8 * time.Second)
+	m.LastRunnersRefresh = now.Add(-4 * time.Second)
+	m.LastRunnersAttempt = m.LastRunnersRefresh
+	r := &jobs.RunItem{ID: 100, Number: 42, Attempt: 1, Repo: "alpha", Workflow: "CI", Title: "Build the new screens", Branch: "feat/screens", Event: "pull_request", Status: jobs.JobRunning, JobsKnown: true, CreatedAt: now.Add(-3*time.Minute - 10*time.Second), StartedAt: now.Add(-3 * time.Minute)}
 	m.JobQueue = []*jobs.JobItem{
 		{ID: "run:100", RunID: 100, Repo: "alpha", Run: r, IsRunHeader: true, Status: jobs.JobRunning},
 		{ID: "#1", GHJobID: 1, RunID: 100, Repo: "alpha", Run: r, Name: "alpha / build", Status: jobs.JobPassed, Duration: "24s", Steps: []jobs.GHJobStep{{Number: 1, Name: "Build", Status: "completed", Conclusion: "success"}}},
@@ -44,16 +49,28 @@ func smokeFixtureModel() Model {
 	m.moveSelection(0)
 	return m
 }
-func press(m *Model, k string) tea.Cmd {
-	msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
-	keys := map[string]tea.KeyType{"enter": tea.KeyEnter, "esc": tea.KeyEsc, "up": tea.KeyUp, "down": tea.KeyDown, "tab": tea.KeyTab, "shift+tab": tea.KeyShiftTab, "pgdown": tea.KeyPgDown, "home": tea.KeyHome, "end": tea.KeyEnd}
+func keyMsg(k string) tea.KeyMsg {
+	keys := map[string]tea.KeyType{"enter": tea.KeyEnter, "esc": tea.KeyEsc, "up": tea.KeyUp, "down": tea.KeyDown, "tab": tea.KeyTab, "shift+tab": tea.KeyShiftTab, "pgdown": tea.KeyPgDown, "home": tea.KeyHome, "end": tea.KeyEnd, "ctrl+c": tea.KeyCtrlC}
 	if typ, ok := keys[k]; ok {
-		msg = tea.KeyMsg{Type: typ}
+		return tea.KeyMsg{Type: typ}
 	}
-	next, cmd := m.Update(msg)
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+}
+
+func press(m *Model, k string) tea.Cmd {
+	next, cmd := m.Update(keyMsg(k))
 	*m = next.(Model)
 	return cmd
 }
+
+// pressHandler runs a key through the update dispatch without Update's toast
+// expiry scheduling, so a nil command proves the key started no work.
+func pressHandler(m *Model, k string) tea.Cmd {
+	next, cmd := m.update(keyMsg(k))
+	*m = next.(Model)
+	return cmd
+}
+
 func TestScreenFrameBounds(t *testing.T) {
 	for _, size := range [][2]int{{1, 1}, {20, 6}, {40, 12}, {60, 18}, {80, 24}, {120, 40}, {200, 50}} {
 		for _, focus := range []FocusType{FocusOverview, FocusRepos, FocusJobs, FocusRunners, FocusConcerns} {
@@ -213,7 +230,7 @@ func TestConcernsPageOrdersWorkAndOpensRepositoryDetail(t *testing.T) {
 		t.Fatalf("PR-bearing repository should lead issue-only repository: %+v", entries)
 	}
 	view := stripped(renderAt(m, 80, 24))
-	for _, want := range []string{"Concerns · 2 repositories", "1 open PR", "4 open issues"} {
+	for _, want := range []string{"Concerns  ·  2 repositories", "1 open PR", "4 open issues"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("Concerns missing %q:\n%s", want, view)
 		}
@@ -262,7 +279,7 @@ func TestEmptyConcernsCannotReuseRepositorySelection(t *testing.T) {
 	}
 	m.ActiveFocus = FocusConcerns
 
-	cmd := press(&m, "s")
+	cmd := pressHandler(&m, "s")
 	if cmd != nil || m.BusyAction != "" || m.ActionTarget != nil {
 		t.Fatal("empty Concerns screen reused an off-screen repository action target")
 	}
@@ -369,7 +386,7 @@ func TestClearedConcernSelectionCannotRearmImmediateAction(t *testing.T) {
 	if m.SelectedIndex != -1 || m.ScreenCursor[FocusConcerns] != "" {
 		t.Fatalf("changed concern list retained selection: selected=%d cursor=%q", m.SelectedIndex, m.ScreenCursor[FocusConcerns])
 	}
-	cmd := press(&m, "s")
+	cmd := pressHandler(&m, "s")
 	if cmd != nil || m.ActionTarget != nil || m.BusyAction != "" {
 		t.Fatal("cleared concern selection silently rearmed an immediate sync")
 	}
@@ -435,6 +452,7 @@ func TestStaleOrgRefreshGenerationCannotOverwriteCurrentState(t *testing.T) {
 	m.IsOrgSyncing = true
 	m.OrgSyncStartedAt = time.Now()
 	original := m.Repos[0]
+	refreshed := m.LastOrgRefresh
 
 	cmd, handled := m.handleOrgSyncedMsg(orgSyncedMsg{
 		repos:      []*git.RepoItem{{Name: "stale", Path: "/tmp/stale"}},
@@ -443,7 +461,7 @@ func TestStaleOrgRefreshGenerationCannotOverwriteCurrentState(t *testing.T) {
 	if !handled || cmd != nil {
 		t.Fatalf("stale completion was not ignored: handled=%v command=%v", handled, cmd)
 	}
-	if !m.IsOrgSyncing || m.Repos[0] != original || !m.LastOrgRefresh.IsZero() {
+	if !m.IsOrgSyncing || m.Repos[0] != original || !m.LastOrgRefresh.Equal(refreshed) {
 		t.Fatalf("stale completion mutated current state: syncing=%v repos=%+v refreshed=%v", m.IsOrgSyncing, m.Repos, m.LastOrgRefresh)
 	}
 }
@@ -497,9 +515,9 @@ func TestLocalRepoBranchesDiscardExpiredContextSentinels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	current, defaultBranch, ok := localRepoBranches(ctx, t.TempDir())
-	if ok || current != "" || defaultBranch != "" {
-		t.Fatalf("expired branch lookup leaked values into the model: current=%q default=%q ok=%v", current, defaultBranch, ok)
+	checkout, err := readLocalCheckout(ctx, t.TempDir())
+	if err == nil || checkout != (git.LocalCheckout{}) {
+		t.Fatalf("expired branch lookup leaked values into the model: %+v err=%v", checkout, err)
 	}
 }
 
@@ -842,7 +860,7 @@ func TestSmallConfirmationCannotExecuteUnseenAction(t *testing.T) {
 	m := smokeFixtureModel()
 	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 40, Height: 12})
 	press(&m, "X")
-	cmd := press(&m, "enter")
+	cmd := pressHandler(&m, "enter")
 	if cmd != nil || m.PendingAction != "prune" || m.BusyAction != "" {
 		t.Fatal("executed a clipped confirmation")
 	}
@@ -991,20 +1009,20 @@ func TestDiscardedActionCommandDoesNotStrandShutdown(t *testing.T) {
 	}
 }
 
-// Job rows now show words rather than font-dependent glyphs. Pin all states so a
-// future rendering change cannot silently swap success, failure and waiting.
+// Job rows show a font-safe glyph and a word for every state. Pin all states so
+// a future rendering change cannot silently swap success, failure and waiting.
 func TestJobStateBadges(t *testing.T) {
 	cases := []struct {
 		status jobs.JobStatus
 		want   string
 	}{
-		{jobs.JobRunning, "RUNNING"},
-		{jobs.JobPassed, "PASSED"},
-		{jobs.JobFailed, "FAILED"},
-		{jobs.JobQueued, "QUEUED"},
-		{jobs.JobWaiting, "WAITING"},
-		{jobs.JobCancelled, "CANCELLED"},
-		{jobs.JobSkipped, "SKIPPED"},
+		{jobs.JobRunning, "↻ RUNNING"},
+		{jobs.JobPassed, "✓ PASSED"},
+		{jobs.JobFailed, "✗ FAILED"},
+		{jobs.JobQueued, "◌ QUEUED"},
+		{jobs.JobWaiting, "◌ WAITING"},
+		{jobs.JobCancelled, "⊘ CANCELLED"},
+		{jobs.JobSkipped, "⊘ SKIPPED"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {

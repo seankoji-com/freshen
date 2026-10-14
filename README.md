@@ -70,41 +70,63 @@ Launch the TUI interface:
 ./freshen
 ```
 
+Global keys work the same on every screen, drill-down and the help overlay.
+Only the filter input, action menu and confirmations take over the keyboard
+until Enter or Esc; `Ctrl+C` always quits.
+
 | Key | Action |
 |---|---|
-| `0` / `1` / `2` / `3` / `4` | Overview / Repositories / Actions / Runners / Concerns |
+| `0` / `1` / `2` / `3` / `4` | Jump to Overview / Repositories / Actions / Runners / Concerns from anywhere, closing drill-downs |
 | `Tab` / `Shift+Tab` | Next / previous screen |
-| `↑↓` or `j/k` | Move within a list, or scroll open details |
-| `Enter` / `→` | Open details; Actions opens run → jobs → steps and log tail |
-| `Esc` / `←` | Back; clear a list filter when at the top level |
-| `/` | Filter the current list; Enter applies, Esc clears |
-| `Home` / `End`, `PgUp` / `PgDn` | First/last item or page through the current view |
-| `Space` | Contextual action menu |
-| `r` | Refresh data, without syncing repositories |
-| `v` | Toggle Actions workflow runs / job queue |
-| `f` | Filter runs: Active / Needs attention / Recent |
+| `Esc` / `←` / `h` | Back one level; then clear the filter; then dismiss the message |
+| `/` | Filter the nearest list (names and status words such as `failed` or `busy`); from Overview it opens Repositories; Enter applies, Esc clears |
+| `r` | Refresh the current screen, without syncing repositories |
+| `?` | Keys valid on the current screen, generated from the bindings the handlers use, plus the status legend |
+| `q` / `Ctrl+C` | Quit |
+| `↑↓` or `j/k`, `PgUp` / `PgDn`, `Home` / `End` | Move within a list, or scroll details and help |
+| `Enter` / `→` / `l` | Open; Actions opens run → jobs → steps and log tail |
+| `Space` | Action menu for the selection |
+| `o` / `y` | Open in GitHub / copy link or runner ID (local path without an owner) |
+| `v` / `f` | Actions: toggle runs and job queue / cycle Active, Needs attention, Recent |
 | `[` / `]` | Repository detail tabs: Logs / Branches / Issues / PRs |
-| `o` / `y` | Open GitHub / copy link or runner ID (local path without an owner) |
-| `s` / `a` | Sync selected repository / confirm sync all |
-| `b` | Switch selected repository between original and default branch |
-| `p` | Confirm commit all changes, push, create PR and switch to default |
-| `X` | Confirm force-removing worktrees and deleting non-default branches |
-| `d` | Confirm deleting an archived local clone |
-| `?` | Scrollable help |
-| `q` / `Ctrl+C` | Quit (`Ctrl+C` works inside search and confirmations) |
+| `s` / `a` | Sync or clone the selected repository / sync all (confirm) |
+| `b` | Switch the selected repository between original and default branch |
+| `p` | Commit all changes, push, create a PR and switch to default (confirm) |
+| `X` | Remove clean secondary worktrees and delete non-default branches already on a remote (confirm) |
+| `d` | Delete an archived local clone (confirm) |
 
-Repository actions run in the background with busy and result feedback. Destructive
-confirmations retain the exact target across refreshes. Navigation never moves to
-another screen merely because you reach the end of a list.
+Confirmations show the captured repository and path; only Enter accepts and
+every other key except Esc and `Ctrl+C` is ignored. Repository actions run in
+the background with busy and result feedback. Navigation never moves to another
+screen merely because you reach the end of a list.
+
+The header shows the owner and how old the current screen's data is ("updated
+8s ago · every 20s"; on narrow terminals just a spinner while a refresh
+runs); tabs carry counts of failures (`✗`), running work (`↻`)
+and concerns. The breadcrumb row shows the drill-down path, such as
+`Actions › alpha / CI #42 › test`; on narrow terminals it shortens before the
+filter input or the active detail tab does. The status row shows progress,
+persistent warnings (such as a failed runner refresh, with the cached runners'
+age and `r` to retry) and transient messages, which expire after 6 seconds
+(errors after 15); key hints for the current screen stay on the last row.
+
+Status is always a glyph plus a word, never colour alone: `✓` success, `✗`
+failure, `↻` running, `◌` queued or waiting, `⊘` skipped or cancelled, `?`
+unknown, `!` needs attention. Set `NO_COLOR=1` to turn colour off; the selected
+row then uses reverse video.
 
 Actions retains all job results. Bars count completed jobs or steps, including
-skipped/cancelled steps; they do not estimate remaining time. The recent view covers
-30 runs per repository. Active runs are additionally queried when that window fills,
-and job lists are paginated. Missing job details and partial repository failures are
-labelled. Fleet access failures show observed assignments with unknown availability.
-The organisation poll starts at 20 seconds and slows with workspace size to budget
-API requests; the footer shows the interval. Selected running-job logs refresh with
-the runner tick. GitHub may provide only step status while logs are unavailable.
+skipped/cancelled steps; they do not estimate remaining time. Runs show how long
+they ran or have waited, and failed jobs name the first failing step. The recent
+view covers 30 runs per repository. Active runs are additionally queried when
+that window fills, and job lists are paginated. Missing job details and partial
+repository failures are labelled. Fleet access failures show observed
+assignments with unknown availability. The organisation poll starts at 20
+seconds and slows with workspace size to budget API requests. Runner polling
+pauses on screens that do not show runners and refreshes when you return to
+Overview or Runners. Selected running-job logs refresh with the runner tick
+using one API request, never more than one at a time; GitHub may provide only
+step status while logs are unavailable, and an empty log is reported as empty.
 
 ### Command Line Options
 
@@ -150,7 +172,7 @@ Flags override config. A `-alias` replaces any config alias that uses the same l
 
 Workspace-only mode requires `git` and never calls GitHub. GitHub features require an authenticated [GitHub CLI](https://cli.github.com/) (`gh auth login`) or `GH_TOKEN`. Use a token with access to the target repositories; organization runner visibility may require organization-admin or runner permissions.
 
-`d d` deletes an archived repository and `X` force-removes secondary worktrees and non-default branches. Review the selected workspace carefully. Batch deletion requires `--delete-archived`.
+`d` then Enter deletes an archived repository and `X` then Enter force-removes secondary worktrees and non-default branches. Review the selected workspace carefully. Batch deletion requires `--delete-archived`.
 
 ### Releases
 

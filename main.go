@@ -377,7 +377,7 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 		if ghRepo.IsArchived && deleteArchived {
 			if _, statErr := os.Stat(localPath); statErr == nil {
 				fmt.Printf("↳ Deleting local directory for archived repo '%s'...\n", localDir)
-				_ = git.DeleteLocalRepo(targetDir, localPath)
+				_ = git.DeleteLocalRepo(ctx, targetDir, localPath)
 			}
 		} else {
 			if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {

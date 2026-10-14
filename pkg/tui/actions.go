@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -28,6 +29,14 @@ func (m Model) menuActions() []uiAction {
 	}
 	if m.ActionTarget.IsNew {
 		return append(actions, uiAction{"sync", "Clone repository", "Clone this repository into the workspace", false})
+	}
+	if m.ActionTarget.CheckoutUnknown {
+		// The refresh could not tell whether this checkout exists. A sync
+		// probes it again before acting; nothing destructive is offered.
+		if m.ActionTarget.IsArchived {
+			return actions
+		}
+		return append(actions, uiAction{"sync", "Sync repository", "Check the checkout again, then clone or sync it", false})
 	}
 	if m.ActionTarget.IsArchived {
 		return append(actions, uiAction{"delete", "Delete archived clone", "Delete this local repository from disk. This cannot be undone.", true})
@@ -75,7 +84,7 @@ func (m Model) menuContent() string {
 				if m.ActionTarget != nil && a.id == "prune" {
 					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
 				}
-				return "Confirm: " + a.label + "\n\n" + target + "\n\n" + detail + "\n\nEnter confirms · Esc cancels"
+				return th.warning.Render(statusGlyphs[kindWarning]+" Confirm: "+a.label) + "\n\n" + th.strong.Render(target) + "\n\n" + detail + "\n\n" + th.key.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
 			}
 		}
 	}
@@ -83,25 +92,42 @@ func (m Model) menuContent() string {
 	if m.ActionTarget != nil {
 		title += " / " + m.ActionTarget.Name
 	}
-	lines := []string{title, ""}
+	// Budget in rendered rows: every row is cut or wrapped to the body width
+	// here, so View's wrap adds none, and the selected action always shows.
+	width := max(1, m.Width-2)
+	fit := func(s string) string { return ansi.Truncate(s, width, "…") }
 	actions := m.menuActions()
-	count := max(1, m.bodyHeight()-5)
-	start := max(0, m.MenuIndex-count+1)
-	for i := start; i < min(len(actions), start+count); i++ {
-		a := actions[i]
-		prefix := "  "
-		if i == m.MenuIndex {
-			prefix = "› "
-		}
-		lines = append(lines, prefix+a.label)
-	}
+	var tail []string
 	if m.MenuIndex < len(actions) {
-		lines = append(lines, "", actions[m.MenuIndex].detail)
+		tail = append(tail, "")
+		tail = append(tail, strings.Split(ansi.Wrap(th.dim.Render(actions[m.MenuIndex].detail), width, ""), "\n")...)
 	}
 	if m.BusyAction != "" {
-		lines = append(lines, "", "A repository action is already running.")
+		tail = append(tail, "", fit("A repository action is already running."))
 	}
-	return strings.Join(lines, "\n")
+	head := []string{fit(th.strong.Render(title)), ""}
+	avail := m.bodyHeight()
+	for len(head)+len(tail) >= avail && len(tail) > 0 {
+		tail = tail[:len(tail)-1]
+	}
+	for len(head) >= avail && len(head) > 0 {
+		head = head[:len(head)-1]
+	}
+	count := max(1, avail-len(head)-len(tail))
+	start := max(0, m.MenuIndex-count+1)
+	lines := head
+	for i := start; i < min(len(actions), start+count); i++ {
+		a := actions[i]
+		line := "  " + a.label
+		if i == m.MenuIndex {
+			line = th.cursor.Render("›") + " " + th.selected.Render(a.label)
+		}
+		if a.confirm {
+			line += th.dim.Render("  (asks to confirm)")
+		}
+		lines = append(lines, fit(line))
+	}
+	return strings.Join(append(lines, tail...), "\n")
 }
 func (m *Model) requestAction(id string) tea.Cmd {
 	for _, a := range m.menuActions() {
@@ -155,9 +181,12 @@ func (m *Model) executeAction(id string) tea.Cmd {
 	if id != "copy" && id != "open" {
 		m.BusyAction = label + " · " + target.Name
 	}
-	m.ToastMsg = ""
-	m.ToastPriority = 0
+	m.clearToast()
 	work := func() actionResultMsg {
+		// One deadline bounds the change itself, so a hung git or gh fails
+		// the action instead of holding BusyAction until quit.
+		actionCtx, cancelAction := context.WithTimeout(ctx, repoActionTimeout)
+		defer cancelAction()
 		result := actionResultMsg{id: id, label: label, repo: target}
 		if target != nil {
 			result.path = target.Path
@@ -191,12 +220,12 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			if target.CurrentBranch == branch {
 				branch = target.DefaultBranch
 			}
-			result.err = git.SwitchBranch(target, branch)
+			result.err = switchBranch(actionCtx, target, branch)
 		case "push":
-			result.err = git.CommitPushPRAndSwitchDefault(ctx, target)
+			result.err = publishRepo(actionCtx, target)
 		case "prune":
 			var pruned git.PruneResult
-			pruned, result.err = git.PruneBranchesAndWorktrees(ctx, target)
+			pruned, result.err = pruneRepo(actionCtx, target)
 			for _, path := range pruned.RemovedWorktrees {
 				target.Logs = append(target.Logs, "Removed worktree: "+path)
 			}
@@ -223,11 +252,24 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			}
 			target.Logs = append(target.Logs, fmt.Sprintf("Prune removed %d worktrees, pruned %d stale registrations, and deleted %d branches; error: %v", len(pruned.RemovedWorktrees), len(pruned.PrunedWorktrees), len(pruned.DeletedBranches), result.err))
 		case "delete":
-			result.err = git.DeleteLocalRepo(dir, target.Path)
+			result.err = git.DeleteLocalRepo(actionCtx, dir, target.Path)
+		}
+		if (id == "switch" || id == "push" || id == "prune") && result.err != nil && errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
+			result.err = fmt.Errorf("stopped after %s; steps that finished are in the repository log: %w", repoActionTimeout, result.err)
+			target.Logs = append(target.Logs, fmt.Sprintf("%s was stopped after %s; the steps logged above it finished.", label, repoActionTimeout))
 		}
 		if target != nil && id != "delete" && id != "copy" && id != "open" {
-			target.CurrentBranch = git.GetOriginalBranch(ctx, target.Path)
-			target.BranchDetails = git.GetRepoBranchDetails(ctx, target.Path, target.DefaultBranch)
+			// The mutation's outcome is already in result. One deadline bounds
+			// the re-read, so a hung git still delivers it and frees BusyAction;
+			// a failed read keeps the last known branch and earlier details.
+			readCtx, cancel := context.WithTimeout(ctx, repoDetailTimeout)
+			if current := getCurrentBranch(readCtx, target.Path); current != "HEAD" {
+				target.CurrentBranch = current
+			} else {
+				target.Logs = append(target.Logs, "Could not re-read the checked-out branch after "+label+"; press r to retry.")
+			}
+			target.BranchDetails = getRepoBranchDetails(readCtx, target.Path, target.DefaultBranch)
+			cancel()
 		}
 		return result
 	}

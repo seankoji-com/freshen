@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
@@ -18,22 +19,28 @@ func Hyperlink(text, url string) string {
 	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", url, text)
 }
 
+// setDetail fills the detail viewport, wrapping every row to its width: the
+// frame clips anything wider, and detail text has no horizontal scroll.
+func (m *Model) setDetail(content string) {
+	m.Viewport.SetContent(ansi.Wrap(content, max(1, m.Viewport.Width), ""))
+}
+
 func (m *Model) updateViewport() {
 	var sb strings.Builder
 
 	switch m.ActiveFocus {
 	case FocusJobs:
-		m.Viewport.SetContent(m.jobDetailContent())
+		m.setDetail(m.jobDetailContent())
 		return
 	case FocusRunners:
-		m.Viewport.SetContent(m.runnerDetailContent())
+		m.setDetail(m.runnerDetailContent())
 		return
 	case FocusRepos, FocusConcerns:
 		if len(m.Repos) == 0 || m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
 			if m.IsOrgSyncing {
-				m.Viewport.SetContent(fmt.Sprintf(" %s Fetching GitHub repositories...", m.Spinner.View()))
+				m.setDetail(fmt.Sprintf(" %s Fetching GitHub repositories…", m.Spinner.View()))
 			} else {
-				m.Viewport.SetContent(lipgloss.NewStyle().Foreground(colorMuted).Render(" No repositories found. Esc returns to the list."))
+				m.setDetail(th.dim.Render(" This repository is no longer in the snapshot. Esc returns to the list."))
 			}
 			return
 		}
@@ -48,54 +55,55 @@ func (m *Model) updateViewport() {
 			}
 			repoURL = fmt.Sprintf("https://github.com/%s/%s", m.TargetOrg, repoName)
 		}
-		repoLink := Hyperlink(fmt.Sprintf("%s %s", iconGithub, subtitleStyle.Render(item.GHRepoName)), repoURL)
-
-		branchDetail := fmt.Sprintf("%s (default)", item.CurrentBranch)
-		if item.CurrentBranch != item.DefaultBranch {
-			branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+		ghName := item.GHRepoName
+		if ghName == "" {
+			ghName = item.Name
 		}
-		branchURL := fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch)
-		branchLink := Hyperlink(fmt.Sprintf("%s %s", iconBranch, branchDetail), branchURL)
+		repoLink := Hyperlink(th.section.Render(ghName), repoURL)
 
-		prCountStr := "0 open"
-		if item.OpenPRsCount > 0 {
-			prCountStr = fmt.Sprintf("%d open", item.OpenPRsCount)
+		branchDetail := "not cloned"
+		if !item.IsNew {
+			branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+			if item.CurrentBranch != item.DefaultBranch {
+				branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+			}
 		}
-		prURL := fmt.Sprintf("%s/pulls", repoURL)
-		prLink := Hyperlink(fmt.Sprintf("%s %s", iconPR, prCountStr), prURL)
+		branchLink := Hyperlink("branch "+branchDetail, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 
-		issueCountStr := "0 open"
-		if item.OpenIssuesCount > 0 {
-			issueCountStr = fmt.Sprintf("%d open", item.OpenIssuesCount)
+		counts := "PR and issue counts not loaded"
+		if item.HasLoadedCounts {
+			prLink := Hyperlink(th.pr.Render(countPhrase(item.OpenPRsCount, "open PR", "open PRs")), repoURL+"/pulls")
+			issueLink := Hyperlink(th.issue.Render(countPhrase(item.OpenIssuesCount, "open issue", "open issues")), repoURL+"/issues")
+			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
-		issueURL := fmt.Sprintf("%s/issues", repoURL)
-		issueLink := Hyperlink(fmt.Sprintf("%s %s", iconIssue, issueCountStr), issueURL)
-
-		fmt.Fprintf(&sb, " %s  |  %s  |  %s  |  %s  |  %s\n\n",
-			repoLink, branchLink, lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render(item.StatusMsg), prLink, issueLink,
-		)
+		status := m.renderStatusBadge(item)
+		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
+			status += th.dim.Render(" · " + item.StatusMsg)
+		}
+		sep := th.dim.Render("  ·  ")
+		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchLink, sep, status)
+		fmt.Fprintf(&sb, " %s", counts)
+		if item.HasUnstagedChanges {
+			sb.WriteString(sep + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
+		}
+		sb.WriteString("\n\n")
 
 		switch m.ActiveTab {
 
 		case TabLogs:
 			if item.ExistingPRURL != "" {
-				fmt.Fprintf(&sb, "%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("OPEN PR: "), iconPR, badgePR.Render(item.ExistingPRURL))
+				fmt.Fprintf(&sb, "%s %s\n", th.pr.Render("Open PR: "), th.link.Render(item.ExistingPRURL))
 			}
 			if item.DraftPRURL != "" && item.DraftPRURL != item.ExistingPRURL {
-				fmt.Fprintf(&sb, "%s %s %s\n", lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("DRAFT PR:"), iconPR, badgePR.Render(item.DraftPRURL))
+				fmt.Fprintf(&sb, "%s %s\n", th.pr.Render("Draft PR:"), th.link.Render(item.DraftPRURL))
 			}
 
-			dashCount := (m.Viewport.Width - 18) / 2
-			if dashCount < 2 {
-				dashCount = 2
+			sb.WriteString("\n" + sectionRule("Sync log", m.Viewport.Width-2) + "\n")
+			if len(item.Logs) == 0 {
+				sb.WriteString(th.dim.Render("No sync has run for this repository in this session. Press s to sync it.") + "\n")
 			}
-			divider := strings.Repeat("─", dashCount) + " EXECUTION LOGS " + strings.Repeat("─", dashCount)
-			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(divider) + "\n")
 
-			wrapWidth := m.Viewport.Width - 2
-			if wrapWidth < 20 {
-				wrapWidth = 40
-			}
+			wrapWidth := max(10, m.Viewport.Width-2)
 			logWrapper := lipgloss.NewStyle().Width(wrapWidth)
 
 			for _, logLine := range item.Logs {
@@ -104,121 +112,131 @@ func (m *Model) updateViewport() {
 			}
 
 		case TabBranches:
-			if m.RepoDetailLoading != "" && m.RepoDetailLoading == item.Path {
-				sb.WriteString("Loading branches and worktrees…\n")
+			if item.Path != "" && (m.RepoDetailLoading == item.Path || m.RepoDetailQueued == item.Path) {
+				sb.WriteString(m.Spinner.View() + " Loading branches and worktrees…\n")
 				break
 			}
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render("󰓦 BRANCHES & WORKTREES") + "\n")
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("(Press 'X' to git fetch --prune, delete non-default local branches & prune worktrees)") + "\n\n")
-
-			localBranches := item.BranchDetails.GetLocalBranches()
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorBlue).Render(" Local Branches:") + "\n")
-			if len(localBranches) == 0 {
-				sb.WriteString("  (None found)\n")
-			} else {
-				for _, b := range localBranches {
-					fmt.Fprintf(&sb, "  %s %s\n", iconBranch, b)
-				}
+			details := item.BranchDetails
+			if details.Unread {
+				sb.WriteString(th.status(kindWarning, "Not read since the checkout moved to "+jobs.SanitizeTerminal(item.CurrentBranch)+".") + " Press r to read branches and worktrees.\n")
+				break
 			}
-
-			remoteBranches := item.BranchDetails.GetRemoteBranches()
-			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(" Remote Branches:") + "\n")
-			if len(remoteBranches) == 0 {
-				sb.WriteString("  (None found)\n")
-			} else {
-				for _, b := range remoteBranches {
-					fmt.Fprintf(&sb, "  %s %s\n", iconBranch, b)
-				}
+			if details.Failed() {
+				sb.WriteString(th.status(kindWarning, "Some git reads failed.") + " Press r to retry.\n\n")
 			}
-
-			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorPrimary).Render("󰉓 Git Worktrees:") + "\n")
-			if len(item.BranchDetails.Worktrees) == 0 {
-				sb.WriteString("  (No worktrees found)\n")
-			} else {
-				for _, w := range item.BranchDetails.Worktrees {
-					fmt.Fprintf(&sb, "  %s %s\n", iconWorktree, w)
+			sb.WriteString(th.dim.Render("X removes clean worktrees and deletes local branches already on a remote, after confirmation.") + "\n\n")
+			// A failed read never reads as empty: it states the failure and
+			// labels any entries kept from an earlier read.
+			listSection := func(heading lipgloss.Style, title string, items []string, readErr string) {
+				if readErr != "" {
+					sb.WriteString(heading.Render(title) + "  " + th.status(kindWarning, "unavailable") + "\n")
+					sb.WriteString("  " + th.dim.Render("Could not read: "+jobs.SanitizeTerminal(readErr)) + "\n")
+					if len(items) > 0 {
+						sb.WriteString(th.dim.Render(fmt.Sprintf("  From an earlier read (%d):", len(items))) + "\n")
+					}
+				} else {
+					sb.WriteString(heading.Render(fmt.Sprintf("%s (%d)", title, len(items))) + "\n")
+					if len(items) == 0 {
+						sb.WriteString(th.dim.Render("  none found") + "\n")
+					}
 				}
+				for _, entry := range items {
+					sb.WriteString("  " + entry + "\n")
+				}
+				sb.WriteString("\n")
 			}
-
-			sb.WriteString("\n" + lipgloss.NewStyle().Bold(true).Foreground(colorYellow).Render("󰈔 Changed Files (Branch Diff Status):") + "\n")
-			if len(item.BranchDetails.ChangedFiles) == 0 {
-				sb.WriteString("  󰄬 Working tree is clean.\n")
+			listSection(th.branchHeading, "Local branches", details.GetLocalBranches(), details.BranchesErr)
+			listSection(th.branchHeading, "Remote branches", details.GetRemoteBranches(), details.BranchesErr)
+			listSection(th.worktreeHeading, "Worktrees", details.Worktrees, details.WorktreesErr)
+			if len(details.ChangedFiles) == 0 && details.StatusErr == "" {
+				sb.WriteString(th.warning.Render("Changed files (0)") + "\n  " + th.status(kindSuccess, "working tree is clean") + "\n")
 			} else {
-				for _, f := range item.BranchDetails.ChangedFiles {
-					fmt.Fprintf(&sb, "  %s\n", f)
-				}
+				listSection(th.warning, "Changed files", details.ChangedFiles, details.StatusErr)
 			}
 
 		case TabIssues:
 			spinnerStr := ""
 			if item.IsLoadingIssues {
-				spinnerStr = fmt.Sprintf("  %s %s", cellStatusIconStyle.Render(m.Spinner.View()), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+				spinnerStr = "  " + m.Spinner.View() + th.dim.Render(" updating…")
 			}
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("⊙ OPEN ISSUES (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
+			sb.WriteString(th.section.Render(fmt.Sprintf("Open issues (%d)", item.OpenIssuesCount)) + spinnerStr + "\n\n")
 
-			if len(item.IssuesList) == 0 && item.IsLoadingIssues {
-				fmt.Fprintf(&sb, "  %s Loading open issues from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View()))
-			} else if !item.HasLoadedIssues {
-				sb.WriteString("Issues not loaded. Press r to retry.\n")
-			} else if len(item.IssuesList) == 0 {
-				sb.WriteString("  󰄬 No open issues found for this repository.\n")
-			} else {
-				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
+			switch {
+			case m.TargetOrg == "":
+				sb.WriteString("Issues need a GitHub owner. Restart with -owner NAME.\n")
+			case len(item.IssuesList) == 0 && item.IsLoadingIssues:
+				sb.WriteString("  " + m.Spinner.View() + " Loading open issues from GitHub…\n")
+			case !item.HasLoadedIssues:
+				sb.WriteString(th.warning.Render(statusGlyphs[kindWarning]+" Issues not loaded.") + " Press r to retry.\n")
+			case len(item.IssuesList) == 0:
+				sb.WriteString("  " + th.status(kindSuccess, "No open issues.") + "\n")
+			default:
+				titleWrapper := lipgloss.NewStyle().Width(max(10, m.Viewport.Width-6))
 				for _, issue := range item.IssuesList {
 					header := fmt.Sprintf("#%-4d %s", issue.Number, issue.Title)
-					fmt.Fprintf(&sb, "  %s %s\n     %s\n\n",
-						badgeIssue.Render("⊙"), titleWrapper.Render(header),
-						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(issue.URL),
-					)
+					fmt.Fprintf(&sb, "  %s\n    %s\n\n", th.issue.Render(titleWrapper.Render(header)), th.link.Render(issue.URL))
 				}
 			}
 
 		case TabPRs:
 			spinnerStr := ""
 			if item.IsLoadingPRs {
-				spinnerStr = fmt.Sprintf("  %s %s", cellStatusIconStyle.Render(m.Spinner.View()), lipgloss.NewStyle().Foreground(colorMuted).Render("Updating..."))
+				spinnerStr = "  " + m.Spinner.View() + th.dim.Render(" updating…")
 			}
-			sb.WriteString(lipgloss.NewStyle().Bold(true).Foreground(colorSecondary).Render(fmt.Sprintf("󰏫 OPEN PULL REQUESTS (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
+			sb.WriteString(th.section.Render(fmt.Sprintf("Open pull requests (%d)", item.OpenPRsCount)) + spinnerStr + "\n\n")
 
-			if len(item.PRsList) == 0 && item.IsLoadingPRs {
-				fmt.Fprintf(&sb, "  %s Loading open pull requests from GitHub...\n", cellStatusIconStyle.Render(m.Spinner.View()))
-			} else if !item.HasLoadedPRs {
-				sb.WriteString("Pull requests not loaded. Press r to retry.\n")
-			} else if len(item.PRsList) == 0 {
-				sb.WriteString("  󰄬 No open pull requests found for this repository.\n")
-			} else {
-				titleWrapper := lipgloss.NewStyle().Width(m.Viewport.Width - 6)
+			switch {
+			case m.TargetOrg == "":
+				sb.WriteString("Pull requests need a GitHub owner. Restart with -owner NAME.\n")
+			case len(item.PRsList) == 0 && item.IsLoadingPRs:
+				sb.WriteString("  " + m.Spinner.View() + " Loading open pull requests from GitHub…\n")
+			case !item.HasLoadedPRs:
+				sb.WriteString(th.warning.Render(statusGlyphs[kindWarning]+" Pull requests not loaded.") + " Press r to retry.\n")
+			case len(item.PRsList) == 0:
+				sb.WriteString("  " + th.status(kindSuccess, "No open pull requests.") + "\n")
+			default:
+				titleWrapper := lipgloss.NewStyle().Width(max(10, m.Viewport.Width-6))
 				for _, pr := range item.PRsList {
-					header := fmt.Sprintf("#%-4d %s (%s %s)", pr.Number, pr.Title, iconBranch, pr.HeadRefName)
-					fmt.Fprintf(&sb, "  %s %s\n     %s\n\n",
-						badgePR.Render("󰏫"), titleWrapper.Render(header),
-						lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(pr.URL),
-					)
+					header := fmt.Sprintf("#%-4d %s (branch %s)", pr.Number, pr.Title, pr.HeadRefName)
+					fmt.Fprintf(&sb, "  %s\n    %s\n\n", th.pr.Render(titleWrapper.Render(header)), th.link.Render(pr.URL))
 				}
 			}
 		}
 	}
 
-	m.Viewport.SetContent(sb.String())
+	m.setDetail(sb.String())
 }
 
-func (m Model) renderTabBar() string {
-	t1 := "Logs"
-	t2 := "Branches"
-	t3 := "Issues"
-	t4 := "PRs"
+// detailTabNames are the repository detail tab labels, longest first.
+var detailTabNames = [][4]string{
+	{"Logs", "Branches", "Issues", "PRs"},
+	{"Log", "Br", "Iss", "PR"},
+}
 
-	switch m.ActiveTab {
-	case TabLogs:
-		return tabActiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
-	case TabBranches:
-		return tabInactiveStyle.Render(t1) + tabActiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
-	case TabIssues:
-		return tabInactiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabActiveStyle.Render(t3) + tabInactiveStyle.Render(t4)
-	case TabPRs:
-		return tabInactiveStyle.Render(t1) + tabInactiveStyle.Render(t2) + tabInactiveStyle.Render(t3) + tabActiveStyle.Render(t4)
+// renderTabBar shows the repository detail tabs; [ and ] move between them.
+// It uses the longest labels that fit budget cells, falling back to the
+// active tab alone so the current tab is always named.
+func (m Model) renderTabBar(budget int) string {
+	for _, names := range detailTabNames {
+		var sb strings.Builder
+		for i, name := range names {
+			if TabType(i) == m.ActiveTab {
+				sb.WriteString(th.subTabActive.Render(name))
+			} else {
+				sb.WriteString(th.subTabInactive.Render(name))
+			}
+		}
+		if ansi.StringWidth(sb.String()) <= budget {
+			return sb.String()
+		}
 	}
-	return ""
+	return th.subTabActive.Render(detailTabNames[0][m.ActiveTab])
+}
+
+// sectionRule is a heading followed by a rule filling the remaining width.
+func sectionRule(title string, width int) string {
+	rest := max(2, width-ansi.StringWidth(title)-1)
+	return th.section.Render(title) + " " + th.divider.Render(strings.Repeat("─", rest))
 }
 
 func highlightLogLine(line string) string {
@@ -226,26 +244,18 @@ func highlightLogLine(line string) string {
 		return line
 	}
 
-	line = reTimestamp.ReplaceAllStringFunc(line, func(m string) string {
-		return lipgloss.NewStyle().Foreground(colorMuted).Render(m)
-	})
-
-	line = reCmd.ReplaceAllStringFunc(line, func(m string) string {
-		return lipgloss.NewStyle().Foreground(colorSecondary).Bold(true).Render(m)
-	})
-
-	line = reURL.ReplaceAllStringFunc(line, func(m string) string {
-		return lipgloss.NewStyle().Foreground(colorBlue).Underline(true).Render(m)
-	})
-
-	line = reQuoted.ReplaceAllStringFunc(line, func(m string) string {
-		return lipgloss.NewStyle().Foreground(colorYellow).Bold(true).Render(m)
-	})
+	render := func(style lipgloss.Style) func(string) string {
+		return func(s string) string { return style.Render(s) }
+	}
+	line = reTimestamp.ReplaceAllStringFunc(line, render(th.logTimestamp))
+	line = reCmd.ReplaceAllStringFunc(line, render(th.logCommand))
+	line = reURL.ReplaceAllStringFunc(line, render(th.link))
+	line = reQuoted.ReplaceAllStringFunc(line, render(th.logQuoted))
 
 	if strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
-		line = lipgloss.NewStyle().Foreground(colorGreen).Render(line)
+		line = th.fg(th.green).Render(line)
 	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
-		line = lipgloss.NewStyle().Foreground(colorRed).Render(line)
+		line = th.fg(th.red).Render(line)
 	}
 
 	return line
@@ -253,31 +263,13 @@ func highlightLogLine(line string) string {
 
 func (m Model) View() string { return m.screenView() }
 
+// renderStatusBadge renders a repository's sync state as glyph and label.
 func (m Model) renderStatusBadge(item *git.RepoItem) string {
-	switch item.Status {
-	case git.StatusUpToDate:
-		return badgeUpToDate.Render(iconSuccess)
-	case git.StatusUpdated, git.StatusCloned:
-		return badgeUpdated.Render(iconSuccess)
-	case git.StatusStashedApplied:
-		return badgeStash.Render(iconStash)
-	case git.StatusSwitchedDefault:
-		return badgeUpToDate.Render(iconSwitch)
-	case git.StatusRebased:
-		return badgeRebased.Render(iconRebase)
-	case git.StatusPRCreated:
-		return badgePR.Render(iconPR)
-	case git.StatusError, git.StatusRebaseConflict:
-		return badgeError.Render(iconError)
-	case git.StatusArchived:
-		return badgeArchived.Render(iconTrash)
-	case git.StatusSkipped:
-		return badgeSkipped.Render(iconSkipped)
-	case git.StatusSyncing:
-		return m.Spinner.View()
-	default:
-		return lipgloss.NewStyle().Foreground(colorMuted).Render(iconPending)
+	if item.IsNew && item.Status == git.StatusPending {
+		return th.status(kindUnknown, "not cloned")
 	}
+	kind, label := repoKind(item.Status)
+	return th.status(kind, label)
 }
 
 func findJobForRunner(r *jobs.RunnerItem, queue []*jobs.JobItem) *jobs.JobItem {

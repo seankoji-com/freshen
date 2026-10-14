@@ -4,58 +4,42 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
-	k := msg.String()
-	if k == "ctrl+c" {
+	k := m.keys()
+	if key.Matches(msg, k.ForceQuit) {
 		cmd, _ := m.handleKeyQuit()
 		return cmd
 	}
-	if m.Filtering {
-		switch k {
-		case "esc":
+	switch {
+	case m.Filtering:
+		switch {
+		case key.Matches(msg, k.FilterClear):
 			m.Search.SetValue("")
 			m.Filtering = false
 			m.Search.Blur()
-		case "enter":
+		case key.Matches(msg, k.FilterApply):
 			m.Filtering = false
 			m.Search.Blur()
 			m.moveSelection(0)
 		default:
 			var cmd tea.Cmd
+			m.sizeSearch()
 			m.Search, cmd = m.Search.Update(msg)
 			return cmd
 		}
 		return nil
-	}
-	if m.ShowHelp {
-		maxOffset := max(0, len(strings.Split(m.helpContent(), "\n"))-m.bodyHeight())
-		switch k {
-		case "down", "j":
-			m.HelpOffset = min(maxOffset, m.HelpOffset+1)
-		case "up", "k":
-			m.HelpOffset = max(0, m.HelpOffset-1)
-		case "pgdown":
-			m.HelpOffset = min(maxOffset, m.HelpOffset+m.bodyHeight())
-		case "pgup":
-			m.HelpOffset = max(0, m.HelpOffset-m.bodyHeight())
-		}
-		if k == "?" || k == "esc" {
-			m.ShowHelp = false
-		}
-		return nil
-	}
-	if m.PendingAction != "" {
-		if k == "esc" {
+	case m.PendingAction != "":
+		switch {
+		case key.Matches(msg, k.Cancel):
 			m.PendingAction = ""
 			m.ActionTarget = nil
-			return nil
-		}
-		if k == "enter" {
+		case key.Matches(msg, k.Confirm):
 			if !m.confirmationFits() {
 				m.setToast("Enlarge the terminal to read the full confirmation, or Esc to cancel.", 2)
 				return nil
@@ -65,16 +49,15 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			return m.executeAction(action)
 		}
 		return nil
-	}
-	if m.MenuOpen {
-		switch k {
-		case "esc", " ":
+	case m.MenuOpen:
+		switch {
+		case key.Matches(msg, k.MenuClose):
 			m.MenuOpen = false
-		case "up", "k":
+		case key.Matches(msg, k.Up):
 			m.MenuIndex = max(0, m.MenuIndex-1)
-		case "down", "j":
+		case key.Matches(msg, k.Down):
 			m.MenuIndex = min(len(m.menuActions())-1, m.MenuIndex+1)
-		case "enter":
+		case key.Matches(msg, k.MenuSelect):
 			actions := m.menuActions()
 			if len(actions) > 0 {
 				a := actions[m.MenuIndex]
@@ -83,143 +66,194 @@ func (m *Model) screenKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		}
 		return nil
+	case m.ShowHelp:
+		maxOffset := m.helpMaxOffset()
+		switch {
+		case key.Matches(msg, k.Help), key.Matches(msg, k.Back):
+			m.ShowHelp = false
+		case key.Matches(msg, k.Down):
+			m.HelpOffset = min(maxOffset, m.HelpOffset+1)
+		case key.Matches(msg, k.Up):
+			m.HelpOffset = max(0, m.HelpOffset-1)
+		case key.Matches(msg, k.PageDown):
+			m.HelpOffset = min(maxOffset, m.HelpOffset+m.bodyHeight())
+		case key.Matches(msg, k.PageUp):
+			m.HelpOffset = max(0, m.HelpOffset-m.bodyHeight())
+		case key.Matches(msg, k.Home):
+			m.HelpOffset = 0
+		case key.Matches(msg, k.End):
+			m.HelpOffset = maxOffset
+		case key.Matches(msg, k.Quit, k.Jump, k.NextScreen, k.PrevScreen, k.Refresh, k.Filter):
+			// Global keys keep their meaning over the overlay: close it and act.
+			m.ShowHelp = false
+			return m.globalKey(msg, m.keys())
+		}
+		return nil
 	}
-	switch k {
-	case "q":
+	if cmd, handled := m.globalKeyHandled(msg, k); handled {
+		return cmd
+	}
+	switch {
+	case key.Matches(msg, k.Up, k.Down, k.PageUp, k.PageDown, k.Home, k.End):
+		m.moveOrScroll(msg, k)
+	case key.Matches(msg, k.Open):
+		return m.openEntry()
+	case key.Matches(msg, k.PrevTab, k.NextTab):
+		if key.Matches(msg, k.NextTab) {
+			m.ActiveTab = (m.ActiveTab + 1) % 4
+		} else {
+			m.ActiveTab = (m.ActiveTab + 3) % 4
+		}
+		m.Viewport.GotoTop()
+		return m.loadRepoDetail()
+	case key.Matches(msg, k.ToggleQueue):
+		m.QueueView = !m.QueueView
+		m.Search.SetValue("")
+	case key.Matches(msg, k.CycleRuns):
+		m.ActionsFilter = (m.ActionsFilter + 1) % 3
+		m.moveSelection(0)
+	case key.Matches(msg, k.Menu):
+		m.captureActionTarget()
+		m.MenuIndex = 0
+		m.MenuOpen = true
+	case key.Matches(msg, k.Browser, k.Copy, k.Sync, k.SyncAll, k.Switch, k.Push, k.Prune, k.Delete):
+		ids := []struct {
+			binding key.Binding
+			id      string
+		}{{k.Browser, "open"}, {k.Copy, "copy"}, {k.Sync, "sync"}, {k.SyncAll, "sync-all"}, {k.Switch, "switch"}, {k.Push, "push"}, {k.Prune, "prune"}, {k.Delete, "delete"}}
+		for _, a := range ids {
+			if key.Matches(msg, a.binding) {
+				m.captureActionTarget()
+				return m.requestAction(a.id)
+			}
+		}
+	}
+	return nil
+}
+
+// globalKeyHandled applies a global binding if msg matches one.
+func (m *Model) globalKeyHandled(msg tea.KeyMsg, k keyMap) (tea.Cmd, bool) {
+	if !key.Matches(msg, k.Quit, k.Help, k.Back, k.Refresh, k.Filter, k.Jump, k.NextScreen, k.PrevScreen) {
+		return nil, false
+	}
+	return m.globalKey(msg, k), true
+}
+
+func (m *Model) globalKey(msg tea.KeyMsg, k keyMap) tea.Cmd {
+	switch {
+	case key.Matches(msg, k.Quit):
 		cmd, _ := m.handleKeyQuit()
 		return cmd
-	case "?":
+	case key.Matches(msg, k.Help):
 		m.ShowHelp = true
-	case "0":
-		m.changeScreen(FocusOverview)
-	case "1":
-		m.changeScreen(FocusRepos)
-	case "2":
-		m.changeScreen(FocusJobs)
-	case "3":
-		m.changeScreen(FocusRunners)
-	case "4":
-		m.changeScreen(FocusConcerns)
-	case "tab", "shift+tab":
-		screens := []FocusType{FocusOverview, FocusRepos, FocusJobs, FocusRunners, FocusConcerns}
+		m.HelpOffset = 0
+	case key.Matches(msg, k.Jump):
+		i := int(msg.String()[0] - '0')
+		return m.changeScreen(screenOrder[i])
+	case key.Matches(msg, k.NextScreen, k.PrevScreen):
 		i := 0
-		for n, f := range screens {
+		for n, f := range screenOrder {
 			if f == m.ActiveFocus {
 				i = n
 			}
 		}
-		if k == "tab" {
-			i = (i + 1) % len(screens)
+		if key.Matches(msg, k.NextScreen) {
+			i = (i + 1) % len(screenOrder)
 		} else {
-			i = (i + len(screens) - 1) % len(screens)
+			i = (i + len(screenOrder) - 1) % len(screenOrder)
 		}
-		m.changeScreen(screens[i])
-	case "esc", "left", "h":
-		switch {
-		case m.OpenJobID != "":
-			m.OpenJobID = ""
-			m.Viewport.GotoTop()
-		case m.OpenRun != nil:
-			m.OpenRun = nil
-			m.Search.SetValue("")
-		case m.Detail:
-			m.Detail = false
-			if m.ActiveFocus == FocusConcerns {
-				entries := m.entries()
-				if len(entries) == 0 {
-					m.ScreenCursor[FocusConcerns] = ""
-					m.SelectedIndex = -1
-				} else {
-					m.selectEntry(entries[m.entryIndex(entries)])
-				}
-			}
-		case m.Search.Value() != "":
-			m.Search.SetValue("")
-		default:
-			m.ToastMsg = ""
-			m.ToastPriority = 0
-		}
-	case "/":
-		if m.ActiveFocus != FocusOverview && !m.detailVisible() {
-			m.Filtering = true
-			return m.Search.Focus()
-		}
-	case "up", "k", "down", "j", "pgup", "pgdown", "home", "end":
-		delta := 1
-		if k == "up" || k == "k" {
-			delta = -1
-		}
-		if k == "pgup" {
-			delta = -max(1, m.bodyHeight()/2)
-		}
-		if k == "pgdown" {
-			delta = max(1, m.bodyHeight()/2)
-		}
-		if m.detailVisible() {
-			switch k {
-			case "home":
-				m.Viewport.GotoTop()
-			case "end":
-				m.Viewport.GotoBottom()
-			default:
-				if delta < 0 {
-					m.Viewport.ScrollUp(-delta)
-				} else {
-					m.Viewport.ScrollDown(delta)
-				}
-			}
-		} else {
-			if k == "home" {
-				delta = -len(m.entries())
-			}
-			if k == "end" {
-				delta = len(m.entries())
-			}
-			m.moveSelection(delta)
-		}
-	case "enter", "right", "l":
-		return m.openEntry()
-	case "[", "]":
-		if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) {
-			if k == "]" {
-				m.ActiveTab = (m.ActiveTab + 1) % 4
-			} else {
-				m.ActiveTab = (m.ActiveTab + 3) % 4
-			}
-			m.Viewport.GotoTop()
-			m.updateViewport()
-			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
-		}
-	case "v":
-		if m.ActiveFocus == FocusJobs && m.OpenRun == nil {
-			m.QueueView = !m.QueueView
-			m.Search.SetValue("")
-		}
-	case "f":
-		if m.ActiveFocus == FocusJobs && m.OpenRun == nil {
-			m.ActionsFilter = (m.ActionsFilter + 1) % 3
-			m.moveSelection(0)
-		}
-	case "r":
+		return m.changeScreen(screenOrder[i])
+	case key.Matches(msg, k.Back):
+		m.back()
+	case key.Matches(msg, k.Filter):
+		return m.startFilter()
+	case key.Matches(msg, k.Refresh):
 		return m.refreshScreen()
-	case " ":
-		if m.ActiveFocus == FocusOverview {
-			return nil
-		}
-		m.captureActionTarget()
-		m.MenuIndex = 0
-		m.MenuOpen = true
-	case "o", "y", "c", "s", "a", "b", "p", "X", "d":
-		if m.ActiveFocus == FocusOverview {
-			return nil
-		}
-		ids := map[string]string{"o": "open", "y": "copy", "c": "copy", "s": "sync", "a": "sync-all", "b": "switch", "p": "push", "X": "prune", "d": "delete"}
-		m.captureActionTarget()
-		return m.requestAction(ids[k])
 	}
 	return nil
 }
-func (m *Model) changeScreen(f FocusType) {
+
+// back leaves the innermost layer: job detail, repository/runner detail, an
+// active filter, an open run, and finally a status message.
+func (m *Model) back() {
+	switch {
+	case m.OpenJobID != "":
+		m.OpenJobID = ""
+		m.Viewport.GotoTop()
+	case m.Detail:
+		m.Detail = false
+		if m.ActiveFocus == FocusConcerns {
+			entries := m.entries()
+			if len(entries) == 0 {
+				m.ScreenCursor[FocusConcerns] = ""
+				m.SelectedIndex = -1
+			} else {
+				m.selectEntry(entries[m.entryIndex(entries)])
+			}
+		}
+	case m.Search.Value() != "":
+		m.Search.SetValue("")
+	case m.OpenRun != nil:
+		m.OpenRun = nil
+	default:
+		m.clearToast()
+	}
+}
+
+// startFilter focuses the filter for the nearest list: a detail view returns
+// to the list it came from, and Overview, which has no list, opens Repositories.
+func (m *Model) startFilter() tea.Cmd {
+	var cmd tea.Cmd
+	if m.ActiveFocus == FocusOverview {
+		cmd = m.changeScreen(FocusRepos)
+	}
+	if m.OpenJobID != "" {
+		m.OpenJobID = ""
+		m.Viewport.GotoTop()
+	}
+	if m.Detail {
+		m.back()
+	}
+	m.Filtering = true
+	m.sizeSearch()
+	return tea.Batch(cmd, m.Search.Focus())
+}
+
+func (m *Model) moveOrScroll(msg tea.KeyMsg, k keyMap) {
+	delta := 1
+	switch {
+	case key.Matches(msg, k.Up):
+		delta = -1
+	case key.Matches(msg, k.PageUp):
+		delta = -max(1, m.bodyHeight()/2)
+	case key.Matches(msg, k.PageDown):
+		delta = max(1, m.bodyHeight()/2)
+	}
+	if m.detailVisible() {
+		switch {
+		case key.Matches(msg, k.Home):
+			m.Viewport.GotoTop()
+		case key.Matches(msg, k.End):
+			m.Viewport.GotoBottom()
+		case delta < 0:
+			m.Viewport.ScrollUp(-delta)
+		default:
+			m.Viewport.ScrollDown(delta)
+		}
+		return
+	}
+	switch {
+	case key.Matches(msg, k.Home):
+		delta = -len(m.entries())
+	case key.Matches(msg, k.End):
+		delta = len(m.entries())
+	}
+	m.moveSelection(delta)
+}
+
+// changeScreen opens a top-level screen from anywhere, discarding drill-downs.
+// Entering a screen that shows runner data refreshes it if polling was paused.
+func (m *Model) changeScreen(f FocusType) tea.Cmd {
 	m.ActiveFocus = f
 	m.Detail = false
 	m.OpenRun = nil
@@ -229,6 +263,7 @@ func (m *Model) changeScreen(f FocusType) {
 	m.Viewport.GotoTop()
 	m.moveSelection(0)
 	m.updateViewport()
+	return m.resumeRunnerPolling()
 }
 func (m *Model) openEntry() tea.Cmd {
 	if m.detailVisible() {
@@ -275,10 +310,10 @@ func (m *Model) openEntry() tea.Cmd {
 		}
 	default:
 		m.Detail = true
-		m.updateViewport()
 		if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
-			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+			return m.loadRepoDetail()
 		}
+		m.updateViewport()
 	}
 	return nil
 }
@@ -298,8 +333,7 @@ func (m *Model) refreshScreen() tea.Cmd {
 			cmds = append(cmds, m.loadJobQueueCmd())
 		}
 		if m.TargetOrg != "" && !m.IsRunnersLoading {
-			m.IsRunnersLoading = true
-			cmds = append(cmds, m.loadRunnersCmd())
+			cmds = append(cmds, m.startRunnerFetch())
 		}
 		if len(cmds) > 0 {
 			return tea.Batch(cmds...)
@@ -317,12 +351,11 @@ func (m *Model) refreshScreen() tea.Cmd {
 		}
 	case FocusRunners:
 		if m.TargetOrg != "" && !m.IsRunnersLoading {
-			m.IsRunnersLoading = true
-			return m.loadRunnersCmd()
+			return m.startRunnerFetch()
 		}
 	case FocusRepos, FocusConcerns:
 		if m.Detail {
-			return tea.Batch(m.loadRepoDetails(), m.triggerTabFetch())
+			return m.loadRepoDetail()
 		}
 		if m.LocalScanUnresponsive {
 			git.ResetLocalDirectoryScanFailures(m.TargetDir)
@@ -334,12 +367,12 @@ func (m *Model) refreshScreen() tea.Cmd {
 }
 func (m *Model) fetchOpenJobLogs() tea.Cmd {
 	j := m.openJob()
-	if j == nil || j.GHJobID == 0 || m.LogLoading != "" {
+	if j == nil || j.GHJobID == 0 {
 		return nil
 	}
-	m.LogLoading = j.ID
+	cmd := m.startLogFetch(j)
 	m.updateViewport()
-	return m.loadJobLogsCmd(j)
+	return cmd
 }
 
 type runJobsLoadedMsg struct {
@@ -425,19 +458,15 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	if msg.Y == 1 {
-		x := 0
-		for _, tab := range screenTabs(m.Width) {
-			w := len(tab.key+" "+tab.name) + 3
-			if msg.X >= x && msg.X < x+w {
-				m.changeScreen(tab.focus)
-				return nil
+		for _, tab := range m.screenTabs() {
+			if msg.X >= tab.start && msg.X < tab.end {
+				return m.changeScreen(tab.focus)
 			}
-			x += w
 		}
 	}
-	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= 3 && msg.Y < 3+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
+	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= headerRows && msg.Y < headerRows+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
 		entries, _, _ := m.visibleEntries()
-		bodyRow := msg.Y - 3
+		bodyRow := msg.Y - headerRows
 		headerRows := m.listHeaderRows()
 		if bodyRow < headerRows {
 			return nil

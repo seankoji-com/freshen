@@ -33,7 +33,7 @@ Timeouts use `context.WithTimeout` + `exec.CommandContext` (6s for issues/PRs).
 - **Commands**: Return `tea.Cmd` from closures, not named functions. Example: `return func() tea.Msg { ... }`
 - **Messages**: Custom struct types (e.g., `loadedRunnersMsg`, `orgSyncedMsg`) carrying data+error
 - **Update**: Single `switch msg.(type)` block handling all message types and key events
-- **View**: Builds full terminal output as string; Lip Gloss styles applied inline
+- **View**: Builds full terminal output as string from `chrome.go` rows and screen bodies; styles come from `theme.go`
 - **Sub-models**: Spinner, ProgressBar, Viewport managed as fields on the main Model
 - **Concurrency**: Long-running git operations run in goroutines within command closures
 
@@ -56,14 +56,20 @@ Timeouts use `context.WithTimeout` + `exec.CommandContext` (6s for issues/PRs).
 - **Functions**: PascalCase for exported, camelCase for unexported
 - **Types**: PascalCase (`RepoItem`, `JobItem`, `RunnerItem`)
 - **Files**: lowercase, single word or hyphenated (`git.go`, `jobs.go`, `tui.go`)
-- **NerdFont icons**: Used extensively — `iconGithub`, `iconBranch`, `iconPR`, `iconSuccess`, `iconError`, etc.
+- **Status glyphs**: The TUI uses one-cell Unicode glyphs from `statusGlyphs` in `pkg/tui/theme.go`, always followed by a word. Nerd Font glyphs remain only in sync log lines produced by `pkg/git`.
 
 ### Style/Lip Gloss
 
-- Color palette defined as constants: Electric Purple primary, Bright Mint secondary, Emerald green, Amber yellow, Coral red, Bright blue, Muted slate
-- Styles defined as package-level `var` blocks in `pkg/tui/model.go`
+- The palette and every style live in the `theme` value `th` in `pkg/tui/theme.go`; render code reads `th.<style>` instead of calling `lipgloss.NewStyle()` with colours
+- Statuses map to a `statusKind` (`jobKind`, `runnerKind`, `repoKind`); render them with `th.status(kind, label)` so colour, glyph and word stay together
+- `NO_COLOR` builds a colourless theme; the selection and active tab use reverse video instead
 - Column widths use explicit `.Width(N)` for table alignment
-- All dynamic sizing uses `m.Width`/`m.Height` from `tea.WindowSizeMsg`
+- All dynamic sizing uses `m.Width`/`m.Height` from `tea.WindowSizeMsg`; measure styled text with `ansi.StringWidth`
+
+### Keys
+
+- Add a binding to `keyMap` in `pkg/tui/keymap.go`, enable it in `Model.keys()` for the contexts where it acts, and match it with `key.Matches` in the handler. The footer and `?` overlay then list it automatically
+- Never reuse a global key (`0`–`4`, Tab, Shift+Tab, Esc/←/h, `/`, `r`, `?`, `q`, Ctrl+C) for a screen binding; `TestScreenKeysDoNotShadowGlobalKeys` enforces this
 
 ### Logging
 

@@ -8,23 +8,61 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/seankoji-com/freshen/pkg/config"
 	"github.com/seankoji-com/freshen/pkg/git"
 	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
+// Update dispatches msg and schedules the expiry of any toast it raised.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	before := m.ToastSeq
+	next, cmd := m.update(msg)
+	updated, ok := next.(Model)
+	if !ok {
+		return next, cmd
+	}
+	if updated.ToastSeq != before && updated.ToastMsg != "" {
+		cmd = tea.Batch(cmd, toastExpireCmd(updated.ToastSeq, toastTTL(updated.ToastPriority)))
+	}
+	return updated, cmd
+}
+
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
 
+	case toastExpiredMsg:
+		// A newer toast has its own sequence number and expiry.
+		if msg.seq == m.ToastSeq {
+			m.clearToast()
+		}
+
 	case repoDetailsLoadedMsg:
-		m.RepoDetailLoading = ""
-		for _, r := range m.Repos {
-			if r.Path == msg.repo.Path {
-				r.BranchDetails = msg.repo.BranchDetails
-				break
+		if m.RepoDetailLoading == msg.repo.Path {
+			m.RepoDetailLoading = ""
+		}
+		// A sync or action snapshot that landed while this read ran is newer:
+		// keep it rather than restore branches it removed or a stale status.
+		// A refresh that found the checkout moved left the details unread, so
+		// an open detail reads them again rather than show them as empty.
+		if msg.rev == m.BranchDetailsRev[msg.repo.Path] {
+			for _, r := range m.Repos {
+				if r.Path == msg.repo.Path {
+					r.BranchDetails = mergeBranchDetails(r.BranchDetails, msg.repo.BranchDetails)
+					break
+				}
+			}
+		} else if open := m.openRepoDetailPath(); open == msg.repo.Path && m.Repos[m.SelectedIndex].BranchDetails.Unread {
+			m.RepoDetailQueued = open
+		}
+		// Start the read that was queued behind this one if its detail is still open.
+		if queued := m.RepoDetailQueued; queued != "" {
+			m.RepoDetailQueued = ""
+			if m.openRepoDetailPath() == queued {
+				cmds = append(cmds, m.loadRepoDetails())
 			}
 		}
 		m.updateViewport()
@@ -67,10 +105,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.handleLoadedJobQueueMsg(msg))
 
 	case loadedJobLogsMsg:
+		// Opening a job already replaced any request for another job, so a
+		// response never needs to start the open job's fetch.
 		m.handleLoadedJobLogsMsg(msg)
-		if m.OpenJobID != "" && m.OpenJobID != msg.jobID {
-			cmds = append(cmds, m.fetchOpenJobLogs())
-		}
 
 	case orgSyncedMsg:
 		cmd, early := m.handleOrgSyncedMsg(msg)
@@ -92,8 +129,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var spinnerCmd tea.Cmd
 	m.Spinner, spinnerCmd = m.Spinner.Update(msg)
 	cmds = append(cmds, spinnerCmd)
+	if _, tick := msg.(spinner.TickMsg); tick && m.detailVisible() && m.detailLoading() {
+		m.updateViewport() // the detail is cached content; animate its spinner
+	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// detailLoading reports whether the open detail is waiting on a request.
+func (m Model) detailLoading() bool {
+	switch m.ActiveFocus {
+	case FocusJobs:
+		return m.LogLoading != ""
+	case FocusRepos, FocusConcerns:
+		if m.RepoDetailLoading != "" || m.RepoDetailQueued != "" {
+			return true
+		}
+		if m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
+			return m.IsOrgSyncing
+		}
+		r := m.Repos[m.SelectedIndex]
+		return r.IsLoadingIssues || r.IsLoadingPRs
+	}
+	return false
 }
 
 func (m *Model) handleLoadedIssuesMsg(msg loadedIssuesMsg) {
@@ -149,11 +207,10 @@ func (m *Model) handleRunnerJobTickMsg() tea.Cmd {
 		return nil
 	}
 	var cmdsToAdd []tea.Cmd
-	if !m.RunnerPermissionDenied {
-		if !m.IsRunnersLoading {
-			m.IsRunnersLoading = true
-			cmdsToAdd = append(cmdsToAdd, m.loadRunnersCmd())
-		}
+	// Only Overview and Runners render runner data; elsewhere the poll pauses
+	// and changeScreen refreshes it on return.
+	if !m.RunnerPermissionDenied && m.runnersVisible() && !m.IsRunnersLoading {
+		cmdsToAdd = append(cmdsToAdd, m.startRunnerFetch())
 	}
 	cmdsToAdd = append(cmdsToAdd, runnerJobTickCmd(backoffInterval(runnerJobTickInterval, m.ConsecutiveErrors[fetchSourceRunners])))
 	// Refresh logs for selected running job
@@ -193,11 +250,12 @@ func (m *Model) handleLoadedRunnersMsg(msg loadedRunnersMsg) {
 		} else {
 			m.noteFetchFailure(fetchSourceRunners, runnerJobTickInterval)
 			slog.Error("runner fetch failed", "org", m.TargetOrg, "error", msg.err)
-			m.setToast(fmt.Sprintf(" ⚠ Runner fetch failed: %v", msg.err), 2)
+			m.setToast(fmt.Sprintf("%s Runner fetch failed: %v. Press r on Runners to retry.", statusGlyphs[kindFailure], msg.err), 2)
 		}
 	} else {
 		m.RunnerFetchFailed = false
 		m.RunnerPermissionDenied = false
+		m.LastRunnersRefresh = time.Now()
 		m.noteFetchSuccess(fetchSourceRunners)
 		// Always update runners, even if empty
 		merged := jobs.MergeRunners(msg.runners, m.Runners, m.JobQueue)
@@ -266,31 +324,46 @@ func (m *Model) handleLoadedJobQueueMsg(msg loadedJobQueueMsg) tea.Cmd {
 	return cmd
 }
 
+// handleLoadedJobLogsMsg applies the response to the newest log request and
+// always re-renders, so no outcome (lines, error or an empty log) can leave
+// the detail showing "Loading logs…". Only the newest outcome is recorded: a
+// failure or empty answer keeps the previous tail but replaces any earlier
+// error or empty note, so the detail never shows an outcome that no longer
+// holds.
 func (m *Model) handleLoadedJobLogsMsg(msg loadedJobLogsMsg) {
-	if m.LogLoading == msg.jobID {
-		m.LogLoading = ""
+	if msg.seq != m.LogSeq {
+		slog.Debug("discarding superseded log response", "jobID", msg.jobID, "seq", msg.seq, "current", m.LogSeq)
+		return
 	}
+	m.LogLoading = ""
+	m.cancelLogFetch = nil
 	if msg.err != nil {
 		slog.Debug("log fetch failed", "jobID", msg.jobID, "error", msg.err)
 	}
-	if len(msg.logs) > 0 {
-		for _, j := range m.JobQueue {
-			if j.ID == msg.jobID {
-				j.Logs = msg.logs
-				j.GHJobID = msg.ghJobID
-				break
-			}
-		}
-		m.updateViewport()
-	} else if msg.err != nil {
-		for _, j := range m.JobQueue {
-			if j.ID == msg.jobID {
-				j.Logs = []string{"[log fetch failed: " + msg.err.Error() + "]"}
-				break
-			}
-		}
-		m.updateViewport()
+	if m.EmptyLogs == nil {
+		m.EmptyLogs = make(map[string]bool)
 	}
+	if m.LogErrors == nil {
+		m.LogErrors = make(map[string]string)
+	}
+	for _, j := range m.JobQueue {
+		if j.ID != msg.jobID {
+			continue
+		}
+		delete(m.EmptyLogs, msg.jobID)
+		delete(m.LogErrors, msg.jobID)
+		switch {
+		case len(msg.logs) > 0:
+			j.Logs = msg.logs
+			j.GHJobID = msg.ghJobID
+		case msg.err != nil:
+			m.LogErrors[msg.jobID] = msg.err.Error()
+		default:
+			m.EmptyLogs[msg.jobID] = true
+		}
+		break
+	}
+	m.updateViewport()
 }
 
 func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
@@ -318,9 +391,9 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			if clearErr := clearConfiguredOwner(badOwner); clearErr != nil {
 				slog.Error("failed to clear invalid owner from config", "owner", badOwner, "error", clearErr)
 			}
-			m.setToast(fmt.Sprintf(" %s GitHub owner %q not found — cleared. Restart freshen to set a new one.", iconError, badOwner), 3)
+			m.setToast(fmt.Sprintf("%s GitHub owner %q not found — cleared. Restart freshen to set a new one.", statusGlyphs[kindFailure], badOwner), 3)
 		} else {
-			m.setToast(fmt.Sprintf(" %s Fetch failed: %v. Check 'gh auth status'.", iconError, msg.err), 2)
+			m.setToast(fmt.Sprintf("%s Fetch failed: %v. Check 'gh auth status'.", statusGlyphs[kindFailure], msg.err), 2)
 		}
 		m.updateViewport()
 		if pendingRefresh {
@@ -358,14 +431,20 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			m.setToast("Local repository metadata is incomplete; keeping last known data where available. Press r to retry.", 1)
 		}
 	}
+	// A sync or action snapshot applied after this refresh started is newer
+	// than what the refresh read for that repository, so it keeps its state.
+	superseded := func(path string) bool { return m.RepoStateRev[path] != m.OrgRefreshRevs[path] }
 	if len(m.Repos) > 0 && len(msg.repos) > 0 {
 		oldRepoBranches := make(map[string]string)
 		for _, r := range m.Repos {
 			oldRepoBranches[r.Name] = r.CurrentBranch
 		}
 		for _, newR := range msg.repos {
+			if superseded(newR.Path) {
+				continue
+			}
 			if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
-				m.setToast(fmt.Sprintf("  Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
+				m.setToast(fmt.Sprintf("Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
 			}
 		}
 	}
@@ -420,8 +499,18 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 						fresh.CountsUpdatedAt = updatedAt
 					}
 				}
-				if fresh.CurrentBranch == old.CurrentBranch {
+				switch {
+				case superseded(fresh.Path):
+					copyRepoState(fresh, old)
 					fresh.BranchDetails = old.BranchDetails
+				case fresh.CurrentBranch == old.CurrentBranch:
+					fresh.BranchDetails = old.BranchDetails
+				default:
+					// The checkout moved: a detail read started before this
+					// refresh, and the cached details, describe the previous
+					// branch. Show them as unread until a new read lands.
+					fresh.BranchDetails = git.BranchWorktreeDetails{Unread: true}
+					m.invalidateBranchReads(fresh.Path)
 				}
 				break
 			}
@@ -483,6 +572,11 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	if pendingRefresh {
 		cmd = tea.Batch(cmd, m.startOrgRefresh(false, true))
 	}
+	// An open detail whose checkout moved reads its branches again; a read
+	// already running for it is discarded on arrival and restarts then.
+	if path := m.openRepoDetailPath(); path != "" && m.RepoDetailLoading != path && m.Repos[m.SelectedIndex].BranchDetails.Unread {
+		cmd = tea.Batch(cmd, m.loadRepoDetails())
+	}
 	m.updateViewport()
 	return cmd, false
 }
@@ -513,9 +607,11 @@ func (m *Model) handleWindowSizeMsg(msg tea.WindowSizeMsg) {
 	m.Height = msg.Height
 
 	m.Viewport.Width = max(2, msg.Width-2)
-	m.Viewport.Height = max(1, msg.Height-5)
-	m.Search.Width = max(1, msg.Width-6)
-	m.Help.Width = max(1, msg.Width)
+	m.Viewport.Height = max(1, msg.Height-headerRows-footerRows)
+	m.sizeSearch()
+	// Help rows rewrap at the new width, so keep the stored offset within the
+	// new range rather than only clamping what is drawn.
+	m.HelpOffset = min(m.HelpOffset, m.helpMaxOffset())
 
 	m.updateViewport()
 }
@@ -554,11 +650,11 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 					label := fmt.Sprintf("Run %s / %s #%d", newJ.Repo, newJ.Run.Workflow, newJ.Run.Number)
 					switch newJ.Status {
 					case jobs.JobFailed:
-						m.setToast(label+" failed", 2)
+						m.setToast(statusGlyphs[kindFailure]+" "+label+" failed", 2)
 					case jobs.JobPassed:
-						m.setToast(label+" passed", 1)
+						m.setToast(statusGlyphs[kindSuccess]+" "+label+" passed", 1)
 					case jobs.JobCancelled:
-						m.setToast(label+" cancelled", 1)
+						m.setToast(statusGlyphs[kindSkipped]+" "+label+" cancelled", 1)
 					}
 				}
 				continue
@@ -571,15 +667,15 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
-						m.setToast(fmt.Sprintf(" ❌ Job %s failed (%s) on %s", newJ.ID, newJ.Name, runnerStr), 2)
+						m.setToast(fmt.Sprintf("%s Job %s failed (%s) on %s", statusGlyphs[kindFailure], newJ.ID, newJ.Name, runnerStr), 2)
 					case jobs.JobRunning:
 						runnerStr := newJ.RunnerName
 						if runnerStr == "" {
 							runnerStr = "worker"
 						}
-						m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+						m.setToast(fmt.Sprintf("%s Job %s started running on %s", statusGlyphs[kindRunning], newJ.ID, runnerStr), 1)
 					case jobs.JobPassed:
-						m.setToast(fmt.Sprintf(" ✅ Job %s passed (%s)", newJ.ID, newJ.Name), 1)
+						m.setToast(fmt.Sprintf("%s Job %s passed (%s)", statusGlyphs[kindSuccess], newJ.ID, newJ.Name), 1)
 					}
 				}
 			} else {
@@ -589,9 +685,9 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 					if runnerStr == "" {
 						runnerStr = "worker"
 					}
-					m.setToast(fmt.Sprintf(" ⚡ Job %s started running on %s", newJ.ID, runnerStr), 1)
+					m.setToast(fmt.Sprintf("%s Job %s started running on %s", statusGlyphs[kindRunning], newJ.ID, runnerStr), 1)
 				case jobs.JobQueued:
-					m.setToast(fmt.Sprintf(" ⏳ Job %s queued (%s)", newJ.ID, newJ.Name), 1)
+					m.setToast(fmt.Sprintf("%s Job %s queued (%s)", statusGlyphs[kindQueued], newJ.ID, newJ.Name), 1)
 				}
 			}
 		}
@@ -644,7 +740,7 @@ func (m *Model) processJobQueueUpdate(queue []*jobs.JobItem, newHistory map[stri
 }
 
 // triggerLogFetchForSelectedJob returns a log-fetch command if a running job is selected.
-func (m Model) triggerLogFetchForSelectedJob() tea.Cmd {
+func (m *Model) triggerLogFetchForSelectedJob() tea.Cmd {
 	if m.ActiveFocus != FocusJobs {
 		return nil
 	}

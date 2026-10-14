@@ -21,7 +21,111 @@ The interface uses the existing Charm stack: Bubble Tea, Lip Gloss, and Bubbles
 text input, help, viewport, spinner and progress components. It avoids a framework
 migration while replacing the old panel layout and navigation code.
 
+## Navigation, visual design and feedback pass
+
+Reviewed on 13 October 2026 against `f324ced`.
+
+| Finding | Change |
+|---|---|
+| Key handling was a string switch; `?` showed a hand-written page that could drift from it | One `keyMap`; `keys()` enables bindings per context; handler, footer and `?` overlay all read it |
+| `q`, `0`–`4` and Tab did nothing over the help page; `/` did nothing on Overview or in details | Global keys act everywhere outside the filter, menu and confirmation; `/` filters the nearest list |
+| Esc closed an open run before clearing that run's job filter | Esc leaves the innermost layer: job, detail, filter, run, then the message |
+| The context row mixed location and statistics; runner detail read "Runners / details" | A breadcrumb (`Actions › alpha / CI #42 › test`) followed by screen statistics |
+| Colours and styles were built ad hoc in each render function; job states were colour plus word, repository states a Nerd Font glyph only, runner states a word only | `theme.go` owns the palette; every status is glyph, word and colour (`✓ ✗ ↻ ◌ ⊘ ? !`) |
+| Bubbles' progress bar ignored `NO_COLOR` | The bar follows Lip Gloss's environment-aware profile; `NO_COLOR` builds a colourless theme with reverse-video selection |
+| Toasts never expired and could stay until Esc | Info toasts expire after 6 s, errors after 15 s; a sequence number stops a stale expiry clearing a newer toast |
+| Footer hints were truncated from the right, so `?` was the first hint lost on narrow terminals | Hints are fitted with the final hint (`? keys` or the modal escape) always shown |
+| Data age was shown only for Actions | The header shows the current screen's data age and refresh interval |
+| Runners were fetched every 10 s on every screen | The runner poll pauses on screens that do not show runners and refreshes on return |
+| Each running-job log refresh listed the run's jobs before downloading the log | A known job ID downloads the log directly: one request instead of two or more |
+| Runs had no timing; failed jobs gave no reason | Runs show running/waiting/took times; failed jobs name the first failing step; tabs count failures and running work |
+| Empty Runners and Repositories screens said "Nothing to show"; without an owner, Actions and Runners looked empty rather than unconfigured | Empty states name what is empty and the next key to press |
+| The breadcrumb was prepended to a filter input sized to the full width, so long queries lost their end and cursor; long names could hide the input or the active detail tab | Controls are sized first and the breadcrumb shortened to what remains; detail tabs fall back to short labels |
+| After a runner error toast expired, cached runners looked live | A status-row warning keeps the cached data's age and `r` retry hint until a refresh succeeds |
+| Repository detail rendered before marking its requests, showing "none found" or "not loaded" while they ran | Requests start before the first render; the spinner animates while the detail waits |
+| Opening repository B while A's branch read ran dropped B's read | B is queued and started when A's read completes, if B's detail is still open |
+| An empty successful log left "Loading logs…" on screen; automatic log refreshes could overlap and an older response could replace newer lines | Every response re-renders; empty logs are stated; one log request at a time, with a sequence number discarding overtaken responses |
+| Help rows were clipped at narrow widths and Home/End did nothing in help | Help rows wrap with a hanging indent; Home/End jump to the top and bottom |
+| Detail text was clipped at narrow widths | Detail viewports wrap to the body width, keeping OSC 8 links intact |
+| The offline demo dropped runner and other fetches but left their loading flags set | The demo completes each dropped request with its seeded data |
+| A log request's 30-second limit applied to each `gh` call, so a slow fallback (download, then several jobs-list pages) could outlive the 45-second backstop and be abandoned while still running | One 40-second deadline covers the whole request; a stuck request is cancelled before its replacement starts |
+| A successful empty log kept an earlier "log fetch failed" line on screen; a failed refresh replaced the last good tail | The detail states only the latest outcome; a kept tail is labelled "Showing the previous tail" |
+| Resizing with help scrolled to the end left one help row and a status of "lines 76–46 of 46" | The help offset is clamped to the rewrapped content on resize |
+| A long repository name wrapped the action menu heading over the selected action at 30 × 10 | The heading is cut to one row and the detail gives way first, so the selected action always shows |
+| On narrow terminals the header dropped its data age, spinner included, so a refresh over cached rows showed no loading state | The header falls back to `⣾ refreshing`, then the spinner alone, and truncates the owner before losing it |
+| The under-size notice offered `q quit` during a filter, menu or confirmation, where `q` is ignored; the demo quit on `q` regardless | The notice names the quit binding enabled in the current layer (`ctrl+c` in modal layers), and the demo quits only through enabled bindings |
+| Branch reads ran on the session context with no deadline, so a hung `git` command kept repository detail loading, blocked `r` and stalled the queued repository | One 30-second deadline (`repoDetailTimeout`) covers the branch, worktree and status reads; a timeout ends the request and starts the queued read |
+| Branch reads after an action, and during a sync or clone, ran with no deadline of their own, so a hung `git` held `BusyAction` or `IsSyncing` and blocked further repository operations | Each branch-state read bounds itself (`branchReadTimeout`, 30 seconds); an action's re-read shares one deadline and a timeout keeps the completed mutation's result |
+| A detail read that started before a prune, switch, sync or branch-changing refresh could answer after it and restore deleted branches, the previous checkout's branches, or a clean tree | Sync and action snapshots, and refreshes that find a new current branch, bump `BranchDetailsRev`; a read started before the latest change is discarded |
+| A sync acted on failed preflight reads: an unbounded checkout check could hang it, a timed-out branch read became `HEAD` and drove a checkout and pull, and a failed dirty check counted as clean, skipping the stash | Each preflight read (checkout, current and default branch, merge, dirty) has its own deadline and must succeed; a failure ends the sync as "Read Err" before anything changes |
+| The checkout check treated every ordinary git failure (permissions, ownership, corruption) as a missing repository and cloned over it, and probed the filesystem with no deadline | Only a missing path, or a directory without `.git` that git rejects, means "clone"; other failures end the sync as "Read Err" with git's diagnostic. The probe returns at its deadline and a hung path holds one probe at most |
+| A refresh that read a repository before a switch or sync answered after it and restored the old branch, status and action target | Snapshots bump `RepoStateRev`; a refresh started before the latest snapshot keeps that repository's snapshot state and raises no "branch changed" toast |
+| A switch ran with no deadline or cancellation, and clone, push and prune only stopped on quit, so a hung command held `BusyAction` or `IsSyncing` | Switch, push and prune run under `repoActionTimeout`, switch also under `checkoutTimeout`, and a first clone under `cloneTimeout`; a stopped action says so and keeps finished steps in the log |
+| A refresh that found the checkout moved showed the unread branch details as "none found" and "working tree is clean" | The details are marked unread and say so; an open detail reads them again |
+| A sync's final snapshot carried branch details read before its checkout or pull, so the header said `main` while the branch list still marked the feature branch checked out | The sync re-reads branch details after its last change; a failed re-read is labelled as earlier data |
+| A failed `git branch`, `git worktree list` or `git status` showed as "none found" or "working tree is clean" | Each section states its failure with an `r` retry hint, and entries kept from an earlier read are labelled |
+| Opening job B while job A's log request ran dropped B's fetch, leaving "Logs not loaded" | Opening a job cancels the request for the job left and starts the open job's at once; `LogSeq` discards the late answer |
+| Branch reads, pulls, pushes and `gh` calls captured output without `WaitDelay`, so a hook or helper holding the pipes kept the worker waiting after the command exited or was killed | Every `git` and `gh` command starts through `proc.Command` with `WaitDelay`; the exit status decides success |
+| A stopped clone killed only `gh`; the `git` it started could keep writing into the checkout after freshen reported the clone stopped | Each command runs in its own process group (Unix); cancelling kills and waits for the whole group, and a survivor holds the path until it exits |
+| An organization refresh probed each checkout with an unbounded `os.Stat`, and a failed probe made a repository "not cloned" or dropped an archived one | The probe has a deadline and tells missing from unreadable; an unreadable checkout keeps its earlier record or shows "Read Err" with no delete or clone offered |
+| Prune's worktree probes, a clone's directory creation and the archived-repo delete ran with no deadline | Each is bounded; a filesystem change that outlives its deadline holds its path, and every repository operation refuses that path until the change ends |
+| A finished clone kept showing "not cloned" and offering only Clone until the next refresh; a failed post-clone branch read showed as branch `HEAD` | Snapshots carry `IsNew`; unread branches stay unresolved with a "Branch unread" status and a refresh hint |
+| A command blocked in the kernel, which no signal ends, held `proc.Run` (and so `BusyAction` or `IsSyncing`) indefinitely, because `exec.Cmd.Wait` blocks until the process is reaped | `proc.Run` stops waiting shortly after the context ends and returns a `StillRunningError`; the command's path stays held, and no command starts on it, until the process is reaped |
+| A command's leftover children outlived it: a held-output timeout counted as success without stopping them, and a `gh repo clone` that failed while its `git` kept writing went straight to the `git clone` fallback on the same path | When a command exits, `proc.Run` kills what is left of its group before returning; a survivor holds the path. The fallback runs only once gh's children are gone |
+| A cancelled archived-repo delete could still start: the worker launched without checking the context, and a path validation that finished after the deadline went on to `os.RemoveAll` | The delete refuses an ended context, and a start gate decides once whether the removal begins or the caller gave up; a stopped delete removes nothing and says so |
+| Refresh discarded git read failures: a failed checkout check dropped a known repository (local-only) or read as "not a checkout", and failed branch reads blanked known branches with no warning | `git.ReadLocalCheckout` returns its failures; the refresh keeps the previous record or branch, marks it stale, lists unknown directories as "Read Err" and reports incomplete local metadata |
+
 ## Verification
+
+`pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,
+200 × 50, 30 × 10 and other sizes and checks the frame height, row widths,
+header and final footer hint. It also checks that screen keys never shadow global
+keys, that the overlay lists exactly the enabled bindings, that global keys act
+from every drill-down, that confirmations ignore every key but Enter and Esc,
+toast expiry and stale expiry, runner-poll call counts, `NO_COLOR` output and
+status glyph coverage. `pkg/tui/feedback_test.go` covers long queries and names
+at 80 × 24, 200 × 50 and 30 × 10, runner failures after toast expiry, the first
+frame of repository detail requests, the repository handoff, empty logs,
+single-flight and out-of-order log responses, cancellation of a stuck log request
+before its replacement, error-to-empty and populated-to-empty log transitions,
+wrapped and Home/End-scrolled help, the help offset after a resize, the action
+menu with long names, wrapped narrow details, the demo's settled requests, the
+narrow-header refresh indicator and the resize notice's quit key in each layer.
+`pkg/tui/handoff_test.go` covers a hung branch read ending at its deadline and
+handing off to the queued repository, failed reads shown as failures rather than
+empty sections, and opening another job while a log request runs.
+`pkg/git/branch_read_test.go` proves each sync preflight read ends at its own
+deadline, and that a sync whose checkout, branch, merge or dirty read hangs or
+fails stops without moving `HEAD`, pulling or stashing. It also covers ordinary
+checkout-check failures reported with git's diagnostic, a hung filesystem probe
+(one probe per path, sync stopped), and a hung checkout or clone stopped at its
+deadline or on quit; `pkg/git/sync_test.go` checks a sync's final branch details
+describe the checkout after it switched. `pkg/tui/branch_state_test.go` covers
+a late refresh after a switch or sync, a branch-changing refresh re-reading the
+open detail, the unread-details message, and hung switch, push and prune
+actions stopped with their finished steps kept.
+`pkg/proc/proc_test.go` runs real subprocesses: a child holding stdout cannot
+hold `Wait` past `WaitDelay` and is stopped with the command, after
+cancellation or after the command exits (with status 0 or not) a child the
+command left writing stops, a leftover that survives the kill is reported with
+a `Done` channel, and a command that cannot be reaped (`proc.BlockReaping`
+stands in for a process blocked in the kernel) returns soon after its deadline
+with readable output. `pkg/git/process_tree_test.go` repeats this through freshen's
+own paths (branch reads and a sync pull with a hook holding the pipes, a stopped
+clone whose child was writing into the checkout), and covers a hung delete
+holding its path against sync, switch, push, prune and delete, a hung clone
+directory, `DirExists`, and post-clone branch-read failures. It also covers a
+checkout that cannot be reaped (the switch returns, its path is held against a
+sync and against reads, and released once reaped), a failed `gh repo clone`
+whose writing child is stopped before the `git clone` fallback, and a
+cancelled delete, or one whose validation outlives the deadline, removing
+nothing. `TestUnreapableSwitchFreesTheRepository` in
+`pkg/tui/branch_state_test.go` shows the same switch clearing `BusyAction`.
+`pkg/tui/refresh_probe_test.go` covers failed and hung refresh probes, failed
+checkout, current-branch and default-branch reads in organization and
+local-only refreshes, and a clone snapshot followed by an older refresh. `pkg/jobs` tests count `gh`
+requests for log refreshes, prove a slow multi-page fallback ends at the request
+deadline, and run a `gh` whose child holds its output.
 
 Regression tests cover run/job drill-down, queue counts, step progress, filtering,
 scrolled mouse selection, frame dimensions, stable selection, confirmation targets,
@@ -39,6 +143,12 @@ percentage of wall time remaining; neither is fabricated. Logs are a 200-line ta
 with an explicit step-status fallback when GitHub withholds the download. Workflow
 configuration editing and Actions cancellation/rerun are outside this change.
 
-Run the fixture with `go test -c -o /tmp/freshen-ui.test ./pkg/tui`, then
-`FRESHEN_DEMO=1 /tmp/freshen-ui.test -test.run TestTerminalDemo`. It drops external
+Run the fixture with `go test -c -o "$TMPDIR/freshen-ui.test" ./pkg/tui`, then
+`FRESHEN_DEMO=1 "$TMPDIR/freshen-ui.test" -test.run TestTerminalDemo`. It drops external
 commands and uses seeded data; it cannot exercise real API or git operations.
+
+A process blocked in the kernel on a hung mount ignores every signal, and Go
+cannot interrupt a blocked filesystem call. freshen stops waiting at the
+deadline and holds the path until the call ends, but it cannot make the call
+end. The non-interactive batch mode (`main.go`) still checks paths with plain
+`os.Stat`.
