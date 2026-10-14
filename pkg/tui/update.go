@@ -46,6 +46,8 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// A sync or action snapshot that landed while this read ran is newer:
 		// keep it rather than restore branches it removed or a stale status.
+		// A refresh that found the checkout moved left the details unread, so
+		// an open detail reads them again rather than show them as empty.
 		if msg.rev == m.BranchDetailsRev[msg.repo.Path] {
 			for _, r := range m.Repos {
 				if r.Path == msg.repo.Path {
@@ -53,12 +55,13 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					break
 				}
 			}
+		} else if open := m.openRepoDetailPath(); open == msg.repo.Path && m.Repos[m.SelectedIndex].BranchDetails.Unread {
+			m.RepoDetailQueued = open
 		}
 		// Start the read that was queued behind this one if its detail is still open.
 		if queued := m.RepoDetailQueued; queued != "" {
 			m.RepoDetailQueued = ""
-			if m.Detail && (m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns) &&
-				m.SelectedIndex >= 0 && m.SelectedIndex < len(m.Repos) && m.Repos[m.SelectedIndex].Path == queued {
+			if m.openRepoDetailPath() == queued {
 				cmds = append(cmds, m.loadRepoDetails())
 			}
 		}
@@ -428,12 +431,18 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			m.setToast("Local repository metadata is incomplete; keeping last known data where available. Press r to retry.", 1)
 		}
 	}
+	// A sync or action snapshot applied after this refresh started is newer
+	// than what the refresh read for that repository, so it keeps its state.
+	superseded := func(path string) bool { return m.RepoStateRev[path] != m.OrgRefreshRevs[path] }
 	if len(m.Repos) > 0 && len(msg.repos) > 0 {
 		oldRepoBranches := make(map[string]string)
 		for _, r := range m.Repos {
 			oldRepoBranches[r.Name] = r.CurrentBranch
 		}
 		for _, newR := range msg.repos {
+			if superseded(newR.Path) {
+				continue
+			}
 			if oldBranch, ok := oldRepoBranches[newR.Name]; ok && oldBranch != "" && newR.CurrentBranch != "" && oldBranch != newR.CurrentBranch {
 				m.setToast(fmt.Sprintf("Branch changed for %s: %s → %s", newR.Name, oldBranch, newR.CurrentBranch), 1)
 			}
@@ -490,11 +499,17 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 						fresh.CountsUpdatedAt = updatedAt
 					}
 				}
-				if fresh.CurrentBranch == old.CurrentBranch {
+				switch {
+				case superseded(fresh.Path):
+					copyRepoState(fresh, old)
 					fresh.BranchDetails = old.BranchDetails
-				} else {
+				case fresh.CurrentBranch == old.CurrentBranch:
+					fresh.BranchDetails = old.BranchDetails
+				default:
 					// The checkout moved: a detail read started before this
-					// refresh describes the previous branch.
+					// refresh, and the cached details, describe the previous
+					// branch. Show them as unread until a new read lands.
+					fresh.BranchDetails = git.BranchWorktreeDetails{Unread: true}
 					m.invalidateBranchReads(fresh.Path)
 				}
 				break
@@ -556,6 +571,11 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 	}
 	if pendingRefresh {
 		cmd = tea.Batch(cmd, m.startOrgRefresh(false, true))
+	}
+	// An open detail whose checkout moved reads its branches again; a read
+	// already running for it is discarded on arrival and restarts then.
+	if path := m.openRepoDetailPath(); path != "" && m.RepoDetailLoading != path && m.Repos[m.SelectedIndex].BranchDetails.Unread {
+		cmd = tea.Batch(cmd, m.loadRepoDetails())
 	}
 	m.updateViewport()
 	return cmd, false

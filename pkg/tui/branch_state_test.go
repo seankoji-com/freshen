@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/seankoji-com/freshen/pkg/git"
 )
 
@@ -16,7 +18,7 @@ import (
 func TestBlockedPostActionReadDeliversResult(t *testing.T) {
 	originalSwitch, originalCurrent, originalRead, originalTimeout := switchBranch, getCurrentBranch, getRepoBranchDetails, repoDetailTimeout
 	repoDetailTimeout = 100 * time.Millisecond
-	switchBranch = func(item *git.RepoItem, branch string) error {
+	switchBranch = func(_ context.Context, item *git.RepoItem, branch string) error {
 		item.CurrentBranch = branch
 		item.Logs = append(item.Logs, "Switched branch to '"+branch+"'.")
 		return nil
@@ -65,8 +67,8 @@ func TestBlockedPostActionReadDeliversResult(t *testing.T) {
 	}
 }
 
-// A detail read that started before a prune or sync snapshot, or before a
-// refresh that found the checkout on another branch, answers after it. The older read must not restore deleted branches or report a stale
+// A detail read that started before a prune or sync snapshot answers after
+// it. The older read must not restore deleted branches or report a stale
 // working tree; a read started after the snapshot still applies.
 func TestStaleBranchReadCannotOverwriteNewerSnapshot(t *testing.T) {
 	for _, tc := range []struct {
@@ -79,16 +81,6 @@ func TestStaleBranchReadCannotOverwriteNewerSnapshot(t *testing.T) {
 		}},
 		{"sync", func(m *Model, snapshot *git.RepoItem) {
 			next, _ := m.Update(repoSyncMsg{repo: snapshot, snapshots: make(chan *git.RepoItem), bulk: true})
-			*m = next.(Model)
-		}},
-		{"refresh", func(m *Model, snapshot *git.RepoItem) {
-			// An organization refresh finds the checkout on another branch.
-			snapshot.CurrentBranch = "main"
-			repos := []*git.RepoItem{snapshot}
-			for _, r := range m.Repos[1:] {
-				repos = append(repos, r.Clone())
-			}
-			next, _ := m.Update(orgSyncedMsg{repos: repos})
 			*m = next.(Model)
 		}},
 	} {
@@ -136,6 +128,234 @@ func TestStaleBranchReadCannotOverwriteNewerSnapshot(t *testing.T) {
 			m = next.(Model)
 			if !slices.Contains(m.Repos[0].BranchDetails.LocalBranches, "feat/old") {
 				t.Fatalf("current read was discarded: %+v", m.Repos[0].BranchDetails)
+			}
+		})
+	}
+}
+
+// refreshRecords is what an organization refresh reports for the fixture:
+// fresh records with no branch details, alpha on branch.
+func refreshRecords(m Model, branch string, generation uint64) orgSyncedMsg {
+	var repos []*git.RepoItem
+	for _, r := range m.Repos {
+		repos = append(repos, &git.RepoItem{Name: r.Name, GHRepoName: r.GHRepoName, Path: r.Path, CurrentBranch: r.CurrentBranch, DefaultBranch: r.DefaultBranch, Status: git.StatusPending, Logs: []string{}})
+	}
+	repos[0].CurrentBranch = branch
+	return orgSyncedMsg{repos: repos, generation: generation}
+}
+
+// A refresh that finds the open repository on another branch never shows its
+// unread details as empty or clean: it reads them again, whether or not a
+// read was already running, and the new read applies.
+func TestRefreshThatMovesTheCheckoutRereadsOpenDetails(t *testing.T) {
+	for _, inFlight := range []bool{true, false} {
+		t.Run(map[bool]string{true: "read in flight", false: "no read in flight"}[inFlight], func(t *testing.T) {
+			reads := 0
+			original := getRepoBranchDetails
+			getRepoBranchDetails = func(context.Context, string, string) git.BranchWorktreeDetails {
+				reads++
+				return git.BranchWorktreeDetails{LocalBranches: []string{"* main", "feat/screens"}, Worktrees: []string{"/tmp/freshen-fixture/alpha  abc123 [main]"}}
+			}
+			t.Cleanup(func() { getRepoBranchDetails = original })
+
+			m := sized(smokeFixtureModel(), 120, 50)
+			press(&m, "1")
+			oldRead := press(&m, "enter")
+			press(&m, "]")
+			if !inFlight {
+				next, _ := m.Update(repoDetailsResponse(t, oldRead))
+				m = next.(Model)
+			}
+
+			// update, not Update: the branch-changed toast's 6s expiry tick
+			// would otherwise run with the re-read command.
+			next, refreshCmd := m.update(refreshRecords(m, "main", 0))
+			m = next.(Model)
+			if !m.Repos[0].BranchDetails.Unread {
+				t.Fatalf("details not marked unread: %+v", m.Repos[0].BranchDetails)
+			}
+			view := stripped(m.Viewport.View())
+			if strings.Contains(view, "working tree is clean") || strings.Contains(view, "none found") {
+				t.Fatalf("unread details shown as read:\n%s", view)
+			}
+
+			var reread repoDetailsLoadedMsg
+			if inFlight {
+				var restart tea.Cmd
+				next, restart = m.Update(repoDetailsResponse(t, oldRead)) // discarded, restarts
+				m = next.(Model)
+				reread = repoDetailsResponse(t, restart)
+			} else {
+				reread = repoDetailsResponse(t, refreshCmd)
+			}
+			if m.RepoDetailLoading != m.Repos[0].Path {
+				t.Fatalf("no new read is running: %q", m.RepoDetailLoading)
+			}
+			if view := stripped(m.Viewport.View()); !strings.Contains(view, "Loading branches") {
+				t.Fatalf("re-read not shown as loading:\n%s", view)
+			}
+			next, _ = m.Update(reread)
+			m = next.(Model)
+			got := m.Repos[0].BranchDetails
+			if got.Unread || !slices.Contains(got.LocalBranches, "* main") {
+				t.Fatalf("re-read not applied: %+v", got)
+			}
+			if reads != 2 { // the first read, then exactly one re-read
+				t.Fatalf("%d branch reads, want 2", reads)
+			}
+		})
+	}
+}
+
+// Unread details that are not being read say so, with a retry hint.
+func TestUnreadBranchDetailsSaySo(t *testing.T) {
+	m := sized(smokeFixtureModel(), 120, 50)
+	m.Repos[0].BranchDetails = git.BranchWorktreeDetails{Unread: true}
+	m.Repos[0].CurrentBranch = "main"
+	m.SelectedIndex = 0
+	m.Detail = true
+	m.ActiveTab = TabBranches
+	m.updateViewport()
+	view := stripped(m.Viewport.View())
+	if !strings.Contains(view, "Not read since the checkout moved to main") || !strings.Contains(view, "Press r") || strings.Contains(view, "clean") {
+		t.Fatalf("unread details not stated:\n%s", view)
+	}
+	// The message wraps inside the frame at every size.
+	for _, size := range [][2]int{{80, 24}, {200, 50}, {30, 10}} {
+		lines := strings.Split(renderAt(m, size[0], size[1]), "\n")
+		if len(lines) != size[1] {
+			t.Fatalf("%v: height %d", size, len(lines))
+		}
+		for _, line := range lines {
+			if ansi.StringWidth(line) > size[0] {
+				t.Fatalf("%v: overflow %q", size, stripped(line))
+			}
+		}
+	}
+}
+
+// A refresh that read a repository before a switch or sync snapshot landed
+// answers after it. The repository keeps the snapshot's branch, status and
+// details, raises no "branch changed" toast, and the next action targets the
+// snapshot's branch. A refresh started after the snapshot still applies.
+func TestLateRefreshCannotOverwriteNewerSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		apply func(m *Model, snapshot *git.RepoItem)
+	}{
+		{"switch", func(m *Model, snapshot *git.RepoItem) {
+			next, _ := m.Update(actionResultMsg{id: "switch", label: "Switch branch", path: snapshot.Path, repo: snapshot})
+			*m = next.(Model)
+		}},
+		{"sync", func(m *Model, snapshot *git.RepoItem) {
+			next, _ := m.Update(repoSyncMsg{repo: snapshot, snapshots: make(chan *git.RepoItem), bulk: true})
+			*m = next.(Model)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := sized(smokeFixtureModel(), 120, 50)
+			m.Repos[0].OriginalBranch = "feat/screens"
+			if m.startOrgRefresh(false, false) == nil {
+				t.Fatal("refresh did not start")
+			}
+			late := refreshRecords(m, "feat/screens", m.OrgRefreshGeneration) // read before the switch
+
+			snapshot := m.Repos[0].Clone()
+			snapshot.CurrentBranch = "main"
+			snapshot.Status = git.StatusSwitchedDefault
+			snapshot.StatusMsg = "Switched"
+			snapshot.BranchDetails = git.BranchWorktreeDetails{LocalBranches: []string{"* main", "feat/screens"}}
+			tc.apply(&m, snapshot)
+			m.clearToast()
+
+			next, _ := m.Update(late)
+			m = next.(Model)
+			alpha := m.Repos[0]
+			if alpha.CurrentBranch != "main" || alpha.Status != git.StatusSwitchedDefault || !slices.Contains(alpha.BranchDetails.LocalBranches, "* main") {
+				t.Fatalf("late refresh overwrote the snapshot: branch=%q status=%s details=%+v", alpha.CurrentBranch, alpha.Status, alpha.BranchDetails)
+			}
+			if strings.Contains(m.ToastMsg, "Branch changed") {
+				t.Fatalf("late refresh raised %q", m.ToastMsg)
+			}
+			m.SelectedIndex = 0
+			m.captureActionTarget()
+			if m.ActionTarget == nil || m.ActionTarget.CurrentBranch != "main" {
+				t.Fatalf("action target uses the late refresh: %+v", m.ActionTarget)
+			}
+
+			// A refresh started after the snapshot is newer and applies.
+			m.IsOrgSyncing = false
+			m.startOrgRefresh(false, false)
+			next, _ = m.Update(refreshRecords(m, "feat/other", m.OrgRefreshGeneration))
+			m = next.(Model)
+			if m.Repos[0].CurrentBranch != "feat/other" {
+				t.Fatalf("newer refresh was discarded: %q", m.Repos[0].CurrentBranch)
+			}
+		})
+	}
+}
+
+// A switch, push or prune whose git or gh never answers is stopped at
+// repoActionTimeout: the result arrives, BusyAction clears, the failure says
+// it was stopped, and steps that finished before it stay logged.
+func TestHungRepositoryActionIsStopped(t *testing.T) {
+	originals := []any{switchBranch, publishRepo, pruneRepo, getCurrentBranch, getRepoBranchDetails, repoActionTimeout}
+	t.Cleanup(func() {
+		switchBranch = originals[0].(func(context.Context, *git.RepoItem, string) error)
+		publishRepo = originals[1].(func(context.Context, *git.RepoItem) error)
+		pruneRepo = originals[2].(func(context.Context, *git.RepoItem) (git.PruneResult, error))
+		getCurrentBranch = originals[3].(func(context.Context, string) string)
+		getRepoBranchDetails = originals[4].(func(context.Context, string, string) git.BranchWorktreeDetails)
+		repoActionTimeout = originals[5].(time.Duration)
+	})
+	repoActionTimeout = 100 * time.Millisecond
+	switchBranch = func(ctx context.Context, _ *git.RepoItem, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	publishRepo = func(ctx context.Context, item *git.RepoItem) error {
+		item.Logs = append(item.Logs, "Pushed branch 'feat/screens' to origin.")
+		<-ctx.Done() // gh pr create hangs
+		return ctx.Err()
+	}
+	pruneRepo = func(ctx context.Context, _ *git.RepoItem) (git.PruneResult, error) {
+		<-ctx.Done()
+		return git.PruneResult{DeletedBranches: []string{"feat/old"}}, ctx.Err()
+	}
+	getCurrentBranch = func(context.Context, string) string { return "feat/screens" }
+	getRepoBranchDetails = func(context.Context, string, string) git.BranchWorktreeDetails {
+		return git.BranchWorktreeDetails{LocalBranches: []string{"* feat/screens"}}
+	}
+
+	for id, partial := range map[string]string{"switch": "", "push": "Pushed branch 'feat/screens' to origin.", "prune": "Deleted local branch: feat/old"} {
+		t.Run(id, func(t *testing.T) {
+			m := sized(smokeFixtureModel(), 120, 50)
+			m.ActionTarget = m.Repos[0].Clone()
+			cmd := m.executeAction(id)
+			if m.BusyAction == "" {
+				t.Fatal("action did not mark the repository busy")
+			}
+			delivered := make(chan []tea.Msg, 1)
+			go func() { delivered <- runCmd(cmd) }()
+			var msgs []tea.Msg
+			select {
+			case msgs = <-delivered:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("hung %s held its result past the action deadline", id)
+			}
+			for _, msg := range msgs {
+				next, _ := m.Update(msg)
+				m = next.(Model)
+			}
+			if m.BusyAction != "" || !strings.Contains(m.ToastMsg, "failed") || !strings.Contains(m.ToastMsg, "stopped after") {
+				t.Fatalf("stopped action not reported: busy=%q toast=%q", m.BusyAction, m.ToastMsg)
+			}
+			logs := m.Repos[0].Logs
+			if !slices.ContainsFunc(logs, func(l string) bool { return strings.Contains(l, "was stopped after") }) {
+				t.Fatalf("stop not logged: %v", logs)
+			}
+			if partial != "" && !slices.Contains(logs, partial) {
+				t.Fatalf("finished step %q lost: %v", partial, logs)
 			}
 		})
 	}

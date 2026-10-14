@@ -181,6 +181,8 @@ type Model struct {
 	RepoDetailLoading  string            // repository path whose branch details are being read
 	RepoDetailQueued   string            // repository path to read once RepoDetailLoading completes
 	BranchDetailsRev   map[string]uint64 // per repository path, snapshots that replaced its branch details; a detail read started before the latest is discarded
+	RepoStateRev       map[string]uint64 // per repository path, sync and action snapshots applied; an organization refresh started before the latest keeps that snapshot's state
+	OrgRefreshRevs     map[string]uint64 // RepoStateRev when the running organization refresh started
 	LogLoading         string            // job ID whose log request is in flight
 	LogLoadingSince    time.Time
 	LogSeq             uint64            // identity of the newest log request; older responses are discarded

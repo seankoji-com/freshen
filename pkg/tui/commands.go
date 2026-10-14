@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -365,6 +366,9 @@ func (m *Model) startOrgRefresh(autoSync, notifyCountsErr bool) tea.Cmd {
 	m.IsOrgSyncing = true
 	m.OrgSyncStartedAt = now
 	m.OrgRefreshGeneration++
+	// The refresh reads each checkout from here on; a sync or action
+	// snapshot that lands before it answers is newer for that repository.
+	m.OrgRefreshRevs = maps.Clone(m.RepoStateRev)
 	previous := cloneRepoItems(m.Repos)
 	return m.loadOrgReposCmd(autoSync, m.OrgRefreshGeneration, previous)
 }
@@ -529,23 +533,33 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 		if item.Name != snapshot.Name {
 			continue
 		}
-		item.Status = snapshot.Status
-		item.StatusMsg = snapshot.StatusMsg
-		item.OriginalBranch = snapshot.OriginalBranch
-		item.CurrentBranch = snapshot.CurrentBranch
-		item.DefaultBranch = snapshot.DefaultBranch
-		item.HasUnstagedChanges = snapshot.HasUnstagedChanges
-		item.ExistingPRURL = snapshot.ExistingPRURL
+		copyRepoState(item, snapshot)
 		// A section the snapshot could not read keeps its earlier entries,
 		// which the detail labels alongside the failure.
 		item.BranchDetails = mergeBranchDetails(item.BranchDetails, snapshot.BranchDetails)
 		m.invalidateBranchReads(item.Path)
-		item.Stashed = snapshot.Stashed
-		item.DraftPRURL = snapshot.DraftPRURL
-		item.ErrorErr = snapshot.ErrorErr
-		item.Logs = snapshot.Logs
+		if m.RepoStateRev == nil {
+			m.RepoStateRev = make(map[string]uint64)
+		}
+		m.RepoStateRev[item.Path]++
 		return
 	}
+}
+
+// copyRepoState copies the fields a sync or action owns, other than
+// BranchDetails, from src onto dst.
+func copyRepoState(dst, src *git.RepoItem) {
+	dst.Status = src.Status
+	dst.StatusMsg = src.StatusMsg
+	dst.OriginalBranch = src.OriginalBranch
+	dst.CurrentBranch = src.CurrentBranch
+	dst.DefaultBranch = src.DefaultBranch
+	dst.HasUnstagedChanges = src.HasUnstagedChanges
+	dst.ExistingPRURL = src.ExistingPRURL
+	dst.Stashed = src.Stashed
+	dst.DraftPRURL = src.DraftPRURL
+	dst.ErrorErr = src.ErrorErr
+	dst.Logs = src.Logs
 }
 
 func copyToClipboard(text string) error {
@@ -717,11 +731,19 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 // can block or fail it.
 var getRepoBranchDetails = git.GetRepoBranchDetails
 
-// getCurrentBranch and switchBranch are swappable for the same reason.
+// getCurrentBranch and the repository actions are swappable for the same
+// reason.
 var (
 	getCurrentBranch = git.GetOriginalBranch
 	switchBranch     = git.SwitchBranch
+	publishRepo      = git.CommitPushPRAndSwitchDefault
+	pruneRepo        = git.PruneBranchesAndWorktrees
 )
+
+// repoActionTimeout bounds the change a switch, push or prune action makes, so
+// a hung git or gh fails the action and frees BusyAction. Steps that finished
+// before the deadline stay done and are listed in the repository log.
+var repoActionTimeout = 5 * time.Minute
 
 // repoDetailTimeout bounds one repository's branch, worktree and status
 // reads together.
@@ -741,4 +763,13 @@ func mergeBranchDetails(cached, fresh git.BranchWorktreeDetails) git.BranchWorkt
 		fresh.ChangedFiles = cached.ChangedFiles
 	}
 	return fresh
+}
+
+// openRepoDetailPath is the path of the repository whose detail is open, or "".
+func (m Model) openRepoDetailPath() string {
+	if !m.Detail || (m.ActiveFocus != FocusRepos && m.ActiveFocus != FocusConcerns) ||
+		m.SelectedIndex < 0 || m.SelectedIndex >= len(m.Repos) {
+		return ""
+	}
+	return m.Repos[m.SelectedIndex].Path
 }

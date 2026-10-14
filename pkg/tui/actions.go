@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -174,6 +175,10 @@ func (m *Model) executeAction(id string) tea.Cmd {
 	}
 	m.clearToast()
 	work := func() actionResultMsg {
+		// One deadline bounds the change itself, so a hung git or gh fails
+		// the action instead of holding BusyAction until quit.
+		actionCtx, cancelAction := context.WithTimeout(ctx, repoActionTimeout)
+		defer cancelAction()
 		result := actionResultMsg{id: id, label: label, repo: target}
 		if target != nil {
 			result.path = target.Path
@@ -207,12 +212,12 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			if target.CurrentBranch == branch {
 				branch = target.DefaultBranch
 			}
-			result.err = switchBranch(target, branch)
+			result.err = switchBranch(actionCtx, target, branch)
 		case "push":
-			result.err = git.CommitPushPRAndSwitchDefault(ctx, target)
+			result.err = publishRepo(actionCtx, target)
 		case "prune":
 			var pruned git.PruneResult
-			pruned, result.err = git.PruneBranchesAndWorktrees(ctx, target)
+			pruned, result.err = pruneRepo(actionCtx, target)
 			for _, path := range pruned.RemovedWorktrees {
 				target.Logs = append(target.Logs, "Removed worktree: "+path)
 			}
@@ -240,6 +245,10 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			target.Logs = append(target.Logs, fmt.Sprintf("Prune removed %d worktrees, pruned %d stale registrations, and deleted %d branches; error: %v", len(pruned.RemovedWorktrees), len(pruned.PrunedWorktrees), len(pruned.DeletedBranches), result.err))
 		case "delete":
 			result.err = git.DeleteLocalRepo(dir, target.Path)
+		}
+		if (id == "switch" || id == "push" || id == "prune") && result.err != nil && errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
+			result.err = fmt.Errorf("stopped after %s; steps that finished are in the repository log: %w", repoActionTimeout, result.err)
+			target.Logs = append(target.Logs, fmt.Sprintf("%s was stopped after %s; the steps logged above it finished.", label, repoActionTimeout))
 		}
 		if target != nil && id != "delete" && id != "copy" && id != "open" {
 			// The mutation's outcome is already in result. One deadline bounds

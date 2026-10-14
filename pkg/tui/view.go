@@ -117,6 +117,10 @@ func (m *Model) updateViewport() {
 				break
 			}
 			details := item.BranchDetails
+			if details.Unread {
+				sb.WriteString(th.status(kindWarning, "Not read since the checkout moved to "+jobs.SanitizeTerminal(item.CurrentBranch)+".") + " Press r to read branches and worktrees.\n")
+				break
+			}
 			if details.Failed() {
 				sb.WriteString(th.status(kindWarning, "Some git reads failed.") + " Press r to retry.\n\n")
 			}

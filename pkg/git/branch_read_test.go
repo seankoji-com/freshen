@@ -3,12 +3,14 @@ package git
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -163,6 +165,25 @@ func TestReadIsGitRepoTellsMissingFromFailed(t *testing.T) {
 		t.Fatalf("plain directory: %v, %v", ok, err)
 	}
 
+	// A checkout git cannot read is a failed read, with git's diagnostic,
+	// never a missing repository to clone over.
+	checkout := t.TempDir()
+	if err := os.Mkdir(filepath.Join(checkout, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, diagnostic := range []string{
+		"fatal: detected dubious ownership in repository",
+		"fatal: cannot change to '/x': Permission denied",
+		"fatal: bad config line 1 in file .git/config",
+	} {
+		runner = &contextFakeRunner{fn: func(context.Context, string, []string) ([]byte, error) {
+			return nil, errors.New("exit status 128: " + diagnostic)
+		}}
+		if ok, err := readIsGitRepo(context.Background(), checkout); ok || err == nil || !strings.Contains(err.Error(), diagnostic) {
+			t.Fatalf("%s: got %v, %v; want the diagnostic as an error", diagnostic, ok, err)
+		}
+	}
+
 	shortBranchReads(t)
 	runnerBlocksOn(t, false, func([]string) bool { return true })
 	dir := t.TempDir()
@@ -183,6 +204,7 @@ func TestSyncStopsBeforeMutationWhenPreflightReadFails(t *testing.T) {
 		match func([]string) bool
 	}{
 		{"checkout check hangs", false, hasArgs("--is-inside-work-tree")},
+		{"checkout check fails", true, hasArgs("--is-inside-work-tree")},
 		{"current branch hangs", false, hasArgs("symbolic-ref", "--short", "HEAD")},
 		{"current branch fails", true, func(args []string) bool {
 			return hasArgs("symbolic-ref", "--short", "HEAD")(args) || hasArgs("rev-parse", "--short", "HEAD")(args)
@@ -257,5 +279,160 @@ func TestSyncFinishesWhenBranchReadHangs(t *testing.T) {
 	}
 	if f.readWork("upstream.txt") != "new\n" {
 		t.Fatal("pull did not land")
+	}
+}
+
+// blockStat makes statPath hang for path until the test ends, counting calls.
+func blockStat(t *testing.T, path string) *atomic.Int32 {
+	t.Helper()
+	var calls atomic.Int32
+	release := make(chan struct{})
+	original := statPath
+	statPath = func(name string) (fs.FileInfo, error) {
+		if name == path {
+			calls.Add(1)
+			<-release
+		}
+		return original(name)
+	}
+	t.Cleanup(func() {
+		close(release)
+		statPath = original
+	})
+	return &calls
+}
+
+// A filesystem that never answers the checkout probe fails the read at its
+// deadline, naming the filesystem. Later callers wait on the same probe
+// rather than start another, so a hung path holds one goroutine at most.
+func TestCheckoutProbeIsBounded(t *testing.T) {
+	shortBranchReads(t)
+	dir := t.TempDir()
+	calls := blockStat(t, dir)
+	for range 3 {
+		returned := make(chan error, 1)
+		go func() {
+			_, err := readIsGitRepo(context.Background(), dir)
+			returned <- err
+		}()
+		var err error
+		select {
+		case err = <-returned:
+		case <-time.After(5 * time.Second):
+			t.Fatal("hung probe did not return at its deadline")
+		}
+		if !errors.Is(err, errPathUnanswered) || readFailure(err) != "the filesystem did not answer before the deadline" {
+			t.Fatalf("hung probe returned %v (%q)", err, readFailure(err))
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("%d probes started for one hung path", n)
+	}
+}
+
+// A sync whose checkout probe hangs stops with a read error at the deadline
+// and changes nothing.
+func TestSyncStopsWhenCheckoutProbeHangs(t *testing.T) {
+	f := newSyncFixture(t)
+	f.pushUpstream()
+	head := runGit(t, f.work, "rev-parse", "HEAD")
+	shortBranchReads(t)
+	blockStat(t, f.work)
+
+	done := make(chan *RepoItem, 1)
+	go func() { done <- f.sync(false) }()
+	var item *RepoItem
+	select {
+	case item = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sync did not finish while its checkout probe hung")
+	}
+	if item.Status != StatusError || item.StatusMsg != "Read Err" {
+		t.Fatalf("sync status %s %q; logs: %v", item.Status, item.StatusMsg, item.Logs)
+	}
+	if last := item.Logs[len(item.Logs)-1]; !strings.Contains(last, "filesystem did not answer") || !strings.Contains(last, "nothing was changed") {
+		t.Fatalf("failure not reported: %q", last)
+	}
+	if got := runGit(t, f.work, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("HEAD moved from %s to %s", head, got)
+	}
+}
+
+// A checkout that never finishes is stopped at checkoutTimeout, and when the
+// caller's context ends (quit), with the failure logged and the branch kept.
+func TestSwitchBranchIsBounded(t *testing.T) {
+	hangGitOn(t, "checkout")
+	original := checkoutTimeout
+	t.Cleanup(func() { checkoutTimeout = original })
+	checkoutTimeout = 200 * time.Millisecond
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for name, ctx := range map[string]context.Context{"deadline": context.Background(), "quit": cancelled} {
+		t.Run(name, func(t *testing.T) {
+			item := &RepoItem{Name: "work", Path: t.TempDir(), CurrentBranch: "feature"}
+			returned := make(chan error, 1)
+			go func() { returned <- SwitchBranch(ctx, item, "main") }()
+			var err error
+			select {
+			case err = <-returned:
+			case <-time.After(5 * time.Second):
+				t.Fatal("hung checkout was not stopped")
+			}
+			if err == nil || !strings.Contains(err.Error(), "stopped before it finished") {
+				t.Fatalf("hung checkout returned %v", err)
+			}
+			if item.CurrentBranch != "feature" || len(item.Logs) == 0 || !strings.Contains(item.Logs[len(item.Logs)-1], "Failed to switch") {
+				t.Fatalf("failed switch recorded wrongly: %q %v", item.CurrentBranch, item.Logs)
+			}
+		})
+	}
+}
+
+// A first clone whose gh never answers is stopped at cloneTimeout, without
+// trying the git fallback past the deadline, and says a partial clone may
+// remain.
+func TestSyncStopsHungClone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the gh and git wrappers are POSIX shell scripts")
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not available")
+	}
+	bin := t.TempDir()
+	for name, script := range map[string]string{
+		"gh":  "#!/bin/sh\nexec " + sleep + " 60\n",
+		"git": "#!/bin/sh\nif [ \"$1\" = clone ]; then exec " + sleep + " 60; fi\nexec " + realGit + " \"$@\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	original := cloneTimeout
+	t.Cleanup(func() { cloneTimeout = original })
+	cloneTimeout = 300 * time.Millisecond
+
+	item := &RepoItem{Name: "fresh", GHRepoName: "fresh", URL: "https://example.invalid/org/fresh.git", Path: filepath.Join(t.TempDir(), "fresh"), IsNew: true}
+	done := make(chan struct{})
+	go func() {
+		SyncRepository(context.Background(), item, nil, false)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sync did not finish while its clone hung")
+	}
+	if item.Status != StatusError || item.StatusMsg != "Clone Err" {
+		t.Fatalf("sync status %s %q; logs: %v", item.Status, item.StatusMsg, item.Logs)
+	}
+	if last := item.Logs[len(item.Logs)-1]; !strings.Contains(last, "did not finish within") || !strings.Contains(last, "partial clone") {
+		t.Fatalf("stopped clone not reported: %q", last)
 	}
 }

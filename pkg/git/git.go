@@ -37,6 +37,7 @@ type execRunner struct{}
 
 func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = commandWaitDelay
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
@@ -72,9 +73,21 @@ const (
 	// process never exits (and kills git) mid-restore.
 	CleanupTimeout = 10 * time.Second
 	// syncTimeout caps one repository's sync of an existing checkout, so a
-	// stalled network call cannot hold a worker slot forever. Cloning is
-	// exempt: a large first clone can legitimately take longer.
+	// stalled network call cannot hold a worker slot forever. Cloning has
+	// its own, longer cloneTimeout.
 	syncTimeout = 10 * time.Minute
+	// commandWaitDelay bounds how long a killed command may hold its output
+	// pipes open, e.g. through a hook or a child git that outlives gh.
+	commandWaitDelay = 5 * time.Second
+)
+
+// cloneTimeout caps a first clone, which can legitimately take much longer
+// than a sync, and checkoutTimeout caps one branch switch. A hung clone or
+// checkout then fails its sync or action instead of holding it open.
+// Variables so tests can shorten them.
+var (
+	cloneTimeout    = 30 * time.Minute
+	checkoutTimeout = 2 * time.Minute
 )
 
 // branchReadTimeout bounds one read of a repository's branch state: the
@@ -159,6 +172,10 @@ type BranchWorktreeDetails struct {
 	BranchesErr  string
 	WorktreesErr string
 	StatusErr    string
+	// Unread marks details that no longer describe the checkout, because
+	// the branch it is on changed before they could be read again. Every
+	// section is empty and unknown, not empty and read.
+	Unread bool
 }
 
 // Failed reports whether any section's read failed.
@@ -505,6 +522,8 @@ func readGitLines(ctx context.Context, path string, args ...string) ([]string, s
 
 func gitReadFailure(err error) string {
 	switch {
+	case errors.Is(err, errPathUnanswered):
+		return errPathUnanswered.Error()
 	case errors.Is(err, context.DeadlineExceeded):
 		return "git did not answer before the deadline"
 	case errors.Is(err, context.Canceled):
@@ -822,27 +841,94 @@ func IsGitRepo(path string) bool {
 	return ok && err == nil
 }
 
-// readIsGitRepo reports whether path is a git working tree, under its own
-// branchReadTimeout deadline. A missing path is simply not one; a read that
-// times out or is cancelled returns an error, so a hung git is never mistaken
-// for a missing checkout.
+// readIsGitRepo reports whether path is a git working tree, with the path
+// probe and git sharing one branchReadTimeout deadline. Only two answers mean
+// "not a checkout": the path does not exist, or git rejects a directory that
+// has no .git entry. Anything else git or the filesystem fails on, including
+// permission, ownership and corruption errors, a hung git or a hung
+// filesystem, is returned as an error with its diagnostic, so a sync never
+// clones over a checkout it could not read.
 func readIsGitRepo(ctx context.Context, path string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
 	ctx, cancel := context.WithTimeout(ctx, branchReadTimeout)
 	defer cancel()
-	if _, err := runner.Run(ctx, "git", "-C", path, "rev-parse", "--is-inside-work-tree"); err == nil {
+	if _, err := statBounded(ctx, path); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	out, gitErr := runner.Run(ctx, "git", "-C", path, "rev-parse", "--is-inside-work-tree")
+	if gitErr == nil && strings.TrimSpace(string(out)) == "true" {
 		return true, nil
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return false, ctxErr
 	}
-	return false, nil
+	if _, err := statBounded(ctx, filepath.Join(path, ".git")); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if gitErr == nil {
+		gitErr = fmt.Errorf("git does not treat %s as a working tree although it has a .git entry", path)
+	}
+	return false, gitErr
 }
+
+// statPath is the filesystem probe statBounded runs; tests swap it to block.
+var statPath = os.Stat
+
+// pathProbe is one statPath call, shared by every caller asking about the
+// same path while it runs.
+type pathProbe struct {
+	done chan struct{}
+	info fs.FileInfo
+	err  error
+}
+
+// pathProbes holds the probes still running, by path. A probe that outlives
+// its caller's deadline stays here until the filesystem answers, and later
+// callers wait on it rather than start another, so a hung filesystem holds at
+// most one goroutine per path.
+var pathProbes = struct {
+	sync.Mutex
+	active map[string]*pathProbe
+}{active: make(map[string]*pathProbe)}
+
+// statBounded is os.Stat that returns when ctx ends, even if the filesystem
+// never answers.
+func statBounded(ctx context.Context, path string) (fs.FileInfo, error) {
+	pathProbes.Lock()
+	probe := pathProbes.active[path]
+	if probe == nil {
+		probe = &pathProbe{done: make(chan struct{})}
+		pathProbes.active[path] = probe
+		stat := statPath
+		go func() {
+			probe.info, probe.err = stat(path)
+			pathProbes.Lock()
+			delete(pathProbes.active, path)
+			pathProbes.Unlock()
+			close(probe.done)
+		}()
+	}
+	pathProbes.Unlock()
+	select {
+	case <-probe.done:
+		return probe.info, probe.err
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("%w (%s): %w", errPathUnanswered, path, ctx.Err())
+		}
+		return nil, ctx.Err()
+	}
+}
+
+// errPathUnanswered marks a filesystem probe that passed its deadline, so the
+// reason names the filesystem rather than git.
+var errPathUnanswered = errors.New("the filesystem did not answer before the deadline")
 
 func IsGitRepoContext(ctx context.Context, path string) bool {
 	_, err := runner.Run(ctx, "git", "-C", path, "rev-parse", "--is-inside-work-tree")
@@ -1111,6 +1197,7 @@ func (d BranchWorktreeDetails) clone() BranchWorktreeDetails {
 		BranchesErr:    d.BranchesErr,
 		WorktreesErr:   d.WorktreesErr,
 		StatusErr:      d.StatusErr,
+		Unread:         d.Unread,
 	}
 }
 
@@ -1120,6 +1207,10 @@ func (d BranchWorktreeDetails) clone() BranchWorktreeDetails {
 type syncSession struct {
 	item *RepoItem
 	emit SyncProgress
+	// rereadCtx, once set, makes finish re-read the branch details before
+	// publishing. A read that fails, e.g. because ctx has ended, marks its
+	// sections failed, so the TUI labels its earlier entries as such.
+	rereadCtx context.Context
 }
 
 // log appends a line to the repository log and publishes a snapshot.
@@ -1130,6 +1221,9 @@ func (s *syncSession) log(format string, args ...any) {
 
 // finish records a terminal status alongside its log line, in one snapshot.
 func (s *syncSession) finish(status RepoStatus, statusMsg, format string, args ...any) {
+	if s.rereadCtx != nil {
+		s.item.BranchDetails = GetRepoBranchDetails(s.rereadCtx, s.item.Path, s.item.DefaultBranch)
+	}
 	s.item.Status = status
 	s.item.StatusMsg = statusMsg
 	s.log(format, args...)
@@ -1184,21 +1278,29 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 			return
 		}
 
-		cloneCmd := exec.CommandContext(ctx, "gh", "repo", "clone", target, item.Path)
+		// gh and the git fallback share one cloneTimeout deadline.
+		cloneCtx, cloneCancel := context.WithTimeout(ctx, cloneTimeout)
+		defer cloneCancel()
+		cloneCmd := exec.CommandContext(cloneCtx, "gh", "repo", "clone", target, item.Path)
+		cloneCmd.WaitDelay = commandWaitDelay
 		var cloneOut bytes.Buffer
 		cloneCmd.Stdout = &cloneOut
 		cloneCmd.Stderr = &cloneOut
 		if err := cloneCmd.Run(); err != nil {
-			if item.URL != "" {
-				gitCloneCmd := exec.CommandContext(ctx, "git", "clone", item.URL, item.Path)
+			if item.URL != "" && cloneCtx.Err() == nil {
+				gitCloneCmd := exec.CommandContext(cloneCtx, "git", "clone", item.URL, item.Path)
+				gitCloneCmd.WaitDelay = commandWaitDelay
 				var gitCloneOut bytes.Buffer
 				gitCloneCmd.Stdout = &gitCloneOut
 				gitCloneCmd.Stderr = &gitCloneOut
-				if gitErr := gitCloneCmd.Run(); gitErr != nil {
-					s.finish(StatusError, "Clone Err", "󰅙 Failed to clone '%s': %s", target, strings.TrimSpace(cloneOut.String()+"\n"+gitCloneOut.String()))
+				err = gitCloneCmd.Run()
+				cloneOut.WriteString("\n" + gitCloneOut.String())
+			}
+			if err != nil {
+				if errors.Is(cloneCtx.Err(), context.DeadlineExceeded) {
+					s.finish(StatusError, "Clone Err", "󰅙 Cloning '%s' did not finish within %s and was stopped; a partial clone may remain at '%s'. Remove it, then sync again.", target, cloneTimeout, item.Path)
 					return
 				}
-			} else {
 				s.finish(StatusError, "Clone Err", "󰅙 Failed to clone '%s': %s", target, strings.TrimSpace(cloneOut.String()))
 				return
 			}
@@ -1249,8 +1351,6 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		return
 	}
 
-	item.BranchDetails = GetRepoBranchDetails(ctx, item.Path, defaultBranch)
-
 	if origBranch != defaultBranch {
 		item.ExistingPRURL = FetchExistingPRURL(ctx, item.Path, origBranch)
 		if item.ExistingPRURL != "" {
@@ -1264,6 +1364,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		return
 	}
 	item.HasUnstagedChanges = hasUnstagedChanges
+	// From here every outcome re-reads branches, worktrees and changed files
+	// after its last git change, so the final snapshot describes the checkout
+	// as the sync left it rather than as it found it.
+	s.rereadCtx = ctx
 
 	s.log(" Branch: %s | Default: %s | Unstaged: %v", origBranch, defaultBranch, hasUnstagedChanges)
 
@@ -1582,10 +1686,15 @@ func shortSHA(sha string) string {
 	return sha
 }
 
-// SwitchBranch switches checkout to target branch.
-func SwitchBranch(item *RepoItem, targetBranch string) error {
-	cmd := exec.Command("git", "-C", item.Path, "checkout", targetBranch)
-	if err := cmd.Run(); err != nil {
+// SwitchBranch switches checkout to target branch. The checkout ends when ctx
+// does or after checkoutTimeout, whichever is first.
+func SwitchBranch(ctx context.Context, item *RepoItem, targetBranch string) error {
+	ctx, cancel := context.WithTimeout(ctx, checkoutTimeout)
+	defer cancel()
+	if _, err := runner.Run(ctx, "git", "-C", item.Path, "checkout", targetBranch); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = fmt.Errorf("git checkout was stopped before it finished (%s); run git status before retrying: %w", gitReadFailure(ctxErr), ctxErr)
+		}
 		item.Logs = append(item.Logs, fmt.Sprintf("󰅙 Failed to switch to branch '%s': %v", targetBranch, err))
 		return err
 	}
@@ -1663,6 +1772,9 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 		}
 		return fmt.Errorf("git push failed: %w", err)
 	}
+	// Logged so an action stopped later, during the PR step, still shows the
+	// push landed.
+	item.Logs = append(item.Logs, fmt.Sprintf("󰄬 Pushed branch '%s' to origin.", branch))
 
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -1704,8 +1816,12 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 }
 
 // CloneRepo clones a repository from GitHub organization into local path.
+// It stops after cloneTimeout.
 func CloneRepo(org, ghRepoName, targetPath string) error {
-	cmd := exec.Command("gh", "repo", "clone", fmt.Sprintf("%s/%s", org, ghRepoName), targetPath)
+	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "repo", "clone", fmt.Sprintf("%s/%s", org, ghRepoName), targetPath)
+	cmd.WaitDelay = commandWaitDelay
 	return cmd.Run()
 }
 

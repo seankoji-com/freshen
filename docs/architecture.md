@@ -75,8 +75,9 @@ screens do not render runner data, so the poll pauses there; entering Overview o
 Runners refreshes runners when the last attempt is older than the backed-off
 interval. Organisation Actions polling starts at twenty seconds and scales with
 repository/active-run count to budget API calls. Pollers use independent
-exponential backoff after failures. `gh` reads, log requests and repository
-branch reads run under deadlines. An open
+exponential backoff after failures. `gh` reads, log requests, repository
+branch reads and repository changes (clone, switch, push, prune) run under
+deadlines. An open
 running job's log refreshes with one request when its job ID is known; the jobs
 list is fetched only to resolve a name or to build the step-status fallback.
 One log request runs at a time (`LogLoading`); runner ticks and queue
@@ -97,21 +98,49 @@ deadline covers a read's branch, worktree and status commands, so a hung `git`
 ends the request. Every repository branch-state read also bounds itself with
 `git.branchReadTimeout` (30 seconds): the checkout check (`IsGitRepo`),
 `GetOriginalBranch`, the default-branch lookup, `FetchExistingPRURL`, the merge
-and dirty checks and `GetRepoBranchDetails`. A sync treats its preflight reads
-(checkout, current branch, default branch, unfinished merge, dirty state) as
-required: if one fails or times out, the sync ends with status `ERROR` / "Read
-Err" and the reason before any clone, checkout, stash or pull, instead of acting
-on a placeholder `HEAD` or assuming a clean tree. A missing directory is not a
-failure; it is the clone case. A hung `GetRepoBranchDetails` only marks its
-sections failed; the sync still finishes and clears `IsSyncing`. An action
-re-reads branch state under one `repoDetailTimeout` deadline after its
-mutation: a hung read still delivers `actionResultMsg` and clears `BusyAction`,
-keeps the mutation's outcome and the last known branch, and logs the failed
-read. Each sync or action snapshot, and each refresh that finds a repository on
-a different branch, bumps the repository's `BranchDetailsRev`; a detail read
-records the revision when it starts and is discarded if its branch state was
-replaced first, so an older read cannot restore pruned branches, a previous
-checkout's branches or a stale working-tree status. `GetRepoBranchDetails` records each failed command in
+and dirty checks and `GetRepoBranchDetails`. The checkout check's filesystem
+probe (`statBounded`) returns at that deadline even if the filesystem never
+answers; a probe that outlives it stays registered by path, and later checks
+of that path wait on it rather than start another, so a hung mount holds at
+most one goroutine per path. The check reports "not a checkout" only for a
+missing path or a directory with no `.git` entry that git rejects; any other
+git or filesystem failure (permissions, ownership, corruption, a hang) is an
+error carrying git's diagnostic. A sync treats its preflight reads (checkout,
+current branch, default branch, unfinished merge, dirty state) as required: if
+one fails or times out, the sync ends with status `ERROR` / "Read Err" and the
+reason before any clone, checkout, stash or pull, instead of acting on a
+placeholder `HEAD`, cloning over an unreadable checkout or assuming a clean
+tree. Changes are bounded too: a sync of an existing checkout by `syncTimeout`
+(10 minutes), a first clone by `cloneTimeout` (30 minutes, which reports that a
+partial clone may remain), and a switch by `checkoutTimeout` (2 minutes). The
+TUI runs switch, push and prune under one `repoActionTimeout` (5 minutes); a
+stopped action reports "stopped after", and steps that finished before it (a
+push that landed, branches already deleted) stay in the repository log. The
+shared command runner, used by switch and the preflight reads, and the clone
+commands set `WaitDelay`, so a hook or child process holding the output pipes
+cannot keep a killed command waiting. Quitting cancels all of them. A
+sync re-reads branches, worktrees and changed files after its last change, so
+its final snapshot describes the checkout it left (for example `main` checked
+out after switching from a clean feature branch); a re-read that fails marks
+its sections failed, and the detail labels the entries it keeps as earlier
+data. A hung `GetRepoBranchDetails` only marks its sections failed; the sync
+still finishes and clears `IsSyncing`. An action re-reads branch state under
+one `repoDetailTimeout` deadline after its mutation: a hung read still delivers
+`actionResultMsg` and clears `BusyAction`, keeps the mutation's outcome and the
+last known branch, and logs the failed read. Each sync or action snapshot, and
+each refresh that finds a repository on a different branch, bumps the
+repository's `BranchDetailsRev`; a detail read records the revision when it
+starts and is discarded if its branch state was replaced first, so an older
+read cannot restore pruned branches, a previous checkout's branches or a stale
+working-tree status. A refresh that finds the checkout moved marks the details
+`Unread` instead of empty: the detail says "Not read since the checkout moved"
+rather than "none found" or "working tree is clean", and an open detail reads
+them again (a read already running is discarded on arrival and restarted).
+Snapshots also bump `RepoStateRev`, which `startOrgRefresh` copies into
+`OrgRefreshRevs`; when the refresh answers, a repository whose revision moved
+in the meantime keeps the snapshot's branch, status, details and logs and
+raises no "branch changed" toast, so a refresh that read the checkout before a
+switch or sync cannot undo it or retarget the next action. `GetRepoBranchDetails` records each failed command in
 `BranchesErr`, `WorktreesErr` or `StatusErr`; the detail states the failure with
 an `r` retry hint instead of "none found" or "working tree is clean", and keeps
 entries from an earlier read under a "From an earlier read" label. Spinner ticks re-render an

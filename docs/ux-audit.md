@@ -58,6 +58,11 @@ Reviewed on 13 October 2026 against `f324ced`.
 | Branch reads after an action, and during a sync or clone, ran with no deadline of their own, so a hung `git` held `BusyAction` or `IsSyncing` and blocked further repository operations | Each branch-state read bounds itself (`branchReadTimeout`, 30 seconds); an action's re-read shares one deadline and a timeout keeps the completed mutation's result |
 | A detail read that started before a prune, switch, sync or branch-changing refresh could answer after it and restore deleted branches, the previous checkout's branches, or a clean tree | Sync and action snapshots, and refreshes that find a new current branch, bump `BranchDetailsRev`; a read started before the latest change is discarded |
 | A sync acted on failed preflight reads: an unbounded checkout check could hang it, a timed-out branch read became `HEAD` and drove a checkout and pull, and a failed dirty check counted as clean, skipping the stash | Each preflight read (checkout, current and default branch, merge, dirty) has its own deadline and must succeed; a failure ends the sync as "Read Err" before anything changes |
+| The checkout check treated every ordinary git failure (permissions, ownership, corruption) as a missing repository and cloned over it, and probed the filesystem with no deadline | Only a missing path, or a directory without `.git` that git rejects, means "clone"; other failures end the sync as "Read Err" with git's diagnostic. The probe returns at its deadline and a hung path holds one probe at most |
+| A refresh that read a repository before a switch or sync answered after it and restored the old branch, status and action target | Snapshots bump `RepoStateRev`; a refresh started before the latest snapshot keeps that repository's snapshot state and raises no "branch changed" toast |
+| A switch ran with no deadline or cancellation, and clone, push and prune only stopped on quit, so a hung command held `BusyAction` or `IsSyncing` | Switch, push and prune run under `repoActionTimeout`, switch also under `checkoutTimeout`, and a first clone under `cloneTimeout`; a stopped action says so and keeps finished steps in the log |
+| A refresh that found the checkout moved showed the unread branch details as "none found" and "working tree is clean" | The details are marked unread and say so; an open detail reads them again |
+| A sync's final snapshot carried branch details read before its checkout or pull, so the header said `main` while the branch list still marked the feature branch checked out | The sync re-reads branch details after its last change; a failed re-read is labelled as earlier data |
 | A failed `git branch`, `git worktree list` or `git status` showed as "none found" or "working tree is clean" | Each section states its failure with an `r` retry hint, and entries kept from an earlier read are labelled |
 | Opening job B while job A's log request ran dropped B's fetch, leaving "Logs not loaded" | Opening a job cancels the request for the job left and starts the open job's at once; `LogSeq` discards the late answer |
 
@@ -82,7 +87,14 @@ handing off to the queued repository, failed reads shown as failures rather than
 empty sections, and opening another job while a log request runs.
 `pkg/git/branch_read_test.go` proves each sync preflight read ends at its own
 deadline, and that a sync whose checkout, branch, merge or dirty read hangs or
-fails stops without moving `HEAD`, pulling or stashing.
+fails stops without moving `HEAD`, pulling or stashing. It also covers ordinary
+checkout-check failures reported with git's diagnostic, a hung filesystem probe
+(one probe per path, sync stopped), and a hung checkout or clone stopped at its
+deadline or on quit; `pkg/git/sync_test.go` checks a sync's final branch details
+describe the checkout after it switched. `pkg/tui/branch_state_test.go` covers
+a late refresh after a switch or sync, a branch-changing refresh re-reading the
+open detail, the unread-details message, and hung switch, push and prune
+actions stopped with their finished steps kept.
 `pkg/jobs` tests count `gh` requests for log refreshes and prove a slow
 multi-page fallback ends at the request deadline.
 
