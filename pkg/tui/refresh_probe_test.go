@@ -31,6 +31,18 @@ func stubOrgRefresh(t *testing.T, repos []git.GHRepoInfo, probe func(ctx context
 	})
 }
 
+// refreshFixtureModel is the smoke fixture with each repository's path built
+// the way a refresh builds it, so a refresh finds the earlier records on every
+// OS (filepath.Join turns the fixture's /tmp/... into \tmp\... on Windows).
+func refreshFixtureModel() Model {
+	m := sized(smokeFixtureModel(), 120, 40)
+	m.ctx = context.Background()
+	for _, r := range m.Repos {
+		r.Path = filepath.Join(m.TargetDir, r.Name)
+	}
+	return m
+}
+
 func repoNamed(repos []*git.RepoItem, name string) *git.RepoItem {
 	for _, r := range repos {
 		if r.Name == name {
@@ -59,8 +71,7 @@ func TestRefreshProbeFailureKeepsRepositories(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			m := sized(smokeFixtureModel(), 120, 40)
-			m.ctx = context.Background()
+			m := refreshFixtureModel()
 			dir := m.TargetDir
 			stubOrgRefresh(t, []git.GHRepoInfo{
 				{Name: "alpha", URL: "https://github.com/fixture-org/alpha"},
@@ -248,8 +259,7 @@ func TestRefreshKeepsStateWhenCheckoutReadsFail(t *testing.T) {
 	for _, org := range []bool{true, false} {
 		for name, tc := range cases {
 			t.Run(fmt.Sprintf("org=%v/%s", org, name), func(t *testing.T) {
-				m := sized(smokeFixtureModel(), 120, 40)
-				m.ctx = context.Background()
+				m := refreshFixtureModel()
 				stubOrgRefresh(t, []git.GHRepoInfo{
 					{Name: "alpha", URL: "https://github.com/fixture-org/alpha"},
 					{Name: "beta", URL: "https://github.com/fixture-org/beta"},
