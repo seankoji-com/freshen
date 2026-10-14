@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -183,6 +182,17 @@ func (m *Model) loadLogsIfSelectedJobRunning() tea.Cmd {
 
 var scanLocalDirectoryContext = git.ScanLocalDirectoryContext
 
+// fetchOrgRepos and fetchOrgRepoCounts read the organization during a
+// refresh; tests swap them so no test reaches GitHub.
+var (
+	fetchOrgRepos      = git.FetchOrgRepos
+	fetchOrgRepoCounts = git.FetchOrgRepoCounts
+)
+
+// dirExists probes each organization repository's checkout during a refresh;
+// tests swap it to fail or hang.
+var dirExists = git.DirExists
+
 func localRepoBranches(ctx context.Context, path string) (current, defaultBranch string, ok bool) {
 	if ctx.Err() != nil || !git.IsGitRepoContext(ctx, path) {
 		return "", "", false
@@ -226,13 +236,13 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			return orgSyncedMsg{repos: repos, autoSync: false, generation: generation}
 		}
 		remoteCtx, remoteCancel := context.WithTimeout(m.ctx, orgRemoteRefreshBudget)
-		orgRepos, err := git.FetchOrgRepos(remoteCtx, m.TargetOrg)
+		orgRepos, err := fetchOrgRepos(remoteCtx, m.TargetOrg)
 		if err != nil {
 			remoteCancel()
 			return orgSyncedMsg{repos: nil, err: err, autoSync: autoSync, generation: generation}
 		}
 
-		orgCounts, countsErr := git.FetchOrgRepoCounts(remoteCtx, m.TargetOrg)
+		orgCounts, countsErr := fetchOrgRepoCounts(remoteCtx, m.TargetOrg)
 		remoteCancel()
 		countsFetchedAt := time.Now()
 		if countsErr != nil {
@@ -248,6 +258,11 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 		}
 
 		repoMap := make(map[string]*git.RepoItem)
+		previousByPath := make(map[string]*git.RepoItem, len(previous))
+		for _, item := range previous {
+			previousByPath[item.Path] = item
+		}
+		var probeFailures []string
 
 		for _, ghRepo := range orgRepos {
 			localDir, ok := git.GetLocalDirName(ghRepo.Name)
@@ -260,9 +275,22 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			}
 			localPath := filepath.Join(m.TargetDir, localDir)
 
-			localExists := false
-			if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
-				localExists = true
+			localExists, probeErr := dirExists(localCtx, localPath)
+			if probeErr != nil {
+				// Could not tell whether the checkout exists: keep what the
+				// last refresh knew, or list the repository as unreadable,
+				// rather than report it not cloned or drop an archived one.
+				probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, probeErr))
+				item := unprobedRepo(previousByPath[localPath], ghRepo, localDir, localPath, probeErr)
+				if counts, found := orgCounts[ghRepo.Name]; found {
+					item.OpenIssuesCount = counts.Issues
+					item.OpenPRsCount = counts.PRs
+					item.HasLoadedCounts = true
+					item.CountsStale = false
+					item.CountsUpdatedAt = countsFetchedAt
+				}
+				repoMap[localDir] = item
+				continue
 			}
 
 			if ghRepo.IsArchived && !localExists {
@@ -334,6 +362,12 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 		if err := localCtx.Err(); err != nil && localErr == nil {
 			localErr = err
 		}
+		if len(probeFailures) > 0 {
+			slog.Warn("could not check local checkouts", "failures", probeFailures)
+			if localErr == nil {
+				localErr = fmt.Errorf("could not check %d local checkouts: %s", len(probeFailures), strings.Join(probeFailures, "; "))
+			}
+		}
 
 		result := make([]*git.RepoItem, 0, len(repoMap))
 		for _, item := range repoMap {
@@ -379,6 +413,34 @@ func cloneRepoItems(items []*git.RepoItem) []*git.RepoItem {
 		clones = append(clones, item.Clone())
 	}
 	return clones
+}
+
+// unprobedRepo is the refresh record for a repository whose checkout could not
+// be probed. With an earlier record it keeps that record's local state, marked
+// stale; without one it is listed as unreadable, never as not cloned, so a
+// clone or delete cannot follow from a probe that only failed.
+func unprobedRepo(prev *git.RepoItem, ghRepo git.GHRepoInfo, localDir, localPath string, probeErr error) *git.RepoItem {
+	if prev != nil {
+		item := prev.Clone()
+		item.IsArchived = ghRepo.IsArchived
+		item.URL = ghRepo.URL
+		item.LocalMetadataStale = true
+		item.CountsStale = item.HasLoadedCounts
+		return item
+	}
+	return &git.RepoItem{
+		Name:               localDir,
+		GHRepoName:         ghRepo.Name,
+		Path:               localPath,
+		URL:                ghRepo.URL,
+		IsArchived:         ghRepo.IsArchived,
+		CheckoutUnknown:    true,
+		LocalMetadataStale: true,
+		Status:             git.StatusError,
+		StatusMsg:          "Read Err",
+		ErrorErr:           probeErr,
+		Logs:               []string{fmt.Sprintf("Could not check whether %s is cloned (%v); press r to retry.", localPath, probeErr)},
+	}
 }
 
 func appendMissingRepos(items, previous []*git.RepoItem) []*git.RepoItem {
@@ -549,6 +611,8 @@ func (m *Model) applyRepoSnapshot(snapshot *git.RepoItem) {
 // copyRepoState copies the fields a sync or action owns, other than
 // BranchDetails, from src onto dst.
 func copyRepoState(dst, src *git.RepoItem) {
+	dst.IsNew = src.IsNew
+	dst.CheckoutUnknown = src.CheckoutUnknown
 	dst.Status = src.Status
 	dst.StatusMsg = src.StatusMsg
 	dst.OriginalBranch = src.OriginalBranch

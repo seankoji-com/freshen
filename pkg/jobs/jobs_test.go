@@ -5,10 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/proc"
 )
 
 func mustJSON(t *testing.T, v any) []byte {
@@ -825,5 +831,36 @@ func TestCancelledContextRunsNoGHCommand(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Fatalf("cancelled log request made %d gh calls", calls)
+	}
+}
+
+// A gh whose helper keeps stdout open after gh exits cannot hold a runner,
+// job or log request: the call returns once WaitDelay passes, with gh's own
+// output, and gh's exit status deciding the result.
+func TestGHCommandBoundsHeldOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the gh wrapper is a POSIX shell script")
+	}
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("sleep not available")
+	}
+	bin := t.TempDir()
+	script := "#!/bin/sh\n" + sleep + " 3 &\necho '{\"ok\":true}'\n"
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	original := proc.WaitDelay
+	proc.WaitDelay = 200 * time.Millisecond
+	t.Cleanup(func() { proc.WaitDelay = original })
+
+	start := time.Now()
+	out, err := defaultRunGHCommand(context.Background(), "api", "anything")
+	if waited := time.Since(start); waited > 2*time.Second {
+		t.Fatalf("gh call waited %s for the process holding its output", waited)
+	}
+	if err != nil || strings.TrimSpace(string(out)) != `{"ok":true}` {
+		t.Fatalf("gh call returned %q, %v", out, err)
 	}
 }

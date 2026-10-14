@@ -30,6 +30,14 @@ func (m Model) menuActions() []uiAction {
 	if m.ActionTarget.IsNew {
 		return append(actions, uiAction{"sync", "Clone repository", "Clone this repository into the workspace", false})
 	}
+	if m.ActionTarget.CheckoutUnknown {
+		// The refresh could not tell whether this checkout exists. A sync
+		// probes it again before acting; nothing destructive is offered.
+		if m.ActionTarget.IsArchived {
+			return actions
+		}
+		return append(actions, uiAction{"sync", "Sync repository", "Check the checkout again, then clone or sync it", false})
+	}
 	if m.ActionTarget.IsArchived {
 		return append(actions, uiAction{"delete", "Delete archived clone", "Delete this local repository from disk. This cannot be undone.", true})
 	}
@@ -244,7 +252,7 @@ func (m *Model) executeAction(id string) tea.Cmd {
 			}
 			target.Logs = append(target.Logs, fmt.Sprintf("Prune removed %d worktrees, pruned %d stale registrations, and deleted %d branches; error: %v", len(pruned.RemovedWorktrees), len(pruned.PrunedWorktrees), len(pruned.DeletedBranches), result.err))
 		case "delete":
-			result.err = git.DeleteLocalRepo(dir, target.Path)
+			result.err = git.DeleteLocalRepo(actionCtx, dir, target.Path)
 		}
 		if (id == "switch" || id == "push" || id == "prune") && result.err != nil && errors.Is(actionCtx.Err(), context.DeadlineExceeded) {
 			result.err = fmt.Errorf("stopped after %s; steps that finished are in the repository log: %w", repoActionTimeout, result.err)

@@ -1155,7 +1155,7 @@ func TestDeleteLocalRepo(t *testing.T) {
 	t.Run("rejects an outside path", func(t *testing.T) {
 		workspace := t.TempDir()
 		outside := t.TempDir()
-		if err := DeleteLocalRepo(workspace, outside); err == nil {
+		if err := DeleteLocalRepo(context.Background(), workspace, outside); err == nil {
 			t.Fatal("DeleteLocalRepo() error = nil, want containment error")
 		}
 	})
@@ -1167,7 +1167,7 @@ func TestDeleteLocalRepo(t *testing.T) {
 		if err := os.Symlink(outside, link); err != nil {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
-		if err := DeleteLocalRepo(workspace, link); err == nil {
+		if err := DeleteLocalRepo(context.Background(), workspace, link); err == nil {
 			t.Fatal("DeleteLocalRepo() accepted a symlink outside the workspace")
 		}
 	})
@@ -1182,7 +1182,7 @@ func TestDeleteLocalRepo(t *testing.T) {
 			t.Fatalf("setup WriteFile: %v", err)
 		}
 
-		if err := DeleteLocalRepo(dir, target); err != nil {
+		if err := DeleteLocalRepo(context.Background(), dir, target); err != nil {
 			t.Fatalf("DeleteLocalRepo() error = %v", err)
 		}
 		if _, err := os.Stat(target); !os.IsNotExist(err) {
@@ -1196,7 +1196,7 @@ func TestDeleteLocalRepo(t *testing.T) {
 		dir := t.TempDir()
 		missing := filepath.Join(dir, "does-not-exist")
 
-		if err := DeleteLocalRepo(dir, missing); err != nil {
+		if err := DeleteLocalRepo(context.Background(), dir, missing); err != nil {
 			t.Errorf("DeleteLocalRepo(%s) error = %v, want nil", missing, err)
 		}
 	})
@@ -1224,7 +1224,7 @@ func TestDeleteLocalRepo(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(target, 0o755) })
 
-		err := DeleteLocalRepo(dir, target)
+		err := DeleteLocalRepo(context.Background(), dir, target)
 		if err == nil {
 			t.Fatal("DeleteLocalRepo() error = nil, want a permission error")
 		}

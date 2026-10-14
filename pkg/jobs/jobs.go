@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/seankoji-com/freshen/pkg/proc"
 )
 
 type RunnerStatus string
@@ -236,12 +237,12 @@ func defaultRunGHCommand(parent context.Context, args ...string) ([]byte, error)
 	ctx, cancel := context.WithTimeout(parent, ghCommandTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "gh", args...)
+	cmd := proc.Command(ctx, "gh", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err := proc.Run(cmd)
 	if parentErr := parent.Err(); parentErr != nil {
 		return nil, parentErr
 	}
