@@ -2,6 +2,10 @@
 
 **freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
 
+![Freshen terminal interface showing parallel repository sync status and logs](docs/images/freshen.webp)
+
+<sub>One screen for a folder of repositories: what is behind, what is dirty, what is waiting on CI. Recording and write-up at [seankoji.com/projects/freshen](https://seankoji.com/projects/freshen).</sub>
+
 > **Contributing?** See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, build/test commands, and the CI-critical `scripts/` directory.
 
 ---
