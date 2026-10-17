@@ -2146,12 +2146,13 @@ func CommitPushPRAndSwitchDefault(ctx context.Context, item *RepoItem) error {
 }
 
 // CloneRepo clones a repository from GitHub organization into local path.
-// It stops after cloneTimeout.
-func CloneRepo(org, ghRepoName, targetPath string) error {
+// It stops when ctx ends or after cloneTimeout. gh runs in its own process
+// group, so a terminal Ctrl+C reaches it only through ctx.
+func CloneRepo(parent context.Context, org, ghRepoName, targetPath string) error {
 	if err := checkUnfinished(targetPath); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+	ctx, cancel := context.WithTimeout(parent, cloneTimeout)
 	defer cancel()
 	cmd := proc.Command(ctx, "gh", "repo", "clone", fmt.Sprintf("%s/%s", org, ghRepoName), targetPath)
 	return runCmd(cmd)
