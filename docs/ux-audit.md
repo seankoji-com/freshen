@@ -110,13 +110,17 @@ cancellation or after the command exits (with status 0 or not) a child the
 command left writing stops, a leftover that survives the kill is reported with
 a `Done` channel, and a command that cannot be reaped (`proc.BlockReaping`
 stands in for a process blocked in the kernel) returns soon after its deadline
-with readable output. `pkg/git/process_tree_test.go` repeats this through freshen's
+with readable output. A start that does not return (`proc.BlockStarting`)
+returns the same way, and its `Done` closes only after the start returns and a
+command it started is killed and reaped; a PATH lookup that does not return
+fails the command with the context's error. `pkg/git/process_tree_test.go` repeats this through freshen's
 own paths (branch reads and a sync pull with a hook holding the pipes, a stopped
 clone whose child was writing into the checkout), and covers a hung delete
 holding its path against sync, switch, push, prune and delete, a hung clone
 directory, `DirExists`, and post-clone branch-read failures. It also covers a
 checkout that cannot be reaped (the switch returns, its path is held against a
-sync and against reads, and released once reaped), a failed `gh repo clone`
+sync and against reads, and released once reaped), a checkout whose start
+does not return (its path is held until the start returns), a failed `gh repo clone`
 whose writing child is stopped before the `git clone` fallback, and a
 cancelled delete, or one whose validation outlives the deadline, removing
 nothing. `TestUnreapableSwitchFreesTheRepository` in

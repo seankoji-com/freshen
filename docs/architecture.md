@@ -7,7 +7,7 @@ GitHub operations use the authenticated `gh` CLI; repository operations use `git
 |---|---|
 | `pkg/git/git.go` | Repository discovery, clone/sync, branches, worktrees and PR operations |
 | `pkg/jobs/jobs.go` | Typed workflow runs/jobs/steps, polling, result mapping and logs |
-| `pkg/proc/` | Starts every `git` and `gh` command: `WaitDelay`, own process group, group kill on cancel and after exit, a bounded wait for commands that cannot be reaped |
+| `pkg/proc/` | Starts every `git` and `gh` command: `WaitDelay`, own process group, group kill on cancel and after exit, a bounded wait for commands that cannot be started or reaped |
 | `pkg/tui/model.go` | Model, messages and polling constants |
 | `pkg/tui/theme.go` | The only palette and style definitions; status kinds, glyphs and labels; `NO_COLOR` |
 | `pkg/tui/keymap.go` | Every key binding, enabled per context; footer hints and help-overlay groups |
@@ -133,12 +133,20 @@ repo clone` that fails while its `git` child keeps writing has that child
 stopped before the `git clone` fallback runs. `proc.Run` also stops waiting
 `ReapTimeout`+`WaitDelay`+1 second after the context ends, even if the command
 has not been reaped (a process blocked in the kernel on a hung mount ignores
-SIGKILL, and `exec.Cmd.Wait` would block on it); output written after that is
-discarded, so the caller reads its buffers safely. In both cases, a command
-that cannot be stopped, or a leftover that survives the kill, returns a
-`*proc.StillRunningError` (`errors.Is(err, proc.ErrSurvived)`) whose `Done`
-channel closes once the command is reaped and its group is empty. On Windows,
-cancelling kills the command itself and `WaitDelay` still applies.
+SIGKILL, and `exec.Cmd.Wait` would block on it) or its start has not returned
+(Go watches the context only once the process exists, and on Unix the start
+waits for the child to exec, which a hung mount can block); output written
+after that is discarded, so the caller reads its buffers safely. In both
+cases, a command that cannot be stopped, or a leftover that survives the
+kill, returns a `*proc.StillRunningError` (`errors.Is(err, proc.ErrSurvived)`)
+whose `Done` channel closes once the start has returned, the command is reaped
+and its group is empty; a start that returns late is killed by its ended
+context. `proc.Command` likewise stops waiting for the PATH lookup of the
+executable when the context ends; that command fails to start with the
+context's error, and the abandoned lookup starts nothing. freshen only stops
+waiting: Go cannot interrupt either call, so the goroutine running a stuck
+lookup or start stays blocked until the kernel returns. On Windows, cancelling kills the command itself and
+`WaitDelay` still applies.
 
 `pkg/git` runs commands through `runCmd`/`outputCmd`/`combinedCmd`, which
 know the path a command acts on (`git -C <path>`, a clone's destination, or
