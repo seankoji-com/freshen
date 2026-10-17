@@ -136,6 +136,40 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # The shared go.sum-keyed cache never holds the linter's own
+          # dependencies, so this job owns its Go stores via the steps below.
+          cache: false
+      # Caches only Go module downloads and build output (including the
+      # `go run`-built golangci-lint executable). golangci-lint's analysis
+      # cache (~/.cache/golangci-lint) is deliberately not cached, so every
+      # run re-analyses the current checkout. Toolchain and linter version
+      # are exact in every key; only lock/config inputs may fall back.
+      - name: Compute lint tool cache key
+        id: lint-cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^GOLANGCI_LINT_VERSION := //p' Makefile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::GOLANGCI_LINT_VERSION not found in Makefile"; exit 1; }
+          prefix="lint-tools-v1-$RUNNER_OS-$RUNNER_ARCH-$(go env GOOS)-$(go env GOARCH)-$(go env GOVERSION)-golangci-lint-$version-"
+          inputs=$(cat go.mod go.sum Makefile .golangci.yml .golangci-shadow.yml | sha256sum | cut -d ' ' -f 1)
+          {
+            echo "gomodcache=$(go env GOMODCACHE)"
+            echo "gocache=$(go env GOCACHE)"
+            echo "prefix=$prefix"
+            echo "key=$prefix$inputs"
+          } >> "$GITHUB_OUTPUT"
+      # PRs and merge queues only read; main-scoped entries come solely from
+      # the trusted push-to-main save below.
+      - name: Restore lint tool cache
+        id: lint-tools
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.lint-cache.outputs.gomodcache }}
+            ${{ steps.lint-cache.outputs.gocache }}
+          key: ${{ steps.lint-cache.outputs.key }}
+          restore-keys: ${{ steps.lint-cache.outputs.prefix }}
       # No separate install step: `make lint`'s GOLANGCI_LINT variable
       # resolves the binary via `go run .../golangci-lint@version` (the Go
       # module proxy's checksum-verified fetch), the same command a
@@ -143,6 +177,14 @@ jobs:
       # defines the enforcing pipeline, so CI and local dev can't drift.
       - name: Tier 1a (enforcing) — make lint
         run: make lint
+      - name: Save trusted lint tool cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.lint-tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ steps.lint-cache.outputs.gomodcache }}
+            ${{ steps.lint-cache.outputs.gocache }}
+          key: ${{ steps.lint-cache.outputs.key }}
   # Surfaces .goreleaser.yaml errors and release-layout regressions on the PR,
   # not when a tag is pushed. Keep `version` in step with release.yml.
   release-config:
