@@ -138,7 +138,7 @@ step status while logs are unavailable, and an empty log is reported as empty.
 # Specify a workspace and GitHub user or organization
 freshen -dir ~/repos -owner octocat
 
-# Non-interactive sync; archived repositories are never deleted by default
+# Non-interactive sync; archived repositories are skipped (deleted only with -delete-archived)
 freshen -y
 
 # Keep the GitHub repo "my-wiki" in a local folder named "wiki"

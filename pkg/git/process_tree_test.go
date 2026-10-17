@@ -634,3 +634,21 @@ exec "$REAL_GIT" "$@"`,
 		t.Fatalf("a fully stopped clone still holds its path: %v", err)
 	}
 }
+
+// Cancelling CloneRepo's context stops the clone. gh runs in its own process
+// group, so the caller's context is the only way a Ctrl+C reaches it.
+func TestCloneRepoStopsWhenCancelled(t *testing.T) {
+	wrapCommands(t, map[string]string{"gh": `exec "$SLEEP" 60`})
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := CloneRepo(ctx, "org", "repo", filepath.Join(t.TempDir(), "repo"))
+	if err == nil {
+		t.Fatal("a cancelled clone reported success")
+	}
+	// The fake gh sleeps for 60s; returning well before that proves the
+	// cancellation stopped it rather than the clone finishing on its own.
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Fatalf("CloneRepo returned %s after its context ended", elapsed)
+	}
+}
