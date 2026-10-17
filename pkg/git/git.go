@@ -51,20 +51,20 @@ func (e *execRunner) Run(ctx context.Context, name string, args ...string) ([]by
 }
 
 // runCmd, outputCmd and combinedCmd are the proc functions of the same
-// names, run on the path the command acts on (see commandPath). A command
+// names, run on the paths the command acts on (see commandPaths). A command
 // does not start while an earlier change to an overlapping path is still
 // running; one proc stops waiting for, because it or a process it started
-// could not be stopped, holds its path until every process it started has
-// exited, so nothing else freshen runs can act on that path meanwhile.
+// could not be stopped, holds its paths until every process it started has
+// exited, so nothing else freshen runs can act on them meanwhile.
 func runCmd(cmd *exec.Cmd) error {
-	if err := checkUnfinished(commandPath(cmd)); err != nil {
+	if err := checkUnfinishedCmd(cmd); err != nil {
 		return err
 	}
 	return holdIfRunning(cmd, proc.Run(cmd))
 }
 
 func outputCmd(cmd *exec.Cmd) ([]byte, error) {
-	if err := checkUnfinished(commandPath(cmd)); err != nil {
+	if err := checkUnfinishedCmd(cmd); err != nil {
 		return nil, err
 	}
 	out, err := proc.Output(cmd)
@@ -72,7 +72,7 @@ func outputCmd(cmd *exec.Cmd) ([]byte, error) {
 }
 
 func combinedCmd(cmd *exec.Cmd) ([]byte, error) {
-	if err := checkUnfinished(commandPath(cmd)); err != nil {
+	if err := checkUnfinishedCmd(cmd); err != nil {
 		return nil, err
 	}
 	out, err := proc.CombinedOutput(cmd)
@@ -88,27 +88,50 @@ func stillRunning(err error) bool {
 func holdIfRunning(cmd *exec.Cmd, err error) error {
 	var running *proc.StillRunningError
 	if errors.As(err, &running) {
-		if path := commandPath(cmd); path != "" {
+		for _, path := range commandPaths(cmd) {
 			holdUntil(path, commandName(cmd), running.Done)
 		}
 	}
 	return err
 }
 
-// commandPath is the path a git or gh command acts on: git's -C directory,
-// a clone's destination, or else the command's working directory ("" when
-// it acts on none, like gh api).
-func commandPath(cmd *exec.Cmd) string {
-	args := cmd.Args[1:]
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-C" {
-			return args[i+1]
+// checkUnfinishedCmd is checkUnfinished for every path cmd acts on.
+func checkUnfinishedCmd(cmd *exec.Cmd) error {
+	for _, path := range commandPaths(cmd) {
+		if err := checkUnfinished(path); err != nil {
+			return err
 		}
 	}
-	if len(args) >= 3 && (args[0] == "clone" || (args[0] == "repo" && args[1] == "clone")) {
-		return args[len(args)-1]
+	return nil
+}
+
+// commandPaths are the paths a git or gh command acts on: git's -C
+// directory, a clone's destination, or else the command's working directory
+// (none when it acts on none, like gh api). A worktree removal also acts on
+// the worktree it deletes, which need not be inside the -C repository.
+func commandPaths(cmd *exec.Cmd) []string {
+	args := cmd.Args[1:]
+	var path string
+	switch i := slices.Index(args, "-C"); {
+	case i >= 0 && i+1 < len(args):
+		path, args = args[i+1], args[i+2:]
+	case len(args) >= 3 && (args[0] == "clone" || (args[0] == "repo" && args[1] == "clone")):
+		return []string{args[len(args)-1]}
+	default:
+		path = cmd.Dir
 	}
-	return cmd.Dir
+	var paths []string
+	if path != "" {
+		paths = append(paths, path)
+	}
+	if len(args) >= 3 && args[0] == "worktree" && args[1] == "remove" {
+		worktree := args[len(args)-1]
+		if !filepath.IsAbs(worktree) && path != "" {
+			worktree = filepath.Join(path, worktree)
+		}
+		paths = append(paths, worktree)
+	}
+	return paths
 }
 
 // commandName is the program and subcommand, e.g. "git pull", for messages
