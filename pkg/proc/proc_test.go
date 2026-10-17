@@ -303,6 +303,77 @@ func TestRunStopsWaitingForABlockedStart(t *testing.T) {
 	}
 }
 
+// A start that returns after its context ended installs exec's context
+// watcher too late: when the command has already exited, the watcher can
+// hand Wait its result without cancelling, so nothing kills the group. A
+// process the late command left behind is still stopped before Done closes.
+func TestRunStopsWhatALateStartLeftBehind(t *testing.T) {
+	needShell(t)
+	shortWaitDelay(t)
+	originalReap, originalSlack, originalStart := ReapTimeout, stopSlack, start
+	ReapTimeout, stopSlack = 200*time.Millisecond, 100*time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release, finished := make(chan struct{}), make(chan struct{})
+	start = func(cmd *exec.Cmd) error {
+		cmd.Cancel = nil // the watcher hands over the result and never cancels
+		err := originalStart(cmd)
+		cancel()
+		<-release
+		return err
+	}
+
+	cmd := Command(ctx, "sh", "-c", "sleep 60 </dev/null >/dev/null 2>&1 & exit 0")
+	returned := make(chan error, 1)
+	go func() {
+		defer close(finished)
+		err := Run(cmd)
+		returned <- err
+		var running *StillRunningError
+		if errors.As(err, &running) {
+			<-running.Done
+		}
+	}()
+	// Restore the tunables only once Done has closed; if it never does, stop
+	// the leftover so it does.
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			if cmd.Process != nil {
+				_ = stopGroup(cmd.Process.Pid)
+			}
+			<-finished
+		}
+		ReapTimeout, stopSlack, start = originalReap, originalSlack, originalStart
+	})
+
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run waited for a start that did not return")
+	}
+	var running *StillRunningError
+	if !errors.As(err, &running) {
+		t.Fatalf("Run() = %v, want a StillRunningError", err)
+	}
+	close(release)
+	select {
+	case <-running.Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Done stayed open while the late command's leftover ran")
+	}
+	if Survived(cmd) {
+		t.Fatal("a process the late command started outlived Done")
+	}
+}
+
 // A PATH lookup that does not return, such as one on a hung mount, does not
 // hold Command past its context: the command fails to start with the
 // context's error, and nothing is left running.

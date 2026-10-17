@@ -112,7 +112,8 @@ a `Done` channel, and a command that cannot be reaped (`proc.BlockReaping`
 stands in for a process blocked in the kernel) returns soon after its deadline
 with readable output. A start that does not return (`proc.BlockStarting`)
 returns the same way, and its `Done` closes only after the start returns and a
-command it started is killed and reaped; a PATH lookup that does not return
+command it started is killed and reaped, including a child left behind by a
+late-started command that exited before exec could cancel it; a PATH lookup that does not return
 fails the command with the context's error. `pkg/git/process_tree_test.go` repeats this through freshen's
 own paths (branch reads and a sync pull with a hook holding the pipes, a stopped
 clone whose child was writing into the checkout), and covers a hung delete

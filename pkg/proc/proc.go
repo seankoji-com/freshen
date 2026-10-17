@@ -138,8 +138,9 @@ func contextDone(cmd *exec.Cmd) <-chan struct{} {
 //     command whose start has not returned by then (one exec'ing a file on a
 //     hung mount) or that is still not reaped (one blocked in the kernel)
 //     makes Run return a *StillRunningError; output it writes afterwards is
-//     discarded, so the caller may read its buffers at once. A start that
-//     returns later is killed by its context and reaped before Done closes.
+//     discarded, so the caller may read its buffers at once. A command whose
+//     start returns later is killed, reaped, and its group emptied before
+//     Done closes.
 func Run(cmd *exec.Cmd) error { return run(cmd) }
 
 // Output is cmd.Output with Run's behaviour.
@@ -239,14 +240,16 @@ func run(cmd *exec.Cmd) error {
 
 // abandonStart returns a channel closed once a start Run stopped waiting for
 // has returned and, if it started the command, the command has been reaped
-// and its group is empty. Its context has ended, so exec kills a command that
-// does start.
+// and its group is empty. A start that returns after the context ended
+// installs exec's context watcher late: it kills a command still running,
+// but one that has already exited may be reaped without the watcher
+// cancelling, so what it left in its group is killed here.
 func abandonStart(cmd *exec.Cmd, started <-chan error, reapCmd func(*exec.Cmd) error) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		if <-started == nil {
-			_ = reapCmd(cmd)
+			_ = reap(cmd, reapCmd(cmd))
 			<-Exited(cmd)
 		}
 	}()

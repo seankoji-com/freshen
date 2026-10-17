@@ -140,8 +140,11 @@ after that is discarded, so the caller reads its buffers safely. In both
 cases, a command that cannot be stopped, or a leftover that survives the
 kill, returns a `*proc.StillRunningError` (`errors.Is(err, proc.ErrSurvived)`)
 whose `Done` channel closes once the start has returned, the command is reaped
-and its group is empty; a start that returns late is killed by its ended
-context. `proc.Command` likewise stops waiting for the PATH lookup of the
+and its group is empty. A command whose start returns late is killed by
+exec's context watcher if it is still running; one that has already exited
+can be reaped without the watcher cancelling (Go installs it only after the
+start returns), so `proc.Run` then kills whatever is left of its group, as
+after any exit, before `Done` closes. `proc.Command` likewise stops waiting for the PATH lookup of the
 executable when the context ends; that command fails to start with the
 context's error, and the abandoned lookup starts nothing. freshen only stops
 waiting: Go cannot interrupt either call, so the goroutine running a stuck
