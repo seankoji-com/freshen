@@ -829,6 +829,8 @@ func (m *Model) invalidateBranchReads(path string) {
 type repoDetailsLoadedMsg struct {
 	repo *git.RepoItem
 	rev  uint64
+	// branchErr is why a branch the read retried is still unresolved.
+	branchErr error
 }
 
 // loadRepoDetail starts every request the open repository detail needs, then
@@ -870,8 +872,10 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 		defer cancel()
 		// A branch a clone or refresh could not read is read again here, as
 		// the list refresh reads it, so r in the detail resolves it.
+		var branchErr error
 		if repo.CurrentBranch == "" || repo.DefaultBranch == "" {
-			if checkout, _ := readLocalCheckout(ctx, repo.Path); checkout.IsRepo {
+			checkout, err := readLocalCheckout(ctx, repo.Path)
+			if checkout.IsRepo {
 				if repo.CurrentBranch == "" {
 					repo.CurrentBranch = checkout.CurrentBranch
 				}
@@ -879,9 +883,12 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 					repo.DefaultBranch = checkout.DefaultBranch
 				}
 			}
+			if err != nil && (repo.CurrentBranch == "" || repo.DefaultBranch == "") {
+				branchErr = err
+			}
 		}
 		repo.BranchDetails = getRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
-		return repoDetailsLoadedMsg{repo: repo, rev: rev}
+		return repoDetailsLoadedMsg{repo: repo, rev: rev, branchErr: branchErr}
 	}
 }
 

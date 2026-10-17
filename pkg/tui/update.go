@@ -63,6 +63,16 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if r.DefaultBranch == "" {
 						r.DefaultBranch = msg.repo.DefaultBranch
 					}
+					switch {
+					case r.CurrentBranch != "" && r.DefaultBranch != "":
+						// The clone's warning no longer holds once both resolve.
+						if r.Status == git.StatusCloned && r.StatusMsg == "Branch unread" {
+							r.StatusMsg = "Cloned"
+						}
+					case msg.branchErr != nil:
+						r.Logs = append(r.Logs, fmt.Sprintf("󰀪 Refresh %v; press r to retry.", msg.branchErr))
+						m.setToast(fmt.Sprintf("%s: %v; press r to retry.", r.Name, msg.branchErr), 1)
+					}
 					break
 				}
 			}

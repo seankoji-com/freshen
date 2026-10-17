@@ -431,15 +431,17 @@ func TestUnreapableSwitchFreesTheRepository(t *testing.T) {
 }
 
 // A clone whose branches could not be read tells the user to press r. In the
-// repository detail, r reads them again: a later read that succeeds resolves
-// the header and the branch read uses the default it found, while a branch a
-// refresh filled during the read keeps that value.
+// repository detail, r reads them again: a read that still fails says why and
+// keeps the clone's "Branch unread" warning, while a later read that succeeds
+// resolves the header, clears the warning and reads branches against the
+// default it found, and a branch a refresh filled during the read keeps that
+// value.
 func TestDetailRefreshRereadsUnresolvedBranches(t *testing.T) {
 	originalCheckout, originalRead := readLocalCheckout, getRepoBranchDetails
 	readable := false
 	readLocalCheckout = func(context.Context, string) (git.LocalCheckout, error) {
 		if !readable {
-			return git.LocalCheckout{IsRepo: true}, errors.New("could not read the checked-out branch (timed out)")
+			return git.LocalCheckout{IsRepo: true, CurrentBranch: "feat/clone"}, errors.New("could not read the default branch (timed out)")
 		}
 		return git.LocalCheckout{IsRepo: true, CurrentBranch: "feat/clone", DefaultBranch: "main"}, nil
 	}
@@ -449,6 +451,9 @@ func TestDetailRefreshRereadsUnresolvedBranches(t *testing.T) {
 		return git.BranchWorktreeDetails{LocalBranches: []string{"* feat/clone", "main"}}
 	}
 	t.Cleanup(func() { readLocalCheckout, getRepoBranchDetails = originalCheckout, originalRead })
+	retryLogs := func(r *git.RepoItem) int {
+		return len(slices.DeleteFunc(slices.Clone(r.Logs), func(l string) bool { return !strings.Contains(l, "could not read the default branch (timed out)") }))
+	}
 
 	for _, filledDuringRead := range []bool{false, true} {
 		t.Run(map[bool]string{false: "recovers", true: "keeps a newer value"}[filledDuringRead], func(t *testing.T) {
@@ -456,14 +461,31 @@ func TestDetailRefreshRereadsUnresolvedBranches(t *testing.T) {
 			m := sized(smokeFixtureModel(), 120, 50)
 			alpha := m.Repos[0]
 			alpha.CurrentBranch, alpha.OriginalBranch, alpha.DefaultBranch = "", "", ""
+			alpha.Status, alpha.StatusMsg = git.StatusCloned, "Branch unread"
+			alpha.Logs = []string{"󰀪 Cloned, but could not read the checked-out branch (timed out) or the default branch (timed out); press r to refresh before acting on it."}
 			press(&m, "1")
 			next, _ := m.Update(repoDetailsResponse(t, press(&m, "enter")))
 			m = next.(Model)
-			if alpha.CurrentBranch != "" || alpha.DefaultBranch != "" {
-				t.Fatalf("failed read resolved the branches: current=%q default=%q", alpha.CurrentBranch, alpha.DefaultBranch)
+			for retry := 1; retry <= 2; retry++ {
+				if alpha.CurrentBranch != "feat/clone" || alpha.DefaultBranch != "" {
+					t.Fatalf("read %d: current=%q default=%q, want the branch it read and the default unresolved", retry, alpha.CurrentBranch, alpha.DefaultBranch)
+				}
+				if alpha.StatusMsg != "Branch unread" || retryLogs(alpha) != retry || !strings.Contains(m.ToastMsg, "could not read the default branch (timed out)") {
+					t.Fatalf("read %d failure not reported: status=%q toast=%q logs=%q", retry, alpha.StatusMsg, m.ToastMsg, alpha.Logs)
+				}
+				list := m
+				press(&list, "esc")
+				if view := stripped(renderAt(list, 120, 50)); !strings.Contains(view, "Branch unread") {
+					t.Fatalf("read %d: repository list dropped the warning:\n%s", retry, view)
+				}
+				if retry == 1 {
+					next, _ = m.Update(repoDetailsResponse(t, press(&m, "r")))
+					m = next.(Model)
+				}
 			}
 
 			readable = true
+			m.clearToast()
 			read := press(&m, "r")
 			if filledDuringRead {
 				alpha.DefaultBranch = "trunk"
@@ -474,11 +496,18 @@ func TestDetailRefreshRereadsUnresolvedBranches(t *testing.T) {
 			if alpha.CurrentBranch != "feat/clone" || alpha.OriginalBranch != "feat/clone" || alpha.DefaultBranch != wantDefault {
 				t.Fatalf("refresh did not resolve the branches: current=%q original=%q default=%q", alpha.CurrentBranch, alpha.OriginalBranch, alpha.DefaultBranch)
 			}
-			if !slices.Equal(defaults, []string{"", "main"}) {
-				t.Fatalf("branch reads used defaults %q, want the unread one then the one just read", defaults)
+			if !slices.Equal(defaults, []string{"", "", "main"}) {
+				t.Fatalf("branch reads used defaults %q, want the unread one twice then the one just read", defaults)
 			}
-			if view := stripped(renderAt(m, 120, 50)); !strings.Contains(view, "branch feat/clone (default: "+wantDefault+")") {
-				t.Fatalf("header does not show the resolved branches:\n%s", view)
+			if alpha.Status != git.StatusCloned || alpha.StatusMsg != "Cloned" || m.ToastMsg != "" || retryLogs(alpha) != 2 || !strings.Contains(alpha.Logs[0], "press r to refresh") {
+				t.Fatalf("recovery left status=%v %q toast=%q logs=%q", alpha.Status, alpha.StatusMsg, m.ToastMsg, alpha.Logs)
+			}
+			if view := stripped(renderAt(m, 120, 50)); !strings.Contains(view, "branch feat/clone (default: "+wantDefault+")") || strings.Contains(view, "Branch unread") {
+				t.Fatalf("header does not show the resolved branches without the warning:\n%s", view)
+			}
+			press(&m, "esc")
+			if view := stripped(renderAt(m, 120, 50)); !strings.Contains(view, "alpha") || strings.Contains(view, "Branch unread") {
+				t.Fatalf("repository list still shows the warning:\n%s", view)
 			}
 		})
 	}
