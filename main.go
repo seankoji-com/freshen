@@ -92,6 +92,26 @@ func configConcurrency(value int) int {
 	return 4
 }
 
+// firstSetup is the first-run workspace prompt; tests swap it.
+var firstSetup = runFirstSetup
+
+// resolveWorkspace returns the directory this session works in and the config
+// to keep using. An interactive run with no workspace configured and no -dir
+// asks for one first, and this session then uses the workspace chosen.
+func resolveWorkspace(cfg config.Config, dirFlag, defaultDir string, interactive bool) (string, config.Config, error) {
+	if cfg.Workspace == "" && interactive && dirFlag == defaultDir {
+		var err error
+		if cfg, err = firstSetup(defaultDir, cfg); err != nil {
+			return "", cfg, err
+		}
+		dirFlag = cfg.Workspace
+	}
+	if dirFlag == "" {
+		dirFlag = defaultDir
+	}
+	return dirFlag, cfg, nil
+}
+
 // validatePrerequisites checks that freshen has access to required tools.
 // It exits with status 1 and writes to stderr if any critical prerequisite is missing.
 // Both the git-on-PATH check and the gh auth check are skipped if versionFlag
@@ -186,13 +206,10 @@ func main() {
 	if orgFlag != "" {
 		ownerFlag = orgFlag
 	}
-	if cfg.Workspace == "" && !nonInteractiveFlag && dirFlag == defaultReposDir {
-		cfg, err = runFirstSetup(defaultReposDir, cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
-			os.Exit(1)
-		}
-		defaultReposDir = cfg.Workspace
+	targetDir, cfg, err := resolveWorkspace(cfg, dirFlag, defaultReposDir, !nonInteractiveFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "freshen: %v\n", err)
+		os.Exit(1)
 	}
 	if ownerFlag == "" && !nonInteractiveFlag {
 		promptErr := ""
@@ -219,11 +236,6 @@ func main() {
 		}
 	}
 	validatePrerequisites(false, ownerFlag != "")
-
-	targetDir := dirFlag
-	if targetDir == "" {
-		targetDir = defaultReposDir
-	}
 
 	absDir, err := filepath.Abs(targetDir)
 	if err == nil {
@@ -343,6 +355,15 @@ func waitForBackgroundWork(wg *sync.WaitGroup) {
 	}
 }
 
+// The batch-mode git and GitHub calls, swappable so tests reach neither.
+var (
+	fetchOrgRepos   = git.FetchOrgRepos
+	cloneRepo       = git.CloneRepo
+	deleteLocalRepo = git.DeleteLocalRepo
+	isGitRepo       = git.IsGitRepo
+	syncRepository  = git.SyncRepository
+)
+
 func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteArchived bool) {
 	fmt.Printf("======================================================================\n")
 	fmt.Printf("                   FRESHEN REPOSITORY WORKFLOW                        \n")
@@ -357,14 +378,19 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 	var orgRepos []git.GHRepoInfo
 	var err error
 	if targetOrg != "" {
-		orgRepos, err = git.FetchOrgRepos(ctx, targetOrg)
+		orgRepos, err = fetchOrgRepos(ctx, targetOrg)
 	}
 	if err != nil {
 		fmt.Printf("Warning: failed to query GitHub org: %v\n", err)
 	}
 
-	// Delete archived repos & clone missing active repos
+	// Delete archived repos & clone missing active repos. Like the TUI, batch
+	// mode never clones or syncs an archived repository.
+	archived := make(map[string]bool)
 	for _, ghRepo := range orgRepos {
+		if ctx.Err() != nil {
+			break
+		}
 		localDir, ok := git.GetLocalDirName(ghRepo.Name)
 		if !ok {
 			// An unusable name must never be joined onto targetDir: the join would
@@ -374,24 +400,42 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 		}
 		localPath := filepath.Join(targetDir, localDir)
 
-		if ghRepo.IsArchived && deleteArchived {
+		if ghRepo.IsArchived {
+			archived[localDir] = true
+			if !deleteArchived {
+				continue
+			}
 			if _, statErr := os.Stat(localPath); statErr == nil {
 				fmt.Printf("↳ Deleting local directory for archived repo '%s'...\n", localDir)
-				_ = git.DeleteLocalRepo(ctx, targetDir, localPath)
+				if delErr := deleteLocalRepo(ctx, targetDir, localPath); delErr != nil {
+					fmt.Printf("  ↳ Warning: failed to delete '%s': %v\n", localPath, delErr)
+				}
 			}
-		} else {
-			if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
-				fmt.Printf("↳ Cloning new active repo '%s'...\n", ghRepo.Name)
-				_ = git.CloneRepo(targetOrg, ghRepo.Name, localPath)
+			continue
+		}
+		if _, statErr := os.Stat(localPath); os.IsNotExist(statErr) {
+			fmt.Printf("↳ Cloning new active repo '%s'...\n", ghRepo.Name)
+			if cloneErr := cloneRepo(ctx, targetOrg, ghRepo.Name, localPath); cloneErr != nil {
+				fmt.Printf("  ↳ Warning: failed to clone '%s': %v\n", ghRepo.Name, cloneErr)
 			}
 		}
 	}
 
 	// Process all remaining active local repos
-	entries, _ := git.ScanLocalDirectory(targetDir)
+	entries, err := git.ScanLocalDirectory(targetDir)
+	if err != nil {
+		fmt.Printf("Warning: failed to read %s: %v\n", targetDir, err)
+	}
 	for idx, name := range entries {
+		if ctx.Err() != nil {
+			break
+		}
+		if archived[name] {
+			fmt.Printf("[%d/%d] Skipping archived repo %s.\n", idx+1, len(entries), name)
+			continue
+		}
 		path := filepath.Join(targetDir, name)
-		if !git.IsGitRepo(path) {
+		if !isGitRepo(path) {
 			continue
 		}
 
@@ -405,12 +449,16 @@ func runNonInteractive(ctx context.Context, targetDir, targetOrg string, deleteA
 
 		// Explicit batch mode (--non-interactive/-y): keep today's full
 		// behavior, same as [a]/[r] in the interactive TUI.
-		git.SyncRepository(ctx, item, nil, false)
+		syncRepository(ctx, item, nil, false)
 		fmt.Printf("  ↳ Result: %s (%s)\n", item.StatusMsg, item.CurrentBranch)
 		if item.DraftPRURL != "" {
 			fmt.Printf("  ↳ Draft PR: %s\n", item.DraftPRURL)
 		}
 	}
 
+	if ctx.Err() != nil {
+		fmt.Printf("\nBatch sync interrupted; remaining repositories were not processed.\n")
+		return
+	}
 	fmt.Printf("\nBatch sync complete.\n")
 }
