@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"slices"
 	"strings"
@@ -426,5 +427,59 @@ func TestUnreapableSwitchFreesTheRepository(t *testing.T) {
 	}
 	if !slices.ContainsFunc(m.Repos[0].Logs, func(l string) bool { return strings.Contains(l, "may still be running") }) {
 		t.Fatalf("held checkout not logged: %v", m.Repos[0].Logs)
+	}
+}
+
+// A clone whose branches could not be read tells the user to press r. In the
+// repository detail, r reads them again: a later read that succeeds resolves
+// the header and the branch read uses the default it found, while a branch a
+// refresh filled during the read keeps that value.
+func TestDetailRefreshRereadsUnresolvedBranches(t *testing.T) {
+	originalCheckout, originalRead := readLocalCheckout, getRepoBranchDetails
+	readable := false
+	readLocalCheckout = func(context.Context, string) (git.LocalCheckout, error) {
+		if !readable {
+			return git.LocalCheckout{IsRepo: true}, errors.New("could not read the checked-out branch (timed out)")
+		}
+		return git.LocalCheckout{IsRepo: true, CurrentBranch: "feat/clone", DefaultBranch: "main"}, nil
+	}
+	var defaults []string
+	getRepoBranchDetails = func(_ context.Context, _, defaultBranch string) git.BranchWorktreeDetails {
+		defaults = append(defaults, defaultBranch)
+		return git.BranchWorktreeDetails{LocalBranches: []string{"* feat/clone", "main"}}
+	}
+	t.Cleanup(func() { readLocalCheckout, getRepoBranchDetails = originalCheckout, originalRead })
+
+	for _, filledDuringRead := range []bool{false, true} {
+		t.Run(map[bool]string{false: "recovers", true: "keeps a newer value"}[filledDuringRead], func(t *testing.T) {
+			readable, defaults = false, nil
+			m := sized(smokeFixtureModel(), 120, 50)
+			alpha := m.Repos[0]
+			alpha.CurrentBranch, alpha.OriginalBranch, alpha.DefaultBranch = "", "", ""
+			press(&m, "1")
+			next, _ := m.Update(repoDetailsResponse(t, press(&m, "enter")))
+			m = next.(Model)
+			if alpha.CurrentBranch != "" || alpha.DefaultBranch != "" {
+				t.Fatalf("failed read resolved the branches: current=%q default=%q", alpha.CurrentBranch, alpha.DefaultBranch)
+			}
+
+			readable = true
+			read := press(&m, "r")
+			if filledDuringRead {
+				alpha.DefaultBranch = "trunk"
+			}
+			next, _ = m.Update(repoDetailsResponse(t, read))
+			m = next.(Model)
+			wantDefault := map[bool]string{false: "main", true: "trunk"}[filledDuringRead]
+			if alpha.CurrentBranch != "feat/clone" || alpha.OriginalBranch != "feat/clone" || alpha.DefaultBranch != wantDefault {
+				t.Fatalf("refresh did not resolve the branches: current=%q original=%q default=%q", alpha.CurrentBranch, alpha.OriginalBranch, alpha.DefaultBranch)
+			}
+			if !slices.Equal(defaults, []string{"", "main"}) {
+				t.Fatalf("branch reads used defaults %q, want the unread one then the one just read", defaults)
+			}
+			if view := stripped(renderAt(m, 120, 50)); !strings.Contains(view, "branch feat/clone (default: "+wantDefault+")") {
+				t.Fatalf("header does not show the resolved branches:\n%s", view)
+			}
+		})
 	}
 }

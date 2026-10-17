@@ -863,11 +863,23 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 	if parent == nil {
 		parent = context.Background()
 	}
-	// The deadline covers all three git reads, so a hung command ends the
+	// The deadline covers every git read, so a hung command ends the
 	// request, clears RepoDetailLoading and lets a queued read start.
 	ctx, cancel := context.WithTimeout(parent, repoDetailTimeout)
 	return func() tea.Msg {
 		defer cancel()
+		// A branch a clone or refresh could not read is read again here, as
+		// the list refresh reads it, so r in the detail resolves it.
+		if repo.CurrentBranch == "" || repo.DefaultBranch == "" {
+			if checkout, _ := readLocalCheckout(ctx, repo.Path); checkout.IsRepo {
+				if repo.CurrentBranch == "" {
+					repo.CurrentBranch = checkout.CurrentBranch
+				}
+				if repo.DefaultBranch == "" {
+					repo.DefaultBranch = checkout.DefaultBranch
+				}
+			}
+		}
 		repo.BranchDetails = getRepoBranchDetails(ctx, repo.Path, repo.DefaultBranch)
 		return repoDetailsLoadedMsg{repo: repo, rev: rev}
 	}
