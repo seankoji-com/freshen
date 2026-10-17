@@ -385,10 +385,20 @@ func TestUnreapableSwitchFreesTheRepository(t *testing.T) {
 	repoActionTimeout, proc.WaitDelay, proc.ReapTimeout = 300*time.Millisecond, 200*time.Millisecond, 200*time.Millisecond
 	release := make(chan struct{})
 	restore := proc.BlockReaping(func(args []string) bool { return slices.Contains(args, "checkout") }, release, 100*time.Millisecond)
-	released := false
 	t.Cleanup(func() {
-		if !released {
-			close(release)
+		close(release)
+		// Killing the checkout read proc.ReapTimeout on exec's cancellation
+		// goroutine, and the switch returns without waiting for it. git
+		// frees the path only once the checkout is reaped, after that
+		// goroutine has finished, so wait for that before restoring the
+		// tunables.
+		deadline := time.Now().Add(5 * time.Second)
+		for strings.Contains(git.GetRepoBranchDetails(context.Background(), dir, "main").BranchesErr, "has not finished") {
+			if time.Now().After(deadline) {
+				t.Error("the repository stayed held after the checkout was reaped")
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 		restore()
 		repoActionTimeout, proc.WaitDelay, proc.ReapTimeout = originalTimeout, originalDelay, originalReap
@@ -417,6 +427,4 @@ func TestUnreapableSwitchFreesTheRepository(t *testing.T) {
 	if !slices.ContainsFunc(m.Repos[0].Logs, func(l string) bool { return strings.Contains(l, "may still be running") }) {
 		t.Fatalf("held checkout not logged: %v", m.Repos[0].Logs)
 	}
-	released = true
-	close(release)
 }
