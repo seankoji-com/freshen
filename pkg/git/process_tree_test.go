@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -481,6 +482,122 @@ func TestUnreapableCheckoutHoldsThePath(t *testing.T) {
 			t.Fatal("the path stayed held after the checkout was reaped")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A prune's worktree removal that the kernel never lets exit holds both the
+// repository it runs in and the worktree it deletes until it is reaped. The
+// worktree may itself be listed as a repository, so a sync, read or delete of
+// it is refused meanwhile, not just one of the main checkout.
+func TestUnreapableWorktreeRemovalHoldsTheWorktree(t *testing.T) {
+	f := newSyncFixture(t)
+	worktree := filepath.Join(t.TempDir(), "feature")
+	runGit(t, f.work, "worktree", "add", "-b", "feature", worktree)
+	worktree = registeredWorktreePath(t, f.work, "feature")
+	withFakeGHDefaultBranch(t, func(string) (string, error) { return "main", nil })
+	shortWaitDelay(t)
+	originalReap := proc.ReapTimeout
+	proc.ReapTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { proc.ReapTimeout = originalReap })
+
+	started, release := make(chan struct{}), make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	restore := proc.BlockReaping(func(args []string) bool {
+		if slices.Contains(args, "worktree") && slices.Contains(args, "remove") {
+			startOnce.Do(func() { close(started) })
+			return true
+		}
+		return false
+	}, release, 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	var result PruneResult
+	var err error
+	go func() {
+		defer close(finished)
+		result, err = PruneBranchesAndWorktrees(ctx, &RepoItem{Name: "work", Path: f.work, DefaultBranch: "main"})
+	}()
+	// The prune reads proc's tunables until it returns, and the removal
+	// until it is reaped, which is what frees the paths; wait for both before
+	// restoring them.
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		<-finished
+		deadline := time.Now().Add(5 * time.Second)
+		for checkUnfinished(f.work) != nil || checkUnfinished(worktree) != nil {
+			if time.Now().After(deadline) {
+				t.Error("a path stayed held after the worktree removal was reaped")
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		restore()
+	})
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the prune never removed the worktree")
+	}
+	cancel()
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the prune waited for a worktree removal that could not be reaped")
+	}
+	if !errors.Is(err, context.Canceled) || len(result.RemovedWorktrees) != 0 ||
+		!slices.ContainsFunc(result.Failures, func(failure string) bool { return strings.Contains(failure, proc.ErrSurvived.Error()) }) {
+		t.Fatalf("PruneBranchesAndWorktrees() = %+v, %v", result, err)
+	}
+	for _, path := range []string{f.work, worktree} {
+		if held := checkUnfinished(path); held == nil || !strings.Contains(held.Error(), "git worktree") {
+			t.Fatalf("%s is not held: %v", path, held)
+		}
+	}
+	synced := &RepoItem{Name: "feature", Path: worktree, CurrentBranch: "feature", DefaultBranch: "main"}
+	SyncRepository(context.Background(), synced, nil, false)
+	if synced.StatusMsg != "Busy" {
+		t.Fatalf("sync on the held worktree: %s %q %v", synced.Status, synced.StatusMsg, synced.Logs)
+	}
+	if details := GetRepoBranchDetails(context.Background(), worktree, "main"); !strings.Contains(details.BranchesErr, "has not finished") {
+		t.Fatalf("a read started on the held worktree: %+v", details)
+	}
+	if err := DeleteLocalRepo(context.Background(), filepath.Dir(worktree), worktree); !errors.Is(err, ErrUnfinishedChange) {
+		t.Fatalf("DeleteLocalRepo() on the held worktree = %v", err)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	deadline := time.Now().Add(5 * time.Second)
+	for checkUnfinished(worktree) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the worktree stayed held after its removal was reaped")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestCommandPaths(t *testing.T) {
+	root := t.TempDir()
+	repo, worktree, dest := filepath.Join(root, "repo"), filepath.Join(root, "elsewhere", "wt"), filepath.Join(root, "dest")
+	for _, tc := range []struct {
+		args []string
+		dir  string
+		want []string
+	}{
+		{[]string{"git", "-C", repo, "status"}, "", []string{repo}},
+		{[]string{"git", "-C", repo, "worktree", "remove", worktree}, "", []string{repo, worktree}},
+		{[]string{"git", "-C", repo, "worktree", "remove", "--force", "wt"}, "", []string{repo, filepath.Join(repo, "wt")}},
+		{[]string{"git", "worktree", "remove", worktree}, repo, []string{repo, worktree}},
+		{[]string{"git", "clone", "https://example.invalid/r", dest}, "", []string{dest}},
+		{[]string{"gh", "repo", "clone", "org/r", dest}, "", []string{dest}},
+		{[]string{"gh", "api", "user"}, "", nil},
+	} {
+		cmd := exec.Command(tc.args[0], tc.args[1:]...)
+		cmd.Dir = tc.dir
+		if got := commandPaths(cmd); !slices.Equal(got, tc.want) {
+			t.Errorf("commandPaths(%q) = %q, want %q", tc.args, got, tc.want)
+		}
 	}
 }
 
