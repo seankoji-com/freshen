@@ -1,8 +1,8 @@
 // Package proc starts the external commands freshen runs (git, gh) so that a
 // deadline or cancellation stops the whole process tree, a child holding the
 // output pipes open cannot keep the caller waiting after the command has
-// exited or been killed, and a command that cannot be reaped at all, because
-// it is blocked in the kernel, still returns control to the caller.
+// exited or been killed, and a command whose lookup, start or reaping is
+// blocked in the kernel still returns control to the caller.
 package proc
 
 import (
@@ -13,8 +13,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
+	"weak"
 )
 
 // WaitDelay bounds how long Wait keeps reading a command's output after the
@@ -39,12 +42,13 @@ var stopSlack = time.Second
 var ErrSurvived = errors.New("processes the command started were still running after it was stopped")
 
 // StillRunningError is the error Run, Output and CombinedOutput return when
-// they stop waiting for a command that has not finished: the command did not
-// exit within ReapTimeout+WaitDelay of its context ending, or it exited but a
-// process it started survived being killed. Either may still change files.
-// Done is closed once the command has been reaped and no process in its group
-// remains; whoever owns the paths the command acts on must keep them until
-// then. errors.Is(err, ErrSurvived) reports true.
+// they stop waiting for a command that has not finished: its start did not
+// return, or it did not exit, within ReapTimeout+WaitDelay of its context
+// ending, or it exited but a process it started survived being killed. Any
+// of these may still change files. Done is closed once the start has
+// returned, the command (if it started) has been reaped and no process in its
+// group remains; whoever owns the paths the command acts on must keep them
+// until then. errors.Is(err, ErrSurvived) reports true.
 type StillRunningError struct {
 	// Err is the command's own result when it had exited (nil for exit 0),
 	// or nil when it could not be reaped.
@@ -66,12 +70,58 @@ func (e *StillRunningError) Unwrap() error { return e.Err }
 
 // Command is exec.CommandContext with WaitDelay set and, on Unix, the command
 // in a process group of its own. When ctx ends the whole group is killed,
-// including children such as the git a gh clone starts.
+// including children such as the git a gh clone starts. If ctx ends while
+// the executable is still being looked up in PATH, Command stops waiting and
+// the command fails to start with ctx's error.
 func Command(ctx context.Context, name string, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := command(ctx, name, args...)
 	cmd.WaitDelay = WaitDelay
 	ownProcessGroup(cmd)
+	if done := ctx.Done(); done != nil {
+		contexts.Store(weak.Make(cmd), done)
+		runtime.AddCleanup(cmd, func(key weak.Pointer[exec.Cmd]) { contexts.Delete(key) }, weak.Make(cmd))
+	}
 	return cmd
+}
+
+// newCommand builds a command; tests swap it to stand in for an executable
+// lookup that blocks.
+var newCommand = exec.CommandContext
+
+// command is exec.CommandContext, except that it stops waiting for the PATH
+// lookup when ctx ends: Go cannot interrupt a lookup blocked on an
+// unresponsive mount. The lookup runs on, but it starts and changes nothing.
+func command(ctx context.Context, name string, args ...string) *exec.Cmd {
+	build := newCommand
+	if ctx.Done() == nil || filepath.Base(name) != name {
+		return build(ctx, name, args...)
+	}
+	built := make(chan *exec.Cmd, 1)
+	go func() { built <- build(ctx, name, args...) }()
+	select {
+	case cmd := <-built:
+		return cmd
+	case <-ctx.Done():
+		return &exec.Cmd{
+			Path: name,
+			Args: append([]string{name}, args...),
+			Err:  fmt.Errorf("exec: looking up %q: %w", name, ctx.Err()),
+		}
+	}
+}
+
+// contexts holds the Done channel of the context of each command Command
+// made, so Run can stop waiting for a start that blocks: exec watches the
+// context only once the process exists. The keys are weak, so an entry goes
+// when its command is collected, whether or not it ran.
+var contexts sync.Map // weak.Pointer[exec.Cmd] -> <-chan struct{}
+
+// contextDone is the Done channel of the context cmd was made with, or nil
+// for a command Command did not make.
+func contextDone(cmd *exec.Cmd) <-chan struct{} {
+	stored, _ := contexts.Load(weak.Make(cmd))
+	done, _ := stored.(<-chan struct{})
+	return done
 }
 
 // Run is cmd.Run for a command made by Command, with three differences.
@@ -84,10 +134,13 @@ func Command(ctx context.Context, name string, args ...string) *exec.Cmd {
 //     killed, so no part of the command outlives Run. If one survives that,
 //     Run returns a *StillRunningError.
 //   - Once the command's context ends, Run waits at most
-//     ReapTimeout+WaitDelay+stopSlack for it. A command that is still not
-//     reaped by then, such as one blocked in the kernel, makes Run return a
-//     *StillRunningError; output it writes afterwards is discarded, so the
-//     caller may read its buffers at once.
+//     ReapTimeout+WaitDelay+stopSlack for it to start and be reaped. A
+//     command whose start has not returned by then (one exec'ing a file on a
+//     hung mount) or that is still not reaped (one blocked in the kernel)
+//     makes Run return a *StillRunningError; output it writes afterwards is
+//     discarded, so the caller may read its buffers at once. A command whose
+//     start returns later is killed, reaped, and its group emptied before
+//     Done closes.
 func Run(cmd *exec.Cmd) error { return run(cmd) }
 
 // Output is cmd.Output with Run's behaviour.
@@ -113,9 +166,13 @@ func CombinedOutput(cmd *exec.Cmd) ([]byte, error) {
 	return out.Bytes(), err
 }
 
-// wait is the reaping Run does; tests swap it to stand in for a process the
-// kernel never lets exit.
-var wait = (*exec.Cmd).Wait
+// start and wait are the starting and reaping Run does; tests swap them to
+// stand in for a start blocked on the filesystem and a process the kernel
+// never lets exit.
+var (
+	start = (*exec.Cmd).Start
+	wait  = (*exec.Cmd).Wait
+)
 
 func run(cmd *exec.Cmd) error {
 	outputs := guardOutputs(cmd)
@@ -129,23 +186,47 @@ func run(cmd *exec.Cmd) error {
 			return cancel()
 		}
 	}
-	if err := cmd.Start(); err != nil {
-		return err
+	startCmd, reapCmd, stopAfter := start, wait, ReapTimeout+WaitDelay+stopSlack
+	// Go cannot interrupt a start blocked on the filesystem, and on Unix
+	// Start waits for the child to exec, so the start runs aside too.
+	started := make(chan error, 1)
+	go func() { started <- startCmd(cmd) }()
+	var giveUp <-chan time.Time
+	select {
+	case err := <-started:
+		if err != nil {
+			return err
+		}
+	case <-contextDone(cmd):
+		timer := time.NewTimer(stopAfter)
+		defer timer.Stop()
+		giveUp = timer.C
+		select {
+		case err := <-started:
+			if err != nil {
+				return err
+			}
+		case <-giveUp:
+			outputs.drop()
+			return &StillRunningError{Done: abandonStart(cmd, started, reapCmd)}
+		}
 	}
 	waited := make(chan error, 1)
-	reapCmd, stopAfter := wait, ReapTimeout+WaitDelay+stopSlack
 	go func() { waited <- reapCmd(cmd) }()
 	select {
 	case err := <-waited:
 		return reap(cmd, settle(err))
 	case <-stopped:
 	}
-	timer := time.NewTimer(stopAfter)
-	defer timer.Stop()
+	if giveUp == nil {
+		timer := time.NewTimer(stopAfter)
+		defer timer.Stop()
+		giveUp = timer.C
+	}
 	select {
 	case err := <-waited:
 		return reap(cmd, settle(err))
-	case <-timer.C:
+	case <-giveUp:
 	}
 	outputs.drop()
 	done := make(chan struct{})
@@ -155,6 +236,24 @@ func run(cmd *exec.Cmd) error {
 		close(done)
 	}()
 	return &StillRunningError{Done: done}
+}
+
+// abandonStart returns a channel closed once a start Run stopped waiting for
+// has returned and, if it started the command, the command has been reaped
+// and its group is empty. A start that returns after the context ended
+// installs exec's context watcher late: it kills a command still running,
+// but one that has already exited may be reaped without the watcher
+// cancelling, so what it left in its group is killed here.
+func abandonStart(cmd *exec.Cmd, started <-chan error, reapCmd func(*exec.Cmd) error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if <-started == nil {
+			_ = reap(cmd, reapCmd(cmd))
+			<-Exited(cmd)
+		}
+	}()
+	return done
 }
 
 // reap kills whatever is left of cmd's process group after the command

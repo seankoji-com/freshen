@@ -484,6 +484,65 @@ func TestUnreapableCheckoutHoldsThePath(t *testing.T) {
 	}
 }
 
+// A checkout whose start does not return, as when exec blocks on a hung
+// mount, still returns the switch soon after its deadline, and its path stays
+// held until the start has returned and the checkout has been reaped.
+func TestBlockedCheckoutStartHoldsThePath(t *testing.T) {
+	f := newSyncFixture(t)
+	runGit(t, f.work, "branch", "feature")
+	shortWaitDelay(t)
+	originalReap := proc.ReapTimeout
+	proc.ReapTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { proc.ReapTimeout = originalReap })
+	release := make(chan struct{})
+	restore := proc.BlockStarting(func(args []string) bool { return slices.Contains(args, "checkout") }, release, 100*time.Millisecond)
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		// The path is freed only once the checkout is reaped, after exec's
+		// cancellation goroutine (which reads proc.ReapTimeout) finished.
+		deadline := time.Now().Add(5 * time.Second)
+		for checkUnfinished(f.work) != nil && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		restore()
+	})
+
+	item := &RepoItem{Name: "work", Path: f.work, CurrentBranch: "main", DefaultBranch: "main"}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	returned := make(chan error, 1)
+	go func() { returned <- SwitchBranch(ctx, item, "feature") }()
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the switch waited for a checkout whose start did not return")
+	}
+	if !errors.Is(err, proc.ErrSurvived) || !strings.Contains(err.Error(), "may still be running") {
+		t.Fatalf("SwitchBranch() = %v", err)
+	}
+	if held := checkUnfinished(f.work); held == nil || !strings.Contains(held.Error(), "git checkout") {
+		t.Fatalf("the checkout's path is not held: %v", held)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if checkUnfinished(f.work) == nil {
+		t.Fatal("the path was freed before the start returned")
+	}
+
+	released = true
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for checkUnfinished(f.work) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the path stayed held after the start returned")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // A gh clone that fails while a git it started keeps writing has that git
 // stopped before the git fallback runs, so the fallback never races it on the
 // same path.
