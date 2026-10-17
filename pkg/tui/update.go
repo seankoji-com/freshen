@@ -52,6 +52,27 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, r := range m.Repos {
 				if r.Path == msg.repo.Path {
 					r.BranchDetails = mergeBranchDetails(r.BranchDetails, msg.repo.BranchDetails)
+					// Only a branch still unresolved takes the read; one a
+					// refresh filled meanwhile is as new and stays.
+					if r.CurrentBranch == "" && msg.repo.CurrentBranch != "" {
+						r.CurrentBranch = msg.repo.CurrentBranch
+						if r.OriginalBranch == "" {
+							r.OriginalBranch = msg.repo.CurrentBranch
+						}
+					}
+					if r.DefaultBranch == "" {
+						r.DefaultBranch = msg.repo.DefaultBranch
+					}
+					switch {
+					case r.CurrentBranch != "" && r.DefaultBranch != "":
+						// The clone's warning no longer holds once both resolve.
+						if r.Status == git.StatusCloned && r.StatusMsg == "Branch unread" {
+							r.StatusMsg = "Cloned"
+						}
+					case msg.branchErr != nil:
+						r.Logs = append(r.Logs, fmt.Sprintf("󰀪 Refresh %v; press r to retry.", msg.branchErr))
+						m.setToast(fmt.Sprintf("%s: %v; press r to retry.", r.Name, msg.branchErr), 1)
+					}
 					break
 				}
 			}
