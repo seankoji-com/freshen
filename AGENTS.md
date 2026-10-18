@@ -6,7 +6,7 @@
 
 ## What this repo is
 
-**freshen** is a Go TUI app (Bubble Tea + Lip Gloss) that manages GitHub org repos and monitors GitHub Actions CI runners/jobs. Entry: `main.go`. Built with `go build -o freshen main.go`.
+**freshen** is a Go TUI app (Bubble Tea + Lip Gloss) that manages GitHub org repos and monitors GitHub Actions CI runners/jobs. Entry: `main.go`. Built with `go build -o freshen .` (the package, not the single file).
 
 ## Quick reference
 
@@ -25,7 +25,7 @@
 ## How to build & test
 
 ```bash
-go build -o freshen main.go    # build
+go build -o freshen .          # build
 go test ./...                  # test
 make lint                      # golangci-lint + gofmt/goimports via `go run` (version pinned in Makefile); report-only, never rewrites
 ```

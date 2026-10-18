@@ -36,7 +36,7 @@ The app is entirely local — it shells out to `git` and `gh` but has no server,
 ## Build
 
 ```bash
-go build -o freshen main.go    # produces a single binary
+go build -o freshen .          # produces a single binary
 go test ./...                  # runs all tests
 ```
 
