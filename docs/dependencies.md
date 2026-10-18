@@ -29,6 +29,8 @@ All other Go dependencies are transitive (ansi, term, cellbuf, etc.) and pulled 
 
 ## Local scripts
 
+- `scripts/winget-manifest.sh`: renders the winget manifest from a release's `checksums.txt` (used by the release and CI workflows).
+
 ## No external services
 
 The app is entirely local — it shells out to `git` and `gh` but has no server, database, or network service of its own. No environment variables required beyond `$HOME` (for default repo directory) and standard `gh` auth.
