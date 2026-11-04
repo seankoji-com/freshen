@@ -63,10 +63,11 @@ func TestThemeBodyContrast(t *testing.T) {
 	t.Cleanup(func() { th = saved })
 	th = newTheme(false)
 
-	const (
-		background = "#101613"
-		surface    = "#223028"
-	)
+	const background = "#101613"
+	surface := colourHex(th.surface)
+	if surface == "" {
+		t.Fatal("theme surface is not a concrete colour")
+	}
 	colours := map[string]lipgloss.TerminalColor{
 		"text": th.text, "muted": th.muted, "primary": th.primary,
 		"secondary": th.secondary, "success": th.green, "warning": th.yellow,

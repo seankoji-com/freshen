@@ -45,13 +45,13 @@ type theme struct {
 
 	brand, owner, dim, body, strong, section, divider    lipgloss.Style
 	tabActive, tabInactive, subTabActive, subTabInactive lipgloss.Style
-	crumb, crumbCurrent, selected, cursor                lipgloss.Style
+	crumb, crumbCurrent, cursor                          lipgloss.Style
 	rowSelected, rowDetail                               lipgloss.Style
-	tableHeader, tileLabel, hero, chip, chipQuiet        lipgloss.Style
+	tableHeader, tileLabel, chip                         lipgloss.Style
 	key, keyDesc, keySep, keyPrimary                     lipgloss.Style
 	toastInfo, toastError, warning, link                 lipgloss.Style
 	pr, issue, branchHeading, worktreeHeading            lipgloss.Style
-	logTimestamp, logCommand, logQuoted, logRule         lipgloss.Style
+	logTimestamp, logCommand, logQuoted                  lipgloss.Style
 }
 
 // noColorRequested follows https://no-color.org: any non-empty NO_COLOR value
@@ -106,20 +106,16 @@ func newTheme(noColor bool) theme {
 	t.subTabInactive = s().Foreground(t.muted).Padding(0, 1)
 	t.crumb = s().Foreground(t.muted)
 	t.crumbCurrent = s().Bold(true).Foreground(t.text)
-	t.selected = s().Bold(true).Foreground(t.text).Background(t.surface)
 	t.cursor = s().Bold(true).Foreground(t.primary)
 	t.rowSelected = s().Foreground(t.text).Background(t.surface)
 	t.rowDetail = s().Foreground(t.text).Background(t.surface)
 	t.tableHeader = s().Bold(true).Foreground(t.muted)
 	t.tileLabel = s().Bold(true).Foreground(t.secondary)
-	t.hero = s().Bold(true).Foreground(t.text)
 	t.chip = s().Bold(true).Foreground(t.text).Background(t.surface).Padding(0, 1)
-	t.chipQuiet = s().Bold(true).Foreground(t.muted).Padding(0, 1)
 	if noColor {
 		// Without colour a background highlight disappears; reverse video keeps
 		// the selected row visible alongside the › cursor.
 		t.tabActive = t.tabActive.Reverse(true)
-		t.selected = t.selected.Reverse(true)
 		t.rowSelected = t.rowSelected.Reverse(true)
 		t.rowDetail = t.rowDetail.Reverse(true)
 		t.chip = t.chip.Reverse(true)
@@ -139,7 +135,6 @@ func newTheme(noColor bool) theme {
 	t.logTimestamp = s().Foreground(t.muted)
 	t.logCommand = s().Bold(true).Foreground(t.secondary)
 	t.logQuoted = s().Bold(true).Foreground(t.yellow)
-	t.logRule = s().Foreground(t.line)
 	return t
 }
 

@@ -465,6 +465,15 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	}
 	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= headerRows && msg.Y < headerRows+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
+		if m.showPreview() {
+			inner := max(20, m.Width-2)
+			listW := inner * 3 / 5
+			if msg.X >= 1+listW {
+				// The preview is read-only; a click there must not retarget the
+				// list selection (and therefore the next action).
+				return nil
+			}
+		}
 		entries, _, _ := m.visibleEntries()
 		bodyRow := msg.Y - headerRows
 		reserved := m.listHeaderRows()

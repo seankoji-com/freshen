@@ -457,17 +457,11 @@ func (m Model) attentionPanel(s orgSummary, width, limit int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) inFlightPanel(s orgSummary, width, limit int) string {
-	header := panelHeader("In flight", s.runningRuns+s.queuedRuns+s.waitingRuns+s.runnerBusy, width)
+func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 	var rows []string
-	total := s.runningRuns + s.queuedRuns + s.waitingRuns
 	for _, run := range m.actionRuns() {
 		if run.run.Status != jobs.JobRunning && run.run.Status != jobs.JobWaiting && run.run.Status != jobs.JobQueued {
 			continue
-		}
-		if len(rows) >= max(1, limit-1) {
-			rows = append(rows, th.dim.Render(fmt.Sprintf("+ %d more", max(0, total-len(rows)))))
-			break
 		}
 		title := runSummaryName(run.run)
 		var detail string
@@ -498,21 +492,27 @@ func (m Model) inFlightPanel(s orgSummary, width, limit int) string {
 		if r.Status != jobs.RunnerRunning {
 			continue
 		}
-		if len(rows) >= max(1, limit-1) {
-			break
-		}
 		detail := r.Platform
 		if j := findJobForRunner(r, m.JobQueue); j != nil {
 			detail = "running " + j.Name
 		}
 		rows = append(rows, joinEnds(th.status(kindRunning, r.Name), th.dim.Render(detail), width))
 	}
-	if len(rows) == 0 {
+	total := len(rows)
+	header := panelHeader("In flight", total, width)
+	if total == 0 {
 		if m.IsJobQueueLoading || m.IsRunnersLoading || m.IsOrgSyncing {
 			rows = append(rows, m.Spinner.View()+th.strong.Render("Loading runs and runners"))
 		} else {
 			rows = append(rows, th.status(kindSuccess, "No runs in flight"), th.dim.Render("The snapshot shows no running or waiting work."))
 		}
+		return strings.Join(append([]string{header}, rows...), "\n")
+	}
+	maxRows := max(1, limit-1)
+	if total > maxRows {
+		keep := max(0, maxRows-1)
+		rows = rows[:keep]
+		rows = append(rows, th.dim.Render(fmt.Sprintf("+ %d more", total-keep)))
 	}
 	return strings.Join(append([]string{header}, rows...), "\n")
 }
@@ -596,19 +596,26 @@ func keysPanel(width, limit int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) recentPanel(s orgSummary, width, limit int) string {
-	lines := []string{panelHeader("Recent runs", s.failedRuns+s.runningRuns+s.queuedRuns, width)}
-	shown := 0
-	recent := 0
+func (m Model) recentPanel(_ orgSummary, width, limit int) string {
+	var runs []actionRun
 	for _, run := range m.actionRuns() {
 		if terminalStatus(run.run.Status) {
-			recent++
+			runs = append(runs, run)
 		}
-		if shown >= max(1, limit-1) {
-			continue
+	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		ti, tj := runFinished(runs[i].run), runFinished(runs[j].run)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
 		}
-		if !terminalStatus(run.run.Status) {
-			continue
+		return runs[i].run.ID > runs[j].run.ID
+	})
+	lines := []string{panelHeader("Recent runs", len(runs), width)}
+	maxRows := max(1, limit-1)
+	shown := 0
+	for _, run := range runs {
+		if shown >= maxRows {
+			break
 		}
 		detail := runTiming(run.run, time.Now())
 		if detail == "" {
@@ -617,17 +624,36 @@ func (m Model) recentPanel(s orgSummary, width, limit int) string {
 		lines = append(lines, joinEnds(th.status(jobKind(run.run.Status), runSummaryName(run.run)), th.dim.Render(detail), width))
 		shown++
 	}
-	if shown < recent {
-		lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more finished runs", recent-shown)))
-	}
 	if shown == 0 {
 		if m.IsJobQueueLoading {
 			lines = append(lines, m.Spinner.View()+th.dim.Render("Loading recent runs"))
 		} else {
 			lines = append(lines, th.dim.Render("No finished runs in this snapshot."))
 		}
+		return strings.Join(lines, "\n")
+	}
+	if shown < len(runs) {
+		if shown == maxRows {
+			// The final row is the overflow notice, so the count matches the
+			// visible rows above it.
+			lines = lines[:len(lines)-1]
+			shown--
+		}
+		lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more finished runs", len(runs)-shown)))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// runFinished is the time a terminal run finished, falling back to its start
+// or creation time when GitHub omits a completion timestamp.
+func runFinished(r *jobs.RunItem) time.Time {
+	switch {
+	case !r.CompletedAt.IsZero():
+		return r.CompletedAt
+	case !r.StartedAt.IsZero():
+		return r.StartedAt
+	}
+	return r.CreatedAt
 }
 
 // attentionPhrase keeps the tile copy grammatical for one and many.

@@ -584,7 +584,7 @@ func (m Model) tableRow(e screenEntry, selected bool, width, itemW, detailW int)
 		body := " " + padTo(ansi.Strip(e.title), itemW) + "  " + padTo(ansi.Strip(e.subtitle), detailW)
 		return th.cursor.Render("›") + th.rowSelected.Render(padTo(body, max(0, w-1)))
 	}
-	return " " + padTo(e.title, itemW) + "  " + th.dim.Render(fitLine(e.subtitle, detailW))
+	return "  " + padTo(e.title, itemW) + "  " + th.dim.Render(fitLine(e.subtitle, detailW))
 }
 func fitFrame(content string, width, height int) string {
 	lines := strings.Split(content, "\n")

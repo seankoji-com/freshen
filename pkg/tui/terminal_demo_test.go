@@ -119,6 +119,13 @@ func demoFixtureModel() Model {
 		{Number: 39, Title: "Keep the previous log tail on failure", HeadRefName: "fix/log-tail", URL: "https://github.com/fixture-org/alpha/pull/39"},
 	}
 	m.Repos[0].HasLoadedIssues, m.Repos[0].HasLoadedPRs = true, true
+	m.Repos[2].PRsList = []git.PRItem{{Number: 7, Title: "Clarify the docs install path", HeadRefName: "docs/install", URL: "https://github.com/fixture-org/gamma/pull/7"}}
+	m.Repos[2].HasLoadedPRs = true
+	m.Repos[5].IssuesList = []git.IssueItem{
+		{Number: 33, Title: "Release branch diverged from main", URL: "https://github.com/fixture-org/zeta/issues/33"},
+		{Number: 31, Title: "Document the 2.4 rollback", URL: "https://github.com/fixture-org/zeta/issues/31"},
+	}
+	m.Repos[5].HasLoadedIssues = true
 
 	passed := &jobs.RunItem{ID: 99, Number: 41, Attempt: 1, Repo: "alpha", Workflow: "CI", Title: "Refresh the log fixture", Branch: "main", Event: "push", Status: jobs.JobPassed, JobsKnown: true,
 		CreatedAt: now.Add(-26 * time.Minute), StartedAt: now.Add(-25 * time.Minute), CompletedAt: now.Add(-23 * time.Minute)}
@@ -158,6 +165,13 @@ func demoFixtureModel() Model {
 		if i%5 == 0 {
 			repo.HasUnstagedChanges = true
 		}
+		for p := 0; p < repo.OpenPRsCount; p++ {
+			repo.PRsList = append(repo.PRsList, git.PRItem{Number: 100 + p, Title: fmt.Sprintf("%s follow-up %d", name, p+1), HeadRefName: "main", URL: fmt.Sprintf("https://github.com/fixture-org/%s/pull/%d", name, 100+p)})
+		}
+		for n := 0; n < repo.OpenIssuesCount; n++ {
+			repo.IssuesList = append(repo.IssuesList, git.IssueItem{Number: 200 + n, Title: fmt.Sprintf("%s report %d", name, n+1), URL: fmt.Sprintf("https://github.com/fixture-org/%s/issues/%d", name, 200+n)})
+		}
+		repo.HasLoadedPRs, repo.HasLoadedIssues = true, true
 		m.Repos = append(m.Repos, repo)
 	}
 	m.Repos[0].BranchDetails = git.BranchWorktreeDetails{
@@ -172,8 +186,8 @@ func demoFixtureModel() Model {
 
 	runStatuses := []jobs.JobStatus{jobs.JobPassed, jobs.JobFailed, jobs.JobQueued, jobs.JobPassed, jobs.JobRunning, jobs.JobCancelled, jobs.JobPassed, jobs.JobFailed, jobs.JobPassed, jobs.JobSkipped}
 	for i, st := range runStatuses {
-		id := 200 + i
-		run := &jobs.RunItem{ID: int64(id), Number: 50 + i, Attempt: 1, Repo: names[i%len(names)], Workflow: "CI", Title: "Routine check " + fmt.Sprint(i+1),
+		id := 260 - i
+		run := &jobs.RunItem{ID: int64(id), Number: 70 - i, Attempt: 1, Repo: names[i%len(names)], Workflow: "CI", Title: "Routine check " + fmt.Sprint(i+1),
 			Branch: "main", Event: "push", Status: st, JobsKnown: true,
 			CreatedAt: now.Add(-time.Duration(i+1) * 12 * time.Minute)}
 		if st != jobs.JobQueued && st != jobs.JobWaiting {
