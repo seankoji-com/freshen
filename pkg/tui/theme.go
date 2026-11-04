@@ -41,15 +41,17 @@ var statusGlyphs = map[statusKind]string{
 type theme struct {
 	noColor bool
 
-	primary, secondary, green, yellow, red, blue, muted, text, surface lipgloss.TerminalColor
+	primary, secondary, green, yellow, red, blue, muted, text, surface, line lipgloss.TerminalColor
 
 	brand, owner, dim, body, strong, section, divider    lipgloss.Style
 	tabActive, tabInactive, subTabActive, subTabInactive lipgloss.Style
 	crumb, crumbCurrent, selected, cursor                lipgloss.Style
-	key, keyDesc, keySep                                 lipgloss.Style
+	rowSelected, rowDetail                               lipgloss.Style
+	tableHeader, tileLabel, hero, chip, chipQuiet        lipgloss.Style
+	key, keyDesc, keySep, keyPrimary                     lipgloss.Style
 	toastInfo, toastError, warning, link                 lipgloss.Style
 	pr, issue, branchHeading, worktreeHeading            lipgloss.Style
-	logTimestamp, logCommand, logQuoted                  lipgloss.Style
+	logTimestamp, logCommand, logQuoted, logRule         lipgloss.Style
 }
 
 // noColorRequested follows https://no-color.org: any non-empty NO_COLOR value
@@ -57,6 +59,18 @@ type theme struct {
 func noColorRequested() bool { return os.Getenv("NO_COLOR") != "" }
 
 var th = newTheme(noColorRequested())
+
+// termenv.ANSI: attributes (bold, reverse, underline) without colour. Lip
+// Gloss otherwise selects the Ascii profile when NO_COLOR is set, which drops
+// the reverse-video selection too; NO_COLOR asks for no colour, not no styling.
+const ansiProfile = 1
+
+func init() {
+	if noColorRequested() {
+		lipgloss.SetColorProfile(ansiProfile)
+		th = newTheme(true)
+	}
+}
 
 func newTheme(noColor bool) theme {
 	c := func(hex string) lipgloss.TerminalColor {
@@ -73,9 +87,10 @@ func newTheme(noColor bool) theme {
 		yellow:    c("#F59E0B"), // Warm amber
 		red:       c("#F07178"), // Coral red
 		blue:      c("#5B9BF8"), // Clear blue
-		muted:     c("#7F9087"), // Muted sage
+		muted:     c("#8CA096"), // Muted sage, lightened for 4.5:1 on the surface
 		text:      c("#DCE7E0"), // Frosted white
-		surface:   c("#2A3A31"), // Deep leaf surface
+		surface:   c("#223028"), // Deep leaf surface, dark enough for failure text
+		line:      c("#2E4038"), // Structural rules, never body text
 	}
 	s := lipgloss.NewStyle
 	t.brand = s().Bold(true).Foreground(t.primary)
@@ -84,7 +99,7 @@ func newTheme(noColor bool) theme {
 	t.body = s().Foreground(t.text)
 	t.strong = s().Bold(true).Foreground(t.text)
 	t.section = s().Bold(true).Foreground(t.secondary)
-	t.divider = s().Foreground(t.surface)
+	t.divider = s().Foreground(t.line)
 	t.tabActive = s().Bold(true).Foreground(t.text).Background(t.surface).Padding(0, 1)
 	t.tabInactive = s().Foreground(t.muted).Padding(0, 1)
 	t.subTabActive = s().Bold(true).Foreground(t.text).Underline(true).Padding(0, 1)
@@ -93,15 +108,26 @@ func newTheme(noColor bool) theme {
 	t.crumbCurrent = s().Bold(true).Foreground(t.text)
 	t.selected = s().Bold(true).Foreground(t.text).Background(t.surface)
 	t.cursor = s().Bold(true).Foreground(t.primary)
+	t.rowSelected = s().Foreground(t.text).Background(t.surface)
+	t.rowDetail = s().Foreground(t.text).Background(t.surface)
+	t.tableHeader = s().Bold(true).Foreground(t.muted)
+	t.tileLabel = s().Bold(true).Foreground(t.secondary)
+	t.hero = s().Bold(true).Foreground(t.text)
+	t.chip = s().Bold(true).Foreground(t.text).Background(t.surface).Padding(0, 1)
+	t.chipQuiet = s().Bold(true).Foreground(t.muted).Padding(0, 1)
 	if noColor {
 		// Without colour a background highlight disappears; reverse video keeps
 		// the selected row visible alongside the › cursor.
 		t.tabActive = t.tabActive.Reverse(true)
 		t.selected = t.selected.Reverse(true)
+		t.rowSelected = t.rowSelected.Reverse(true)
+		t.rowDetail = t.rowDetail.Reverse(true)
+		t.chip = t.chip.Reverse(true)
 	}
 	t.key = s().Bold(true).Foreground(t.secondary)
+	t.keyPrimary = s().Bold(true).Foreground(t.primary)
 	t.keyDesc = s().Foreground(t.muted)
-	t.keySep = s().Foreground(t.surface)
+	t.keySep = s().Foreground(t.line)
 	t.toastInfo = s().Foreground(t.text)
 	t.toastError = s().Bold(true).Foreground(t.red)
 	t.warning = s().Bold(true).Foreground(t.yellow)
@@ -113,6 +139,7 @@ func newTheme(noColor bool) theme {
 	t.logTimestamp = s().Foreground(t.muted)
 	t.logCommand = s().Bold(true).Foreground(t.secondary)
 	t.logQuoted = s().Bold(true).Foreground(t.yellow)
+	t.logRule = s().Foreground(t.line)
 	return t
 }
 
@@ -143,6 +170,16 @@ func (t theme) status(k statusKind, label string) string {
 	return t.fg(t.kindColor(k)).Bold(true).Render(statusGlyphs[k] + " " + label)
 }
 
+// statusChip is the compact state capsule used in the context row. Colour is
+// carried by the glyph and label, never by the background alone.
+func (t theme) statusChip(k statusKind, label string) string {
+	s := lipgloss.NewStyle().Bold(true).Foreground(t.kindColor(k)).Background(t.surface).Padding(0, 1)
+	if t.noColor {
+		s = s.Reverse(true)
+	}
+	return s.Render(statusGlyphs[k] + " " + label)
+}
+
 // newProgress builds the shared progress bar. Bubbles' progress bar queries the
 // terminal profile itself and ignores NO_COLOR, so it is pinned to the same
 // environment-aware profile Lip Gloss uses, or to no colour at all.
@@ -152,7 +189,9 @@ func (t theme) newProgress() progress.Model {
 		p.EmptyColor = ""
 		return p
 	}
-	return progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+	// The bar stays inside the leaf/mint identity instead of Charm's default
+	// purple gradient, which was the only off-palette colour in the frame.
+	return progress.New(progress.WithGradient("#78B159", "#56BFA8"), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
 }
 
 func jobKind(s jobs.JobStatus) statusKind {

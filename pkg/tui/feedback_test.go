@@ -22,7 +22,7 @@ func sized(m Model, w, h int) Model {
 // is sized against the breadcrumb, so the context row never overflows.
 func TestLongFilterQueryKeepsCursorVisible(t *testing.T) {
 	query := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijkl" // 74 cells
-	for _, size := range [][2]int{{80, 24}, {200, 50}, {30, 10}} {
+	for _, size := range [][2]int{{80, 24}, {200, 50}, {40, 12}} {
 		for name, open := range map[string][]string{"repos": {"1"}, "run": {"2", "enter"}} {
 			m := sized(smokeFixtureModel(), size[0], size[1])
 			for _, k := range open {
@@ -55,7 +55,7 @@ func TestLongFilterQueryKeepsCursorVisible(t *testing.T) {
 // detail tab or the current crumb.
 func TestLongNamesKeepActiveTabAndCurrentCrumb(t *testing.T) {
 	long := strings.Repeat("very-long-repository-name-", 6)
-	for _, size := range [][2]int{{80, 24}, {200, 50}, {30, 10}} {
+	for _, size := range [][2]int{{80, 24}, {200, 50}, {40, 12}} {
 		m := sized(smokeFixtureModel(), size[0], size[1])
 		m.Repos[0].Name = long
 		press(&m, "1")
@@ -288,7 +288,7 @@ func TestRunningJobLogRefreshIsSingleFlightAndOrdered(t *testing.T) {
 // scrolling, and Home/End jump to either end as the README says.
 func TestHelpWrapsAndScrollsToEveryDescription(t *testing.T) {
 	collapse := func(s string) string { return strings.Join(strings.Fields(s), " ") }
-	for _, size := range [][2]int{{30, 10}, {48, 14}, {80, 24}} {
+	for _, size := range [][2]int{{40, 12}, {48, 14}, {80, 24}} {
 		m := sized(smokeFixtureModel(), size[0], size[1])
 		press(&m, "2")
 		press(&m, "?")
@@ -553,7 +553,7 @@ func TestHelpOffsetFollowsResize(t *testing.T) {
 // heading is cut to one row and the detail gives way first.
 func TestActionMenuKeepsSelectionWithLongName(t *testing.T) {
 	long := strings.Repeat("very-long-repository-name-", 4) // 104 cells
-	for _, size := range [][2]int{{30, 10}, {31, 11}, {48, 14}, {80, 24}, {200, 50}} {
+	for _, size := range [][2]int{{40, 12}, {48, 14}, {80, 24}, {200, 50}} {
 		m := smokeFixtureModel()
 		m.Repos[0].Name = long
 		m.Repos[0].GHRepoName = long
@@ -598,7 +598,7 @@ func TestCompactHeaderKeepsRefreshIndicator(t *testing.T) {
 		{"overview", "0", func(m *Model) { m.IsRunnersLoading = true }},
 		{"long-owner", "3", func(m *Model) { m.TargetOrg = strings.Repeat("an-organisation-", 4); m.IsRunnersLoading = true }},
 	}
-	for _, size := range [][2]int{{30, 10}, {31, 11}, {48, 14}, {80, 24}, {200, 50}} {
+	for _, size := range [][2]int{{40, 12}, {48, 14}, {80, 24}, {200, 50}} {
 		for _, c := range cases {
 			m := sized(smokeFixtureModel(), size[0], size[1])
 			press(&m, c.focus)
@@ -625,7 +625,7 @@ func TestCompactHeaderKeepsRefreshIndicator(t *testing.T) {
 		}
 	}
 	// Idle screens show no indicator, so the spinner always means work.
-	m := sized(smokeFixtureModel(), 30, 10)
+	m := sized(smokeFixtureModel(), 40, 12)
 	press(&m, "3")
 	if header := stripped(strings.Split(m.View(), "\n")[0]); strings.Contains(header, "refreshing") || strings.Contains(header, strings.TrimSpace(stripped(m.Spinner.View()))) {
 		t.Fatalf("idle header shows a refresh: %q", header)

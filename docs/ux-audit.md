@@ -75,6 +75,30 @@ Reviewed on 13 October 2026 against `f324ced`.
 | A cancelled archived-repo delete could still start: the worker launched without checking the context, and a path validation that finished after the deadline went on to `os.RemoveAll` | The delete refuses an ended context, and a start gate decides once whether the removal begins or the caller gave up; a stopped delete removes nothing and says so |
 | Refresh discarded git read failures: a failed checkout check dropped a known repository (local-only) or read as "not a checkout", and failed branch reads blanked known branches with no warning | `git.ReadLocalCheckout` returns its failures; the refresh keeps the previous record or branch, marks it stale, lists unknown directories as "Read Err" and reports incomplete local metadata |
 
+## Visual system and density pass
+
+Reviewed on 5 November 2026 against `689c0c3`.
+
+| Finding | Change |
+|---|---|
+| The Overview left most of a 120×30 body empty, gave three thin text columns equal weight, and truncated operational statements at wider sizes | A priority-led dashboard: four tiles with figures, status and (on tall terminals) a second detail line; grouped `FAILURES`/`REVIEW` rows; an in-flight desk; repository health and recent runs; a snapshot/key block only when there is room. Narrow terminals get a 2×2 or stacked layout |
+| Lists were two-line cards at every width, with no column headings, full-row selection or use for the right half of a wide terminal | Lists become one-row tables from 100 columns with aligned item/detail columns; from 140 columns a read-only preview of the selected repository, run, job or runner sits beside the list. Enter still opens the full screen |
+| The selected row highlighted only its text, and muted/failure/running text on the selection surface fell below 4.5:1 | Selection uses a full-row surface and a left accent; the surface was darkened and muted sage lightened so every body colour clears WCAG AA. `TestThemeBodyContrast` measures the palette |
+| A loading repository snapshot rendered checked `0 need attention` and `0 open PRs`; a degraded snapshot's repository tile kept its success check | Loading tiles and panels say what they are reading; degraded tiles carry the warning and name the unavailable snapshot |
+| `NO_COLOR` dropped the reverse-video selection because Lip Gloss selected the Ascii profile, although it kept the colourless glyphs and words | `NO_COLOR` selects the ANSI attribute profile, so bold, underline and reverse survive while colour stays off |
+| Tabs at very narrow widths collapsed to single letters with no explanation, and the old minimum rendered a clipped frame | The full chrome now starts at 40×12 with two-letter tab labels; below that a resize notice names the supported size and the quit key |
+| Short detail pages reported `100% scrolled` even when every line fitted | Detail status says `all content shown` until the content actually overflows |
+| The progress bar used Charm's purple default gradient, the only off-palette colour in the frame | The bar uses the leaf/mint palette |
+| The fixture's Issues/PRs counts contradicted empty detail lists, weakening the demo | The demo fixture seeds matching issues and pull requests and a larger, varied workspace |
+| The action menu and confirmation were unframed text over the list | Both open with a rule; the selected action uses the same full-row surface; confirmation names its consequence and keys |
+| The README screenshot still showed the retired two-panel layout | The screenshot and interface description now show the Overview dashboard |
+
+The measurable checks added or extended by this pass: exact frame bounds at
+30×10, 40×12, 60×18, 80×24, 120×30 and 200×50; a wide-layout density check; a
+preview overflow check; table click geometry; loading and degraded honesty;
+grouped-attention copy; measured palette contrast; and a 200×50 render
+benchmark. `go build ./...`, `go test -race ./...` and `make lint` pass locally.
+
 ## Verification
 
 `pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,

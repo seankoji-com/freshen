@@ -146,8 +146,8 @@ func TestOverviewSummarisesSnapshotsWithoutInventingCounts(t *testing.T) {
 	for _, want := range []string{
 		"2 repositories",
 		"PR and issue counts loaded for 1/2",
-		"1 need attention",
-		"1 recent failures",
+		"1 needs attention",
+		"1 recent failure",
 		"observed busy",
 		"2 open PRs · 4 open issues",
 		"beta / CI #43",
@@ -263,8 +263,10 @@ func TestConcernsMouseSelectionAccountsForCoverageBanner(t *testing.T) {
 	m.ActiveFocus = FocusConcerns
 	m.ScreenCursor[FocusConcerns] = ""
 	m.SelectedIndex = -1
+	m = sized(m, 80, 24)
 
-	// Body row 0 is the warning, row 1 is blank, and row 2 is the first repo.
+	// At 80x24 the list is two-line cards: body row 0 is the warning, row 1 is
+	// blank, and row 2 is the first repo.
 	m.screenMouse(tea.MouseMsg{X: 5, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if m.SelectedIndex != 0 || m.ScreenCursor[FocusConcerns] != m.Repos[0].Path+"/"+m.Repos[0].Name {
 		t.Fatalf("coverage banner shifted mouse selection: selected=%d cursor=%q", m.SelectedIndex, m.ScreenCursor[FocusConcerns])

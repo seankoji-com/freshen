@@ -12,7 +12,9 @@ GitHub operations use the authenticated `gh` CLI; repository operations use `git
 | `pkg/tui/theme.go` | The only palette and style definitions; status kinds, glyphs and labels; `NO_COLOR` |
 | `pkg/tui/keymap.go` | Every key binding, enabled per context; footer hints and help-overlay groups |
 | `pkg/tui/chrome.go` | Header, tab row geometry, breadcrumb, status row, footer and help overlay |
-| `pkg/tui/screens.go` | Screen entries, identity, list layout, progress and detail content |
+| `pkg/tui/screens.go` | Screen entries, identity, adaptive list/table layout, progress and detail content |
+| `pkg/tui/ui.go` | Width-exact row, rule, column and tint primitives shared by lists and the dashboard |
+| `pkg/tui/preview.go` | Read-only wide-screen preview for the selected repository, run, job or runner |
 | `pkg/tui/screen_keys.go` | Key and mouse dispatch, navigation, filtering and run-detail requests |
 | `pkg/tui/actions.go` | Action menus, captured confirmation targets and background results |
 | `pkg/tui/keys.go` | Quit and bulk-sync helpers |

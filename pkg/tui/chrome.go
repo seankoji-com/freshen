@@ -20,9 +20,12 @@ const (
 
 // minFrameWidth and minFrameHeight are the smallest terminal that renders the
 // full chrome; anything smaller shows a resize notice instead.
+// minFrameWidth and minFrameHeight are the smallest terminal that renders the
+// full chrome. Below them the tabs, context and hints would clip into an
+// ambiguous frame, so a resize notice with the working quit key is clearer.
 const (
-	minFrameWidth  = 30
-	minFrameHeight = 10
+	minFrameWidth  = 40
+	minFrameHeight = 12
 )
 
 type screenTab struct {
@@ -32,11 +35,11 @@ type screenTab struct {
 }
 
 var tabNames = map[FocusType][3]string{
-	FocusOverview: {"Overview", "Org", "O"},
-	FocusRepos:    {"Repositories", "Repos", "R"},
-	FocusJobs:     {"Actions", "CI", "A"},
-	FocusRunners:  {"Runners", "Run", "N"},
-	FocusConcerns: {"Concerns", "Concerns", "C"},
+	FocusOverview: {"Overview", "Org", "Ov"},
+	FocusRepos:    {"Repositories", "Repos", "Re"},
+	FocusJobs:     {"Actions", "CI", "Ac"},
+	FocusRunners:  {"Runners", "Run", "Ru"},
+	FocusConcerns: {"Concerns", "Concerns", "Co"},
 }
 
 // tabBadge is a short count for a tab, or "" when there is nothing to flag.
@@ -71,7 +74,8 @@ func (m Model) tabBadge(f FocusType, s orgSummary) string {
 
 // screenTabs lays out the tab row. It tries full names with count badges,
 // then progressively shorter labels, and uses the first that fits. Rendering
-// and mouse hit testing both use these spans.
+// and mouse hit testing both use these spans. Each tab reserves one leading
+// cell for the active accent so selecting a tab never shifts the row.
 func (m Model) screenTabs() []screenTab {
 	summary := m.buildOrgSummary()
 	for _, variant := range []struct {
@@ -87,7 +91,7 @@ func (m Model) screenTabs() []screenTab {
 					label += " " + badge
 				}
 			}
-			w := ansi.StringWidth(label) + 2 // tab style pads one cell each side
+			w := ansi.StringWidth(label) + 3 // accent cell plus tab padding
 			tabs = append(tabs, screenTab{focus: f, key: fmt.Sprint(i), label: label, start: x, end: x + w})
 			x += w + 1
 		}
@@ -103,13 +107,15 @@ func (m Model) tabRow() string {
 	sb.WriteString(" ")
 	for i, tab := range m.screenTabs() {
 		if i > 0 {
-			sb.WriteString(" ")
+			sb.WriteString(th.divider.Render("│"))
 		}
-		style := th.tabInactive
 		if tab.focus == m.ActiveFocus {
-			style = th.tabActive
+			sb.WriteString(th.cursor.Render("▎"))
+			sb.WriteString(th.tabActive.Render(tab.label))
+		} else {
+			sb.WriteString(" ")
+			sb.WriteString(th.tabInactive.Render(tab.label))
 		}
-		sb.WriteString(style.Render(tab.label))
 	}
 	return sb.String()
 }
@@ -199,8 +205,48 @@ func joinEnds(left, right string, width int) string {
 	return left + strings.Repeat(" ", width-lw-rw) + right
 }
 
+// overallKind is the one-glance health of everything the current snapshot
+// covers. It never invents a healthy state: failed or partial reads stay
+// visible as warning or failure.
+func (m Model) overallKind() statusKind {
+	s := m.buildOrgSummary()
+	switch {
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
+		return kindWarning
+	case s.repoProblems > 0 || s.failedRuns > 0 || (s.runnerOffline > 0 && !m.RunnerPermissionDenied):
+		return kindFailure
+	case len(s.attention) > 0:
+		return kindWarning
+	case s.repositories == 0:
+		return kindUnknown
+	case m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading:
+		return kindRunning
+	}
+	return kindSuccess
+}
+
+// snapshotChip names the freshness of the whole screen without implying that
+// a partial snapshot is live. It agrees with the header dot.
+func (m Model) snapshotChip() (string, statusKind) {
+	switch {
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed:
+		return "partial", kindWarning
+	case m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading:
+		if len(m.Repos) == 0 {
+			return "loading", kindRunning
+		}
+		return "syncing", kindRunning
+	case m.TargetOrg == "":
+		return "local", m.overallKind()
+	case m.LocalScanFailed:
+		return "stale", kindWarning
+	}
+	k := m.overallKind()
+	return healthLabel(k), k
+}
+
 func (m Model) headerRow() string {
-	left := " " + th.brand.Render("freshen")
+	left := " " + th.glyph(m.overallKind()) + " " + th.brand.Render("freshen")
 	owner := m.TargetOrg
 	if owner == "" {
 		owner = git.ShortenHomePath(m.TargetDir)
@@ -379,8 +425,13 @@ func (m Model) contextRow() string {
 		return " " + m.breadcrumbView(avail-contextGap-ansi.StringWidth(tabs)) + strings.Repeat(" ", contextGap) + tabs
 	}
 	row := " " + m.breadcrumbView(avail)
-	if detail := m.contextSummary(); detail != "" {
-		row += th.dim.Render("  ·  " + detail)
+	if m.ActiveFocus != FocusOverview {
+		if detail := m.contextSummary(); detail != "" {
+			row += th.dim.Render("  ·  " + detail)
+		}
+	}
+	if chip, kind := m.snapshotChip(); chip != "" && m.Width >= 48 {
+		row = joinEnds(fitLine(row, avail), th.statusChip(kind, chip)+" ", avail)
 	}
 	return row
 }
@@ -510,6 +561,8 @@ func (m Model) screenView() string {
 	body := m.listContent()
 	if m.ActiveFocus == FocusOverview {
 		body = m.summaryContent(max(1, m.Width-2), m.bodyHeight())
+	} else if m.showPreview() {
+		body = m.listWithPreview()
 	}
 	if m.detailVisible() {
 		body = m.Viewport.View()
@@ -547,14 +600,18 @@ func (m Model) footerView() string {
 	if len(bs) == 0 {
 		return ""
 	}
-	render := func(b key.Binding) string {
-		return th.key.Render(b.Help().Key) + " " + th.keyDesc.Render(b.Help().Desc)
+	render := func(b key.Binding, primary bool) string {
+		keyStyle := th.key
+		if primary {
+			keyStyle = th.keyPrimary
+		}
+		return keyStyle.Render(b.Help().Key) + " " + th.keyDesc.Render(b.Help().Desc)
 	}
 	sep := th.keySep.Render(" • ")
-	last := render(bs[len(bs)-1])
+	last := render(bs[len(bs)-1], len(bs) == 1)
 	out := ""
-	for _, b := range bs[:len(bs)-1] {
-		candidate := out + render(b) + sep
+	for i, b := range bs[:len(bs)-1] {
+		candidate := out + render(b, i == 0) + sep
 		if ansi.StringWidth(candidate+last) > m.Width-2 {
 			break
 		}
@@ -569,10 +626,12 @@ func (m Model) statusLine() string {
 	}
 	if m.toastVisible(time.Now()) {
 		style := th.toastInfo
+		glyph := "• "
 		if m.ToastPriority >= 2 {
 			style = th.toastError
+			glyph = statusGlyphs[kindFailure] + " "
 		}
-		toast := style.Render(strings.TrimSpace(m.ToastMsg))
+		toast := style.Render(glyph + strings.TrimSpace(m.ToastMsg))
 		if m.OpenJobID == "" && !m.Detail && m.Search.Value() == "" && m.OpenRun == nil {
 			toast += th.dim.Render("  esc dismiss") // Esc reaches the message only at the top of a screen
 		}
@@ -616,6 +675,9 @@ func (m Model) statusLine() string {
 		return th.dim.Render("Press 1–4 or Tab to open a screen · ? lists every key")
 	}
 	if m.detailVisible() {
+		if m.Viewport.TotalLineCount() <= m.Viewport.VisibleLineCount() {
+			return th.dim.Render("all content shown")
+		}
 		return th.dim.Render(fmt.Sprintf("%d%% scrolled", int(m.Viewport.ScrollPercent()*100)))
 	}
 	es := m.entries()

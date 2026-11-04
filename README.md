@@ -2,7 +2,7 @@
 
 **freshen** is an interactive TUI for managing sibling Git repositories. Connect an optional GitHub user or organization to discover repositories and monitor GitHub Actions.
 
-![Freshen terminal interface showing parallel repository sync status and logs](docs/images/freshen.webp)
+![Freshen Overview showing repository health, work in flight and what needs attention](docs/images/freshen.webp)
 
 *One screen for a folder of repositories: what is behind, what is dirty, what is waiting on CI. Recording and write-up at [seankoji.com/projects/freshen](https://seankoji.com/projects/freshen).*
 
@@ -13,7 +13,7 @@
 ## 🌟 Key Features
 
 - **Concurrent Parallel Syncing**: Syncs 20+ repositories simultaneously in seconds using Go worker pools.
-- **Organization overview**: Starts with repository, Actions and runner health at a glance, then opens dedicated searchable screens for each area.
+- **Organization overview**: Starts with a priority-led dashboard: four operational tiles, grouped failures and review items, work already in flight, repository health, recent runs and, on tall terminals, the snapshot's sources. Each area opens its dedicated searchable screen.
 - **Concern queue**: Ranks repositories with open PRs or issues and opens their existing detail view for review.
 - **Explicit repository sync**: Startup loads metadata. Sync or clone only when requested; archived repositories are highlighted.
 - **Alias Mappings**: Map GitHub repo names to custom local folder names with a repeatable `-alias local=remote` flag or an `aliases` list in the config file. `.github` ➔ `github` is built in.
@@ -104,15 +104,19 @@ every other key except Esc and `Ctrl+C` is ignored. Repository actions run in
 the background with busy and result feedback. Navigation never moves to another
 screen merely because you reach the end of a list.
 
-The header shows the owner and how old the current screen's data is ("updated
-8s ago · every 20s"; on narrow terminals just a spinner while a refresh
-runs); tabs carry counts of failures (`✗`), running work (`↻`)
-and concerns. The breadcrumb row shows the drill-down path, such as
-`Actions › alpha / CI #42 › test`; on narrow terminals it shortens before the
-filter input or the active detail tab does. The status row shows progress,
-persistent warnings (such as a failed runner refresh, with the cached runners'
-age and `r` to retry) and transient messages, which expire after 6 seconds
-(errors after 15); key hints for the current screen stay on the last row.
+The header shows the owner, a health dot and how old the current screen's data is
+("updated 8s ago · every 20s"; on narrow terminals just a spinner while a refresh
+runs); tabs carry counts of failures (`✗`), running work (`↻`) and concerns. A
+state chip names the snapshot's health (`healthy`, `attention`, `partial`,
+`syncing`, `local`). On terminals at least 100 columns wide lists become dense
+one-row tables; from 140 columns a read-only preview of the selected repository,
+run, job or runner sits beside the list. Enter still opens the full screen. The
+breadcrumb row shows the drill-down path, such as `Actions › alpha / CI #42 ›
+test`; on narrow terminals it shortens before the filter input or the active
+detail tab does. The status row shows progress, persistent warnings (such as a
+failed runner refresh, with the cached runners' age and `r` to retry) and
+transient messages, which expire after 6 seconds (errors after 15); key hints for
+the current screen stay on the last row.
 
 Status is always a glyph plus a word, never colour alone: `✓` success, `✗`
 failure, `↻` running, `◌` queued or waiting, `⊘` skipped or cancelled, `?`

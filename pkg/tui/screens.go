@@ -162,6 +162,9 @@ func (m Model) countBar(done, total int, noun string) string {
 	}
 	p := m.ProgressBar
 	p.Width = min(14, max(4, m.Width/8))
+	if m.singleLineList() {
+		p.Width = 4
+	}
 	return fmt.Sprintf("%s %d/%d %s complete", p.ViewAs(float64(done)/float64(total)), done, total, noun)
 }
 func (m Model) entries() []screenEntry {
@@ -215,7 +218,7 @@ func (m Model) entries() []screenEntry {
 			case r.CurrentBranch != "":
 				branch := r.CurrentBranch
 				if r.DefaultBranch != "" && r.CurrentBranch != r.DefaultBranch {
-					branch += " (default " + r.DefaultBranch + ")"
+					branch += " → " + r.DefaultBranch
 				}
 				parts = append(parts, branch)
 			}
@@ -386,10 +389,49 @@ func (m Model) concernsCoverageWarning() string {
 	return fmt.Sprintf("! %d repositories have unknown counts and are not ranked", unknown)
 }
 func (m Model) listHeaderRows() int {
+	n := 0
 	if m.concernsCoverageWarning() != "" {
-		return 2
+		n += 2
 	}
-	return 0
+	if m.singleLineList() {
+		n++
+	}
+	return n
+}
+
+// singleLineList uses a dense one-row-per-item table on wide terminals. The
+// two-line card layout remains the fallback where titles and details would be
+// squeezed.
+func (m Model) singleLineList() bool {
+	if m.Width < 100 || m.detailVisible() || m.ActiveFocus == FocusOverview {
+		return false
+	}
+	return true
+}
+
+func (m Model) listColumnLabels() (string, string) {
+	switch m.ActiveFocus {
+	case FocusJobs:
+		if m.OpenRun != nil {
+			return "JOB", "PROGRESS · STATE"
+		}
+		if m.QueueView {
+			return "JOB", "RUN · WAITING"
+		}
+		return "RUN", "PROGRESS · TIMING"
+	case FocusRunners:
+		return "RUNNER", "PLATFORM · ASSIGNMENT"
+	case FocusConcerns:
+		return "REPOSITORY", "SIGNAL"
+	}
+	return "REPOSITORY", "BRANCH · COUNTS"
+}
+
+// listTableWidths splits the list column into the item and detail columns.
+func (m Model) listTableWidths(width int) (item, detail int) {
+	inner := max(20, width)
+	item = min(64, max(24, inner*2/5))
+	return item, max(8, inner-item-4)
 }
 func (m Model) selectionKey() string {
 	if m.ActiveFocus == FocusJobs && m.OpenRun != nil {
@@ -438,12 +480,21 @@ func (m Model) visibleEntries() (entries []screenEntry, start, selected int) {
 		selected = m.entryIndex(es)
 	}
 	reservedRows := m.listHeaderRows()
-	count := max(1, (m.bodyHeight()-reservedRows)/2)
+	var count int
+	if m.singleLineList() {
+		count = max(1, m.bodyHeight()-reservedRows)
+	} else {
+		count = max(1, (m.bodyHeight()-reservedRows)/2)
+	}
 	start = max(0, max(selected, 0)-count+1)
 	return es[start:min(len(es), start+count)], start, selected
 }
 func (m Model) detailVisible() bool { return m.Detail || m.OpenJobID != "" }
 func (m Model) listContent() string {
+	return m.listContentWidth(max(10, m.Width-2))
+}
+
+func (m Model) listContentWidth(width int) string {
 	es, start, selected := m.visibleEntries()
 	coverageWarning := m.concernsCoverageWarning()
 	if len(es) == 0 {
@@ -503,16 +554,37 @@ func (m Model) listContent() string {
 	if coverageWarning != "" {
 		lines = append(lines, th.warning.Render(coverageWarning), "")
 	}
-	for i, e := range es {
-		prefix, title, subtitle := "  ", e.title, th.dim.Render(e.subtitle)
-		if i+start == selected {
-			prefix = th.cursor.Render("›") + " "
-			title = th.selected.Render(title)
-			subtitle = th.body.Render(e.subtitle)
+	if m.singleLineList() {
+		itemW, detailW := m.listTableWidths(width)
+		headItem, headDetail := m.listColumnLabels()
+		lines = append(lines, "  "+columnHeader([]string{headItem, headDetail}, []int{itemW, detailW}, 2))
+		for i, e := range es {
+			lines = append(lines, m.tableRow(e, i+start == selected, width, itemW, detailW))
 		}
-		lines = append(lines, prefix+title, "  "+subtitle)
+		return strings.Join(lines, "\n")
+	}
+	for i, e := range es {
+		if i+start == selected {
+			w := max(10, width)
+			lines = append(lines,
+				th.cursor.Render("▌")+tint(th.rowSelected, padTo(" "+ansi.Strip(e.title), w-1), w-1),
+				" "+tint(th.rowDetail, " "+padTo(ansi.Strip(e.subtitle), max(0, w-3)), max(0, w-1)))
+			continue
+		}
+		lines = append(lines, "  "+e.title, "  "+th.dim.Render(e.subtitle))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// tableRow is one dense list row. The selected row drops nested colours so the
+// surface highlight and text contrast survive the whole row.
+func (m Model) tableRow(e screenEntry, selected bool, width, itemW, detailW int) string {
+	w := max(8, width)
+	if selected {
+		body := " " + padTo(ansi.Strip(e.title), itemW) + "  " + padTo(ansi.Strip(e.subtitle), detailW)
+		return th.cursor.Render("›") + th.rowSelected.Render(padTo(body, max(0, w-1)))
+	}
+	return " " + padTo(e.title, itemW) + "  " + th.dim.Render(fitLine(e.subtitle, detailW))
 }
 func fitFrame(content string, width, height int) string {
 	lines := strings.Split(content, "\n")

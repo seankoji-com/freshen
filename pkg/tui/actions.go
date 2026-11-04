@@ -73,6 +73,7 @@ func (m *Model) captureActionTarget() {
 	m.ActionURL = m.selectedURL()
 }
 func (m Model) menuContent() string {
+	width := max(1, m.Width-2)
 	if m.PendingAction != "" {
 		for _, a := range m.menuActions() {
 			if a.id == m.PendingAction {
@@ -84,7 +85,24 @@ func (m Model) menuContent() string {
 				if m.ActionTarget != nil && a.id == "prune" {
 					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
 				}
-				return th.warning.Render(statusGlyphs[kindWarning]+" Confirm: "+a.label) + "\n\n" + th.strong.Render(target) + "\n\n" + detail + "\n\n" + th.key.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
+				lines := []string{
+					rule("CONFIRM", width),
+					th.warning.Render(statusGlyphs[kindWarning] + " " + a.label),
+					"",
+					th.strong.Render(target),
+					"",
+					detail,
+					"",
+					th.keyPrimary.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels",
+				}
+				for i := range lines {
+					if i > 0 {
+						lines[i] = ansi.Wrap(lines[i], width, "")
+					} else {
+						lines[i] = fitLine(lines[i], width)
+					}
+				}
+				return strings.Join(lines, "\n")
 			}
 		}
 	}
@@ -94,7 +112,7 @@ func (m Model) menuContent() string {
 	}
 	// Budget in rendered rows: every row is cut or wrapped to the body width
 	// here, so View's wrap adds none, and the selected action always shows.
-	width := max(1, m.Width-2)
+	width = max(1, m.Width-2)
 	fit := func(s string) string { return ansi.Truncate(s, width, "…") }
 	actions := m.menuActions()
 	var tail []string
@@ -105,7 +123,7 @@ func (m Model) menuContent() string {
 	if m.BusyAction != "" {
 		tail = append(tail, "", fit("A repository action is already running."))
 	}
-	head := []string{fit(th.strong.Render(title)), ""}
+	head := []string{rule("ACTIONS", width), fit(th.strong.Render(title)), ""}
 	avail := m.bodyHeight()
 	for len(head)+len(tail) >= avail && len(tail) > 0 {
 		tail = tail[:len(tail)-1]
@@ -118,14 +136,16 @@ func (m Model) menuContent() string {
 	lines := head
 	for i := start; i < min(len(actions), start+count); i++ {
 		a := actions[i]
-		line := "  " + a.label
-		if i == m.MenuIndex {
-			line = th.cursor.Render("›") + " " + th.selected.Render(a.label)
-		}
+		suffix := ""
 		if a.confirm {
-			line += th.dim.Render("  (asks to confirm)")
+			suffix = "  (asks to confirm)"
 		}
-		lines = append(lines, fit(line))
+		if i == m.MenuIndex {
+			body := padTo(" "+a.label+suffix, max(0, width-1))
+			lines = append(lines, th.cursor.Render("›")+th.rowSelected.Render(body))
+			continue
+		}
+		lines = append(lines, fit("  "+a.label+th.dim.Render(suffix)))
 	}
 	return strings.Join(append(lines, tail...), "\n")
 }

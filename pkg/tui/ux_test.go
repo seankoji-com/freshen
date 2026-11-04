@@ -88,7 +88,7 @@ func TestReferenceFramesShowChrome(t *testing.T) {
 	m := smokeFixtureModel()
 	frame := stripped(renderAt(m, 80, 24))
 	lines := strings.Split(frame, "\n")
-	for i, want := range map[int]string{0: "freshen  fixture-org", 1: "1 Repositories", 2: "Repositories  ·  2 repositories", 3: "› alpha  ✓ updated", 22: "1 / 2", 23: "? keys"} {
+	for i, want := range map[int]string{0: "freshen  fixture-org", 1: "1 Repositories", 2: "Repositories  ·  2 repositories", 3: "▌ alpha  ✓ updated", 22: "1 / 2", 23: "? keys"} {
 		if !strings.Contains(lines[i], want) {
 			t.Fatalf("80x24 row %d = %q, want %q\n%s", i, lines[i], want, frame)
 		}
@@ -295,7 +295,8 @@ func TestTabRowGeometryDrivesMouse(t *testing.T) {
 		m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: width, Height: 24})
 		row := stripped(m.tabRow())
 		for _, tab := range m.screenTabs() {
-			if got := ansi.Cut(row, tab.start, tab.end); strings.TrimSpace(got) != tab.label {
+			got := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ansi.Cut(row, tab.start, tab.end)), "▎"))
+			if got != tab.label {
 				t.Fatalf("width %d: span [%d,%d) = %q, want %q", width, tab.start, tab.end, got, tab.label)
 			}
 			m.screenMouse(tea.MouseMsg{X: tab.start, Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})

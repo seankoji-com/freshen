@@ -467,11 +467,14 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= headerRows && msg.Y < headerRows+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
 		entries, _, _ := m.visibleEntries()
 		bodyRow := msg.Y - headerRows
-		headerRows := m.listHeaderRows()
-		if bodyRow < headerRows {
+		reserved := m.listHeaderRows()
+		if bodyRow < reserved {
 			return nil
 		}
-		i := (bodyRow - headerRows) / 2
+		i := bodyRow - reserved
+		if !m.singleLineList() {
+			i /= 2
+		}
 		if i < len(entries) {
 			m.selectEntry(entries[i])
 		}
