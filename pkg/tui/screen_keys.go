@@ -309,6 +309,13 @@ func (m *Model) openEntry() tea.Cmd {
 			return m.fetchOpenJobLogs()
 		}
 	default:
+		if m.ActiveFocus == FocusConcerns {
+			if r := m.Repos[e.index]; r.OpenPRsCount > 0 {
+				m.ActiveTab = TabPRs
+			} else if r.OpenIssuesCount > 0 {
+				m.ActiveTab = TabIssues
+			}
+		}
 		m.Detail = true
 		if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
 			return m.loadRepoDetail()
@@ -465,13 +472,24 @@ func (m *Model) screenMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 	}
 	if m.ActiveFocus != FocusOverview && !m.detailVisible() && msg.Y >= headerRows && msg.Y < headerRows+m.bodyHeight() && msg.X >= 1 && msg.X < m.Width-1 {
+		if m.showPreview() {
+			listW, _, _ := previewSplit(m.Width)
+			if msg.X >= 1+listW {
+				// The preview is read-only; a click there must not retarget the
+				// list selection (and therefore the next action).
+				return nil
+			}
+		}
 		entries, _, _ := m.visibleEntries()
 		bodyRow := msg.Y - headerRows
-		headerRows := m.listHeaderRows()
-		if bodyRow < headerRows {
+		reserved := m.listHeaderRows()
+		if bodyRow < reserved {
 			return nil
 		}
-		i := (bodyRow - headerRows) / 2
+		i := bodyRow - reserved
+		if !m.singleLineList() {
+			i /= 2
+		}
 		if i < len(entries) {
 			m.selectEntry(entries[i])
 		}

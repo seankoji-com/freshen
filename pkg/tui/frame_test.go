@@ -146,8 +146,8 @@ func TestOverviewSummarisesSnapshotsWithoutInventingCounts(t *testing.T) {
 	for _, want := range []string{
 		"2 repositories",
 		"PR and issue counts loaded for 1/2",
-		"1 need attention",
-		"1 recent failures",
+		"1 needs attention",
+		"1 recent failure",
 		"observed busy",
 		"2 open PRs · 4 open issues",
 		"beta / CI #43",
@@ -263,8 +263,10 @@ func TestConcernsMouseSelectionAccountsForCoverageBanner(t *testing.T) {
 	m.ActiveFocus = FocusConcerns
 	m.ScreenCursor[FocusConcerns] = ""
 	m.SelectedIndex = -1
+	m = sized(m, 80, 24)
 
-	// Body row 0 is the warning, row 1 is blank, and row 2 is the first repo.
+	// At 80x24 the list is two-line cards: body row 0 is the warning, row 1 is
+	// blank, and row 2 is the first repo.
 	m.screenMouse(tea.MouseMsg{X: 5, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	if m.SelectedIndex != 0 || m.ScreenCursor[FocusConcerns] != m.Repos[0].Path+"/"+m.Repos[0].Name {
 		t.Fatalf("coverage banner shifted mouse selection: selected=%d cursor=%q", m.SelectedIndex, m.ScreenCursor[FocusConcerns])
@@ -719,7 +721,7 @@ func TestProgressUsesAllJobsAndRealSteps(t *testing.T) {
 	}
 	press(&m, "enter")
 	content := stripped(m.listContent())
-	for _, want := range []string{"PASSED", "RUNNING", "QUEUED", "1/2 steps complete", "Run tests", "self-hosted"} {
+	for _, want := range []string{"passed", "running", "queued", "1/2 steps complete", "Run tests", "self-hosted"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q in %s", want, content)
 		}
@@ -1016,13 +1018,13 @@ func TestJobStateBadges(t *testing.T) {
 		status jobs.JobStatus
 		want   string
 	}{
-		{jobs.JobRunning, "↻ RUNNING"},
-		{jobs.JobPassed, "✓ PASSED"},
-		{jobs.JobFailed, "✗ FAILED"},
-		{jobs.JobQueued, "◌ QUEUED"},
-		{jobs.JobWaiting, "◌ WAITING"},
-		{jobs.JobCancelled, "⊘ CANCELLED"},
-		{jobs.JobSkipped, "⊘ SKIPPED"},
+		{jobs.JobRunning, "↻ running"},
+		{jobs.JobPassed, "✓ passed"},
+		{jobs.JobFailed, "✗ failed"},
+		{jobs.JobQueued, "◌ queued"},
+		{jobs.JobWaiting, "◌ waiting"},
+		{jobs.JobCancelled, "⊘ cancelled"},
+		{jobs.JobSkipped, "⊘ skipped"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {

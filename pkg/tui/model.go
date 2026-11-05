@@ -75,10 +75,16 @@ func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
 
 // --- Log highlighting patterns (styles live in theme.go) ---
 var (
-	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]`)
-	reCmd       = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
-	reURL       = regexp.MustCompile(`https?://[^\s]+`)
-	reQuoted    = regexp.MustCompile(`'[^']+'`)
+	reFail       = regexp.MustCompile(`^FAIL\b`)
+	rePass       = regexp.MustCompile(`\bPASS\b`)
+	reOK         = regexp.MustCompile(`^\s*ok\b`)
+	reErrorStart = regexp.MustCompile(`(?i)^(error|failed|failure|conflict|panic)(?::|\s)`)
+	reMakeError  = regexp.MustCompile(`(?i)\bmake:.*\bError [0-9]+\b`)
+	reErrorWord  = regexp.MustCompile(`(?i)(?:^|\s)(failed|failure)(?:[.,;:!]|\s|$)`)
+	reTimestamp  = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	reCmd        = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
+	reURL        = regexp.MustCompile(`https?://[^\s]+`)
+	reQuoted     = regexp.MustCompile(`'[^']+'`)
 )
 
 // --- Messages for Bubble Tea Update Loop ---
@@ -261,6 +267,9 @@ func NewModel(targetDir, targetOrg string, concurrency int, ctx context.Context,
 	search.Prompt = "/ "
 	search.Placeholder = "Filter by name, repository, branch or status"
 	search.CharLimit = 100
+	search.PromptStyle = th.fg(th.secondary)
+	search.TextStyle = th.body
+	search.PlaceholderStyle = th.dim
 
 	return Model{
 		TargetDir:            targetDir,

@@ -59,32 +59,76 @@ func (m *Model) updateViewport() {
 		if ghName == "" {
 			ghName = item.Name
 		}
+		avail := max(1, m.Viewport.Width)
+		if ansi.StringWidth(ghName) > max(1, avail-2) {
+			ghName = ansi.Truncate(ghName, max(1, avail-2), "…")
+		}
 		repoLink := Hyperlink(th.section.Render(ghName), repoURL)
 
+		sep := "  ·  "
+		if m.Width < 60 {
+			sep = " · "
+		}
 		branchDetail := "not cloned"
 		if !item.IsNew {
-			branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
-			if item.CurrentBranch != item.DefaultBranch {
-				branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+			switch {
+			case item.CurrentBranch == "":
+				branchDetail = "unread"
+			case m.Width >= 100 && item.DefaultBranch != "":
+				branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+				if item.CurrentBranch != item.DefaultBranch {
+					branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+				}
+			default:
+				branchDetail = item.CurrentBranch
 			}
 		}
-		branchLink := Hyperlink("branch "+branchDetail, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
-
+		branchLabel := "branch " + branchDetail
+		if m.Width < 60 {
+			branchLabel = branchDetail
+		}
 		counts := "PR and issue counts not loaded"
 		if item.HasLoadedCounts {
 			prLink := Hyperlink(th.pr.Render(countPhrase(item.OpenPRsCount, "open PR", "open PRs")), repoURL+"/pulls")
 			issueLink := Hyperlink(th.issue.Render(countPhrase(item.OpenIssuesCount, "open issue", "open issues")), repoURL+"/issues")
 			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
-		status := m.renderStatusBadge(item)
-		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
-			status += th.dim.Render(" · " + item.StatusMsg)
+		div := ""
+		if m.Width >= 60 {
+			div = repoDivergence(item)
 		}
-		sep := th.dim.Render("  ·  ")
-		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchLink, sep, status)
+		divPart := ""
+		if div != "" {
+			divPart = th.dim.Render(sep) + th.dim.Render(div)
+		}
+		status := m.renderStatusBadge(item)
+		fixed := 1 + ansi.StringWidth(repoLink) + 2*ansi.StringWidth(sep) + ansi.StringWidth(status)
+		budget := avail - fixed - ansi.StringWidth(divPart)
+		if m.Width >= 60 && budget >= 8 {
+			branchText := ansi.Truncate(branchLabel, budget, "…")
+			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
+			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, divPart, th.dim.Render(sep)+status)
+		} else {
+			branchBudget := max(1, avail-2-ansi.StringWidth(divPart))
+			branchText := ansi.Truncate(branchLabel, branchBudget, "…")
+			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
+			fmt.Fprintf(&sb, " %s\n %s%s\n %s\n", repoLink, branchPart, divPart, fitLine(status, avail-1))
+		}
 		fmt.Fprintf(&sb, " %s", counts)
+		var extras []string
+		if !item.IsNew && item.DefaultBranch == "" {
+			extras = append(extras, "default branch unread; press r to refresh")
+		}
+		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
+			extras = append(extras, item.StatusMsg)
+		}
+		for _, extra := range extras {
+			for _, line := range strings.Split(ansi.Wrap(extra, max(1, m.Viewport.Width-2), ""), "\n") {
+				sb.WriteString("\n  " + th.dim.Render(line))
+			}
+		}
 		if item.HasUnstagedChanges {
-			sb.WriteString(sep + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
+			sb.WriteString("\n " + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
 		}
 		sb.WriteString("\n\n")
 
@@ -243,6 +287,24 @@ func highlightLogLine(line string) string {
 	if line == "" {
 		return line
 	}
+	trimmed := strings.TrimSpace(line)
+	// GitHub job-log lines start with an ISO timestamp; classify the content
+	// after it so a timestamped "ok .../errors" is still a passing line.
+	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
+	switch {
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify):
+		return th.fg(th.red).Render(ansi.Strip(line))
+	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
+		return th.fg(th.yellow).Render(ansi.Strip(line))
+	case strings.Contains(classify, "##[group]"):
+		return th.fg(th.blue).Render(ansi.Strip(line))
+	case strings.HasPrefix(classify, "--- PASS") || reOK.MatchString(classify):
+		return th.fg(th.green).Render(ansi.Strip(line))
+	case reErrorWord.MatchString(classify):
+		return th.fg(th.red).Render(ansi.Strip(line))
+	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
+		return th.fg(th.green).Render(ansi.Strip(line))
+	}
 
 	render := func(style lipgloss.Style) func(string) string {
 		return func(s string) string { return style.Render(s) }
@@ -251,13 +313,6 @@ func highlightLogLine(line string) string {
 	line = reCmd.ReplaceAllStringFunc(line, render(th.logCommand))
 	line = reURL.ReplaceAllStringFunc(line, render(th.link))
 	line = reQuoted.ReplaceAllStringFunc(line, render(th.logQuoted))
-
-	if strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
-		line = th.fg(th.green).Render(line)
-	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
-		line = th.fg(th.red).Render(line)
-	}
-
 	return line
 }
 

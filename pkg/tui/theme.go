@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
@@ -40,13 +41,16 @@ var statusGlyphs = map[statusKind]string{
 // from th rather than building ad-hoc lipgloss styles.
 type theme struct {
 	noColor bool
+	light   bool
 
-	primary, secondary, green, yellow, red, blue, muted, text, surface lipgloss.TerminalColor
+	primary, secondary, green, yellow, red, blue, muted, text, surface, line lipgloss.TerminalColor
 
 	brand, owner, dim, body, strong, section, divider    lipgloss.Style
 	tabActive, tabInactive, subTabActive, subTabInactive lipgloss.Style
-	crumb, crumbCurrent, selected, cursor                lipgloss.Style
-	key, keyDesc, keySep                                 lipgloss.Style
+	crumb, crumbCurrent, cursor                          lipgloss.Style
+	rowSelected, rowDetail                               lipgloss.Style
+	tableHeader, tileLabel                               lipgloss.Style
+	key, keyDesc, keySep, keyPrimary                     lipgloss.Style
 	toastInfo, toastError, warning, link                 lipgloss.Style
 	pr, issue, branchHeading, worktreeHeading            lipgloss.Style
 	logTimestamp, logCommand, logQuoted                  lipgloss.Style
@@ -56,26 +60,70 @@ type theme struct {
 // disables colour while keeping bold, underline and reverse attributes.
 func noColorRequested() bool { return os.Getenv("NO_COLOR") != "" }
 
+// lightRequested chooses a light-terminal palette. FRESHEN_LIGHT wins; then a
+// COLORFGBG background of 7 or 15. The default is dark because the app does not
+// paint its own background and most terminals in this workflow are dark.
+func lightRequested() bool {
+	switch os.Getenv("FRESHEN_LIGHT") {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	parts := strings.Split(os.Getenv("COLORFGBG"), ";")
+	if len(parts) >= 2 {
+		bg := parts[len(parts)-1]
+		return bg == "15" || bg == "7"
+	}
+	return false
+}
+
 var th = newTheme(noColorRequested())
 
+// termenv.ANSI: attributes (bold, reverse, underline) without colour. Lip
+// Gloss otherwise selects the Ascii profile when NO_COLOR is set, which drops
+// the reverse-video selection too; NO_COLOR asks for no colour, not no styling.
+const ansiProfile = 2
+
+func init() {
+	if noColorRequested() {
+		lipgloss.SetColorProfile(ansiProfile)
+		th = newTheme(true)
+	}
+}
+
 func newTheme(noColor bool) theme {
+	return newThemeMode(noColor, lightRequested())
+}
+
+func newThemeMode(noColor, light bool) theme {
 	c := func(hex string) lipgloss.TerminalColor {
 		if noColor {
 			return lipgloss.NoColor{}
 		}
 		return lipgloss.Color(hex)
 	}
+	primary, secondary, green := "#78B159", "#56BFA8", "#72C98B"
+	yellow, red, blue := "#F59E0B", "#F07178", "#5B9BF8"
+	muted, text, surface, line := "#8CA096", "#DCE7E0", "#223028", "#2E4038"
+	if light {
+		primary, secondary, green = "#276B2B", "#126B5C", "#1E7A3A"
+		yellow, red, blue = "#8A5A00", "#B3261E", "#1F5FBF"
+		muted, text, surface, line = "#4E6258", "#1B2A22", "#E4EEE7", "#C9D8CF"
+	}
 	t := theme{
 		noColor:   noColor,
-		primary:   c("#78B159"), // Leaf green
-		secondary: c("#56BFA8"), // Dew mint
-		green:     c("#72C98B"), // Fresh green
-		yellow:    c("#F59E0B"), // Warm amber
-		red:       c("#F07178"), // Coral red
-		blue:      c("#5B9BF8"), // Clear blue
-		muted:     c("#7F9087"), // Muted sage
-		text:      c("#DCE7E0"), // Frosted white
-		surface:   c("#2A3A31"), // Deep leaf surface
+		light:     light,
+		primary:   c(primary),
+		secondary: c(secondary),
+		green:     c(green),
+		yellow:    c(yellow),
+		red:       c(red),
+		blue:      c(blue),
+		muted:     c(muted),
+		text:      c(text),
+		surface:   c(surface),
+		line:      c(line),
 	}
 	s := lipgloss.NewStyle
 	t.brand = s().Bold(true).Foreground(t.primary)
@@ -84,24 +132,29 @@ func newTheme(noColor bool) theme {
 	t.body = s().Foreground(t.text)
 	t.strong = s().Bold(true).Foreground(t.text)
 	t.section = s().Bold(true).Foreground(t.secondary)
-	t.divider = s().Foreground(t.surface)
+	t.divider = s().Foreground(t.line)
 	t.tabActive = s().Bold(true).Foreground(t.text).Background(t.surface).Padding(0, 1)
 	t.tabInactive = s().Foreground(t.muted).Padding(0, 1)
 	t.subTabActive = s().Bold(true).Foreground(t.text).Underline(true).Padding(0, 1)
 	t.subTabInactive = s().Foreground(t.muted).Padding(0, 1)
 	t.crumb = s().Foreground(t.muted)
 	t.crumbCurrent = s().Bold(true).Foreground(t.text)
-	t.selected = s().Bold(true).Foreground(t.text).Background(t.surface)
 	t.cursor = s().Bold(true).Foreground(t.primary)
+	t.rowSelected = s().Foreground(t.text).Background(t.surface)
+	t.rowDetail = s().Foreground(t.text).Background(t.surface)
+	t.tableHeader = s().Bold(true).Foreground(t.muted)
+	t.tileLabel = s().Bold(true).Foreground(t.secondary)
 	if noColor {
 		// Without colour a background highlight disappears; reverse video keeps
 		// the selected row visible alongside the › cursor.
 		t.tabActive = t.tabActive.Reverse(true)
-		t.selected = t.selected.Reverse(true)
+		t.rowSelected = t.rowSelected.Reverse(true)
+		t.rowDetail = t.rowDetail.Reverse(true)
 	}
 	t.key = s().Bold(true).Foreground(t.secondary)
+	t.keyPrimary = s().Bold(true).Foreground(t.primary)
 	t.keyDesc = s().Foreground(t.muted)
-	t.keySep = s().Foreground(t.surface)
+	t.keySep = s().Foreground(t.line)
 	t.toastInfo = s().Foreground(t.text)
 	t.toastError = s().Bold(true).Foreground(t.red)
 	t.warning = s().Bold(true).Foreground(t.yellow)
@@ -143,6 +196,16 @@ func (t theme) status(k statusKind, label string) string {
 	return t.fg(t.kindColor(k)).Bold(true).Render(statusGlyphs[k] + " " + label)
 }
 
+// statusChip is the compact state capsule used in the context row. Colour is
+// carried by the glyph and label, never by the background alone.
+func (t theme) statusChip(k statusKind, label string) string {
+	s := lipgloss.NewStyle().Bold(true).Foreground(t.kindColor(k)).Background(t.surface).Padding(0, 1)
+	if t.noColor {
+		s = s.Reverse(true)
+	}
+	return s.Render(statusGlyphs[k] + " " + label)
+}
+
 // newProgress builds the shared progress bar. Bubbles' progress bar queries the
 // terminal profile itself and ignores NO_COLOR, so it is pinned to the same
 // environment-aware profile Lip Gloss uses, or to no colour at all.
@@ -152,7 +215,51 @@ func (t theme) newProgress() progress.Model {
 		p.EmptyColor = ""
 		return p
 	}
-	return progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+	// The bar stays inside the leaf/mint identity instead of Charm's default
+	// purple gradient, which was the only off-palette colour in the frame.
+	return progress.New(progress.WithGradient("#78B159", "#56BFA8"), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+}
+
+// progressFor colours a bar by the state it describes: a failed run must not
+// show a reassuring green bar just because its jobs finished.
+func (t theme) progressFor(k statusKind) progress.Model {
+	if t.noColor {
+		p := progress.New(progress.WithSolidFill(""), progress.WithoutPercentage())
+		p.EmptyColor = ""
+		return p
+	}
+	return progress.New(progress.WithSolidFill(t.progressFill(k)), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+}
+
+// progressFill is the bar colour for a state, chosen from the active palette.
+func (t theme) progressFill(k statusKind) string {
+	fill := "#8CA096"
+	if t.light {
+		fill = "#4E6258"
+	}
+	switch k {
+	case kindSuccess:
+		fill = "#78B159"
+		if t.light {
+			fill = "#1E7A3A"
+		}
+	case kindFailure:
+		fill = "#F07178"
+		if t.light {
+			fill = "#B3261E"
+		}
+	case kindRunning:
+		fill = "#5B9BF8"
+		if t.light {
+			fill = "#1F5FBF"
+		}
+	case kindQueued, kindWarning:
+		fill = "#F59E0B"
+		if t.light {
+			fill = "#8A5A00"
+		}
+	}
+	return fill
 }
 
 func jobKind(s jobs.JobStatus) statusKind {
@@ -175,15 +282,15 @@ func jobKind(s jobs.JobStatus) statusKind {
 func runnerKind(s jobs.RunnerStatus) (statusKind, string) {
 	switch s {
 	case jobs.RunnerRunning:
-		return kindRunning, "BUSY"
+		return kindRunning, "busy"
 	case jobs.RunnerIdle:
-		return kindSuccess, "IDLE"
+		return kindSuccess, "idle"
 	case jobs.RunnerOffline:
-		return kindFailure, "OFFLINE"
+		return kindFailure, "offline"
 	case jobs.RunnerMaintenance:
-		return kindSkipped, "MAINTENANCE"
+		return kindSkipped, "maintenance"
 	default:
-		return kindUnknown, "UNKNOWN"
+		return kindUnknown, "unknown"
 	}
 }
 

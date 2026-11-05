@@ -364,6 +364,9 @@ type RepoItem struct {
 	CurrentBranch      string
 	OriginalBranch     string
 	DefaultBranch      string
+	Ahead              int  // commits ahead of the upstream, when known
+	Behind             int  // commits behind the upstream, when known
+	HasUpstream        bool // false when the branch has no upstream
 	HasUnstagedChanges bool
 	ExistingPRURL      string
 	OpenIssuesCount    int
@@ -1311,6 +1314,30 @@ type LocalCheckout struct {
 	IsRepo        bool
 	CurrentBranch string // "" when it could not be read
 	DefaultBranch string // "" when it could not be read; local tiers only
+	Ahead         int    // commits ahead of the upstream, when known
+	Behind        int    // commits behind the upstream, when known
+	HasUpstream   bool
+}
+
+// readAheadBehind reads the divergence from the branch's upstream. A missing
+// upstream is not an error; the caller simply has no divergence to show.
+func readAheadBehind(ctx context.Context, path string) (ok bool, ahead, behind int) {
+	readCtx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
+	lines, readErr := readGitLines(readCtx, path, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+	if readErr != "" || len(lines) == 0 {
+		return false, 0, 0
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) != 2 {
+		return false, 0, 0
+	}
+	a, errA := strconv.Atoi(fields[0])
+	b, errB := strconv.Atoi(fields[1])
+	if errA != nil || errB != nil {
+		return false, 0, 0
+	}
+	return true, a, b
 }
 
 // ReadLocalCheckout reads whether path is a checkout and, if so, its checked
@@ -1335,6 +1362,7 @@ func ReadLocalCheckout(ctx context.Context, path string) (LocalCheckout, error) 
 	if checkout.DefaultBranch, err = readDefaultBranch(ctx, path, false); err != nil {
 		failed = append(failed, "default branch ("+readFailure(err)+")")
 	}
+	checkout.HasUpstream, checkout.Ahead, checkout.Behind = readAheadBehind(ctx, path)
 	if len(failed) > 0 {
 		return checkout, fmt.Errorf("could not read the %s", strings.Join(failed, " or the "))
 	}
@@ -1561,6 +1589,18 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		return
 	}
 	s := &syncSession{item: item, emit: emit}
+	defer func() {
+		// The sync's own deadline is cancelled by a later defer, so this final
+		// read gets its own bounded context.
+		readCtx, cancel := context.WithTimeout(context.Background(), branchReadTimeout)
+		ok, ahead, behind := readAheadBehind(readCtx, item.Path)
+		cancel()
+		item.HasUpstream, item.Ahead, item.Behind = ok, ahead, behind
+		// The final finish snapshot was published before this read; publish one
+		// more so the TUI receives the divergence that belongs to the final
+		// branch state.
+		s.publish()
+	}()
 
 	item.Status = StatusSyncing
 	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)

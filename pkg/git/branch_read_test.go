@@ -448,7 +448,7 @@ func TestReadLocalCheckoutReportsFailedReads(t *testing.T) {
 	if got, err := ReadLocalCheckout(ctx, t.TempDir()); err != nil || got.IsRepo {
 		t.Fatalf("plain directory: %+v %v", got, err)
 	}
-	if got, err := ReadLocalCheckout(ctx, f.work); err != nil || got != (LocalCheckout{IsRepo: true, CurrentBranch: "main", DefaultBranch: "main"}) {
+	if got, err := ReadLocalCheckout(ctx, f.work); err != nil || got != (LocalCheckout{IsRepo: true, CurrentBranch: "main", DefaultBranch: "main", HasUpstream: true}) {
 		t.Fatalf("checkout: %+v %v", got, err)
 	}
 

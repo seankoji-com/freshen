@@ -154,7 +154,11 @@ func (m Model) footerBindings() []key.Binding {
 	}
 	switch {
 	case m.PendingAction != "":
-		add(k.Confirm, relabel(k.ForceQuit, "quit"), k.Cancel)
+		if !m.confirmationFits() || (m.PendingAction == "push" && m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "" || m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch)) {
+			add(relabel(k.Cancel, "cancel"), relabel(k.ForceQuit, "quit"))
+		} else {
+			add(k.Confirm, relabel(k.ForceQuit, "quit"), k.Cancel)
+		}
 	case m.MenuOpen:
 		add(pair(k.Up, k.Down, "choose"), relabel(k.MenuSelect, "run"), relabel(k.MenuClose, "close"))
 	case m.Filtering:
@@ -166,8 +170,20 @@ func (m Model) footerBindings() []key.Binding {
 	case m.detailVisible():
 		add(pair(k.Up, k.Down, "scroll"), relabel(k.Back, "back"), pair(k.PrevTab, k.NextTab, "tab"), relabel(k.Menu, "actions"), relabel(k.Refresh, "refresh"), k.Quit, relabel(k.Help, "keys"))
 	default:
-		add(pair(k.Up, k.Down, "move"), relabel(k.Open, "open"), relabel(k.Filter, "filter"), relabel(k.ToggleQueue, queue), relabel(k.CycleRuns, "filter runs"),
+		if len(m.entries()) == 0 {
+			if (m.OpenRun != nil || m.QueueView || m.detailVisible()) && k.Back.Enabled() {
+				add(relabel(k.Back, "back"))
+			}
+			add(relabel(k.Refresh, "refresh"), relabel(k.Jump, "screens"), k.Quit, relabel(k.Help, "keys"))
+			break
+		}
+		first := []key.Binding{pair(k.Up, k.Down, "move"), relabel(k.Open, "open"), relabel(k.Filter, "filter")}
+		if (m.OpenRun != nil || m.QueueView) && k.Back.Enabled() {
+			first = append(first, relabel(k.Back, "back"))
+		}
+		first = append(first, relabel(k.ToggleQueue, queue), relabel(k.CycleRuns, "filter runs"),
 			relabel(k.Menu, "actions"), relabel(k.Refresh, "refresh"), relabel(k.Jump, "screens"), k.Quit, relabel(k.Help, "keys"))
+		add(first...)
 	}
 	return out
 }

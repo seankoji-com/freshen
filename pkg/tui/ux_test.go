@@ -33,6 +33,7 @@ var uxStates = []struct {
 	{"concerns", func(m *Model) { press(m, "4") }},
 	{"help", func(m *Model) { press(m, "2"); press(m, "?") }},
 	{"filter", func(m *Model) { press(m, "/"); press(m, "al") }},
+	{"empty-filter", func(m *Model) { press(m, "1"); press(m, "/") }},
 	{"menu", func(m *Model) { press(m, " ") }},
 	{"confirm", func(m *Model) { press(m, "X") }},
 	{"long-filter", func(m *Model) { press(m, "/"); press(m, strings.Repeat("abcdefghij", 7)+"wxyz") }},
@@ -88,7 +89,7 @@ func TestReferenceFramesShowChrome(t *testing.T) {
 	m := smokeFixtureModel()
 	frame := stripped(renderAt(m, 80, 24))
 	lines := strings.Split(frame, "\n")
-	for i, want := range map[int]string{0: "freshen  fixture-org", 1: "1 Repositories", 2: "Repositories  ·  2 repositories", 3: "› alpha  ✓ updated", 22: "1 / 2", 23: "? keys"} {
+	for i, want := range map[int]string{0: "freshen  fixture-org", 1: "1 Repositories", 2: "Repositories  ·  2 repositories", 3: "▌ alpha  ✓ updated", 22: "1 / 2", 23: "? keys"} {
 		if !strings.Contains(lines[i], want) {
 			t.Fatalf("80x24 row %d = %q, want %q\n%s", i, lines[i], want, frame)
 		}
@@ -295,7 +296,8 @@ func TestTabRowGeometryDrivesMouse(t *testing.T) {
 		m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: width, Height: 24})
 		row := stripped(m.tabRow())
 		for _, tab := range m.screenTabs() {
-			if got := ansi.Cut(row, tab.start, tab.end); strings.TrimSpace(got) != tab.label {
+			got := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ansi.Cut(row, tab.start, tab.end)), "▎"))
+			if got != tab.label {
 				t.Fatalf("width %d: span [%d,%d) = %q, want %q", width, tab.start, tab.end, got, tab.label)
 			}
 			m.screenMouse(tea.MouseMsg{X: tab.start, Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
@@ -429,7 +431,7 @@ func TestNoColorRemovesColourButKeepsMeaning(t *testing.T) {
 	})
 
 	t.Setenv("NO_COLOR", "")
-	th = newTheme(noColorRequested())
+	th = newThemeMode(noColorRequested(), false)
 	m := smokeFixtureModel()
 	m.ProgressBar = th.newProgress()
 	press(&m, "2")
@@ -438,7 +440,7 @@ func TestNoColorRemovesColourButKeepsMeaning(t *testing.T) {
 	}
 
 	t.Setenv("NO_COLOR", "1")
-	th = newTheme(noColorRequested())
+	th = newThemeMode(noColorRequested(), false)
 	for _, st := range uxStates {
 		m := smokeFixtureModel()
 		m.ProgressBar = th.newProgress()
@@ -466,7 +468,7 @@ func TestStatusSemanticsNeverDependOnColourAlone(t *testing.T) {
 		}
 	}
 	for _, s := range []jobs.JobStatus{jobs.JobQueued, jobs.JobRunning, jobs.JobPassed, jobs.JobFailed, jobs.JobCancelled, jobs.JobSkipped, jobs.JobWaiting, jobs.JobUnknown} {
-		if got := stripped(stateBadge(s)); got != statusGlyphs[jobKind(s)]+" "+string(s) {
+		if got := stripped(stateBadge(s)); got != statusGlyphs[jobKind(s)]+" "+jobLabel(s) {
 			t.Fatalf("job %s rendered %q", s, got)
 		}
 	}
@@ -497,7 +499,7 @@ func TestRunsShowTimingAndFailureReason(t *testing.T) {
 	press(&m, "2")
 	press(&m, "f") // Needs attention
 	list := stripped(m.listContent())
-	if !strings.Contains(list, "✗ FAILED  beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
+	if !strings.Contains(list, "✗ failed") || !strings.Contains(list, "beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
 		t.Fatalf("failed run lacks status or timing:\n%s", list)
 	}
 	press(&m, "enter")

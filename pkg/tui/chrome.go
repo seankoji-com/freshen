@@ -19,10 +19,11 @@ const (
 )
 
 // minFrameWidth and minFrameHeight are the smallest terminal that renders the
-// full chrome; anything smaller shows a resize notice instead.
+// full chrome. Below them the tabs, context and hints would clip into an
+// ambiguous frame, so a resize notice with the working quit key is clearer.
 const (
-	minFrameWidth  = 30
-	minFrameHeight = 10
+	minFrameWidth  = 40
+	minFrameHeight = 12
 )
 
 type screenTab struct {
@@ -32,11 +33,11 @@ type screenTab struct {
 }
 
 var tabNames = map[FocusType][3]string{
-	FocusOverview: {"Overview", "Org", "O"},
-	FocusRepos:    {"Repositories", "Repos", "R"},
-	FocusJobs:     {"Actions", "CI", "A"},
-	FocusRunners:  {"Runners", "Run", "N"},
-	FocusConcerns: {"Concerns", "Concerns", "C"},
+	FocusOverview: {"Overview", "Ovw", "Ovw"},
+	FocusRepos:    {"Repositories", "Rep", "Rep"},
+	FocusJobs:     {"Actions", "Act", "Act"},
+	FocusRunners:  {"Runners", "Rnr", "Rnr"},
+	FocusConcerns: {"Concerns", "Con", "Con"},
 }
 
 // tabBadge is a short count for a tab, or "" when there is nothing to flag.
@@ -71,23 +72,28 @@ func (m Model) tabBadge(f FocusType, s orgSummary) string {
 
 // screenTabs lays out the tab row. It tries full names with count badges,
 // then progressively shorter labels, and uses the first that fits. Rendering
-// and mouse hit testing both use these spans.
+// and mouse hit testing both use these spans. Each tab reserves one leading
+// cell for the active accent so selecting a tab never shifts the row.
 func (m Model) screenTabs() []screenTab {
 	summary := m.buildOrgSummary()
 	for _, variant := range []struct {
-		name   int
-		badges bool
-	}{{0, true}, {0, false}, {1, false}, {2, false}} {
+		name    int
+		badges  bool
+		numbers bool
+	}{{0, true, true}, {0, false, true}, {1, false, true}, {1, false, false}, {2, false, false}} {
 		tabs := make([]screenTab, 0, len(screenOrder))
 		x := 1
 		for i, f := range screenOrder {
-			label := fmt.Sprintf("%d %s", i, tabNames[f][variant.name])
+			label := tabNames[f][variant.name]
+			if variant.numbers {
+				label = fmt.Sprintf("%d %s", i, label)
+			}
 			if variant.badges {
 				if badge := m.tabBadge(f, summary); badge != "" {
 					label += " " + badge
 				}
 			}
-			w := ansi.StringWidth(label) + 2 // tab style pads one cell each side
+			w := ansi.StringWidth(label) + 3 // accent cell plus tab padding
 			tabs = append(tabs, screenTab{focus: f, key: fmt.Sprint(i), label: label, start: x, end: x + w})
 			x += w + 1
 		}
@@ -103,13 +109,15 @@ func (m Model) tabRow() string {
 	sb.WriteString(" ")
 	for i, tab := range m.screenTabs() {
 		if i > 0 {
-			sb.WriteString(" ")
+			sb.WriteString(th.divider.Render("│"))
 		}
-		style := th.tabInactive
 		if tab.focus == m.ActiveFocus {
-			style = th.tabActive
+			sb.WriteString(th.cursor.Render("▎"))
+			sb.WriteString(th.tabActive.Render(tab.label))
+		} else {
+			sb.WriteString(" ")
+			sb.WriteString(th.tabInactive.Render(tab.label))
 		}
-		sb.WriteString(style.Render(tab.label))
 	}
 	return sb.String()
 }
@@ -199,8 +207,54 @@ func joinEnds(left, right string, width int) string {
 	return left + strings.Repeat(" ", width-lw-rw) + right
 }
 
+// overallKind is the one-glance health of everything the current snapshot
+// covers. It never invents a healthy state: failed or partial reads stay
+// visible as warning or failure.
+func (m Model) overallKind() statusKind {
+	s := m.buildOrgSummary()
+	switch {
+	case s.repoProblems > 0 || s.failedRuns > 0 || (s.runnerOffline > 0 && !m.RunnerPermissionDenied):
+		return kindFailure
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
+		return kindWarning
+	case len(s.attention) > 0:
+		return kindWarning
+	case s.repositories == 0:
+		return kindUnknown
+	case m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading:
+		return kindRunning
+	}
+	return kindSuccess
+}
+
+// snapshotChip names the freshness of the whole screen without implying that
+// a partial snapshot is live. It agrees with the header dot.
+func (m Model) snapshotChip() (string, statusKind) {
+	switch {
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
+		if m.overallKind() == kindFailure {
+			return "partial · failures", kindFailure
+		}
+		return "partial", kindWarning
+	case m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading:
+		if len(m.Repos) == 0 {
+			return "loading", kindRunning
+		}
+		return "syncing", kindRunning
+	case m.TargetOrg == "":
+		if len(m.Repos) == 0 {
+			return "empty", kindUnknown
+		}
+		return "local", m.overallKind()
+	case m.LocalScanFailed:
+		return "stale", kindWarning
+	}
+	k := m.overallKind()
+	return healthLabel(k), k
+}
+
 func (m Model) headerRow() string {
-	left := " " + th.brand.Render("freshen")
+	left := " " + th.brand.Render("❧") + " " + th.brand.Render("freshen")
 	owner := m.TargetOrg
 	if owner == "" {
 		owner = git.ShortenHomePath(m.TargetDir)
@@ -208,8 +262,11 @@ func (m Model) headerRow() string {
 	if owner != "" {
 		left += "  " + th.owner.Render(owner)
 	}
+	if m.Width < 48 {
+		left += "  " + th.glyph(m.overallKind())
+	}
 	if m.JobQueueFetchFailed {
-		left += "  " + th.toastError.Render(statusGlyphs[kindFailure]+" Actions incomplete")
+		left += "  " + th.warning.Render(statusGlyphs[kindWarning]+" Actions incomplete")
 	}
 	if full := th.dim.Render(m.freshness()) + " "; ansi.StringWidth(left)+ansi.StringWidth(full)+2 <= m.Width || !m.screenRefreshing() {
 		return joinEnds(left, full, m.Width)
@@ -379,8 +436,13 @@ func (m Model) contextRow() string {
 		return " " + m.breadcrumbView(avail-contextGap-ansi.StringWidth(tabs)) + strings.Repeat(" ", contextGap) + tabs
 	}
 	row := " " + m.breadcrumbView(avail)
-	if detail := m.contextSummary(); detail != "" {
-		row += th.dim.Render("  ·  " + detail)
+	if m.ActiveFocus != FocusOverview {
+		if detail := m.contextSummary(); detail != "" {
+			row += th.dim.Render("  ·  " + detail)
+		}
+	}
+	if chip, kind := m.snapshotChip(); chip != "" && m.Width >= 48 {
+		row = joinEnds(fitLine(row, avail), th.statusChip(kind, chip)+" ", avail)
 	}
 	return row
 }
@@ -436,13 +498,13 @@ func (m Model) contextSummary() string {
 		switch {
 		case m.OpenJobID != "":
 			if j := m.openJob(); j != nil {
-				s = string(j.Status)
+				s = jobLabel(j.Status)
 				if j.RunnerName != "" {
 					s += " · on " + j.RunnerName
 				}
 			}
 		case m.OpenRun != nil:
-			s = fmt.Sprintf("%s · attempt %d", string(m.OpenRun.Status), m.OpenRun.Attempt)
+			s = fmt.Sprintf("%s · attempt %d", jobLabel(m.OpenRun.Status), m.OpenRun.Attempt)
 			if t := runTiming(m.OpenRun, time.Now()); t != "" {
 				s += " · " + t
 			}
@@ -465,7 +527,7 @@ func (m Model) contextSummary() string {
 				}
 			}
 			if m.QueueView {
-				s = fmt.Sprintf("%d jobs not started", queuedJobs)
+				s = countPhrase(queuedJobs, "job not started", "jobs not started")
 			} else {
 				s = fmt.Sprintf("%d running · %d queued · %d waiting · %d queued jobs", running, queued, waiting, queuedJobs)
 			}
@@ -510,6 +572,8 @@ func (m Model) screenView() string {
 	body := m.listContent()
 	if m.ActiveFocus == FocusOverview {
 		body = m.summaryContent(max(1, m.Width-2), m.bodyHeight())
+	} else if m.showPreview() {
+		body = m.listWithPreview()
 	}
 	if m.detailVisible() {
 		body = m.Viewport.View()
@@ -547,14 +611,18 @@ func (m Model) footerView() string {
 	if len(bs) == 0 {
 		return ""
 	}
-	render := func(b key.Binding) string {
-		return th.key.Render(b.Help().Key) + " " + th.keyDesc.Render(b.Help().Desc)
+	render := func(b key.Binding, primary bool) string {
+		keyStyle := th.key
+		if primary {
+			keyStyle = th.keyPrimary
+		}
+		return keyStyle.Render(b.Help().Key) + " " + th.keyDesc.Render(b.Help().Desc)
 	}
 	sep := th.keySep.Render(" • ")
-	last := render(bs[len(bs)-1])
+	last := render(bs[len(bs)-1], len(bs) == 1)
 	out := ""
-	for _, b := range bs[:len(bs)-1] {
-		candidate := out + render(b) + sep
+	for i, b := range bs[:len(bs)-1] {
+		candidate := out + render(b, i == 0) + sep
 		if ansi.StringWidth(candidate+last) > m.Width-2 {
 			break
 		}
@@ -564,15 +632,20 @@ func (m Model) footerView() string {
 }
 
 func (m Model) statusLine() string {
+	if m.PendingAction != "" && !m.confirmationFits() {
+		return th.warning.Render(statusGlyphs[kindWarning] + " Resize the terminal to read the full confirmation · esc cancels")
+	}
 	if m.BusyAction != "" {
 		return m.Spinner.View() + " " + m.BusyAction + th.dim.Render(" · navigation remains available")
 	}
 	if m.toastVisible(time.Now()) {
 		style := th.toastInfo
+		glyph := "• "
 		if m.ToastPriority >= 2 {
 			style = th.toastError
+			glyph = statusGlyphs[kindFailure] + " "
 		}
-		toast := style.Render(strings.TrimSpace(m.ToastMsg))
+		toast := style.Render(glyph + strings.TrimSpace(m.ToastMsg))
 		if m.OpenJobID == "" && !m.Detail && m.Search.Value() == "" && m.OpenRun == nil {
 			toast += th.dim.Render("  esc dismiss") // Esc reaches the message only at the top of a screen
 		}
@@ -616,6 +689,9 @@ func (m Model) statusLine() string {
 		return th.dim.Render("Press 1–4 or Tab to open a screen · ? lists every key")
 	}
 	if m.detailVisible() {
+		if m.Viewport.TotalLineCount() <= m.Viewport.VisibleLineCount() {
+			return th.dim.Render("all content shown")
+		}
 		return th.dim.Render(fmt.Sprintf("%d%% scrolled", int(m.Viewport.ScrollPercent()*100)))
 	}
 	es := m.entries()
@@ -652,31 +728,33 @@ func hangingWrap(lead string, indent int, text string, width int, style func(...
 	return out
 }
 
-// helpContent is the ? overlay. Its key list is generated from keys(), the
-// same bindings the handlers match, for the screen beneath the overlay. Every
-// row is wrapped to the body width, so scrolling reaches all of it.
-func (m Model) helpContent() string {
-	width := max(1, m.Width-2)
+// helpKeyWidth is the widest key label in the groups.
+func helpKeyWidth(groups []helpGroup) int {
+	width := 0
+	for _, g := range groups {
+		for _, b := range g.bindings {
+			width = max(width, ansi.StringWidth(b.Help().Key))
+		}
+	}
+	return width
+}
+
+// helpGroupLines renders one group at a column width.
+func helpGroupLines(g helpGroup, width, keyWidth int) []string {
 	plain := func(s ...string) string { return strings.Join(s, " ") }
-	groups := m.helpGroups()
-	keyWidth := 0
-	for _, g := range groups {
-		for _, b := range g.bindings {
-			keyWidth = max(keyWidth, ansi.StringWidth(b.Help().Key))
-		}
+	lines := []string{th.section.Render(g.title)}
+	for _, b := range g.bindings {
+		k := b.Help().Key
+		lead := "  " + th.key.Render(k) + strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)
+		lines = append(lines, hangingWrap(lead, keyWidth+4, b.Help().Desc, width, plain)...)
 	}
-	lines := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
-	lines = append(lines, "")
-	for _, g := range groups {
-		lines = append(lines, th.section.Render(g.title))
-		for _, b := range g.bindings {
-			k := b.Help().Key
-			lead := "  " + th.key.Render(k) + strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)
-			lines = append(lines, hangingWrap(lead, keyWidth+4, b.Help().Desc, width, plain)...)
-		}
-		lines = append(lines, "")
-	}
-	lines = append(lines, th.section.Render("Status"))
+	return lines
+}
+
+// helpStatusLines is the shared status legend.
+func helpStatusLines(width int) []string {
+	plain := func(s ...string) string { return strings.Join(s, " ") }
+	lines := []string{th.section.Render("Status")}
 	for _, legend := range []struct {
 		kind statusKind
 		text string
@@ -687,12 +765,114 @@ func (m Model) helpContent() string {
 		{kindQueued, "queued · not started, waiting for approval or a runner"},
 		{kindSkipped, "skipped · skipped, cancelled, archived, maintenance"},
 		{kindUnknown, "unknown · not synced or not reported"},
-		{kindWarning, "attention · incomplete or stale data"},
+		{kindWarning, "review · review item, incomplete or stale data"},
 	} {
 		glyph := th.glyph(legend.kind)
 		lines = append(lines, hangingWrap("  "+glyph+"  ", 4+ansi.StringWidth(glyph), legend.text, width, plain)...)
 	}
-	lines = append(lines, "")
-	lines = append(lines, hangingWrap("", 0, "The filter, action menu and confirmations take every key until Enter or Esc; Ctrl+C quits from anywhere. Lists never change screen at their ends.", width, th.dim.Render)...)
-	return strings.Join(lines, "\n")
+	return lines
+}
+
+// helpScreenGroup names the group that belongs to the current screen, so a
+// narrow help column starts with the keys the user just asked about.
+func (m Model) helpScreenGroup() string {
+	switch m.ActiveFocus {
+	case FocusRepos, FocusConcerns:
+		return "Repository"
+	case FocusJobs:
+		return "Actions"
+	}
+	return ""
+}
+
+// helpContent is the ? overlay. Its key list is generated from keys(), the
+// same bindings the handlers match, for the screen beneath the overlay. Wide
+// terminals use two columns so the current screen's keys stay above the fold.
+func (m Model) helpContent() string {
+	width := max(1, m.Width-2)
+	groups := m.helpGroups()
+	keyWidth := helpKeyWidth(groups)
+	header := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
+
+	if width < 100 {
+		ordered := groups
+		if first := m.helpScreenGroup(); first != "" {
+			ordered = make([]helpGroup, 0, len(groups))
+			for _, g := range groups {
+				if g.title == first {
+					ordered = append(ordered, g)
+				}
+			}
+			for _, g := range groups {
+				if g.title != first {
+					ordered = append(ordered, g)
+				}
+			}
+		}
+		lines := append([]string{}, header...)
+		lines = append(lines, "")
+		for _, g := range ordered {
+			lines = append(lines, helpGroupLines(g, width, keyWidth)...)
+			lines = append(lines, "")
+		}
+		lines = append(lines, helpStatusLines(width)...)
+		lines = append(lines, "")
+		lines = append(lines, hangingWrap("", 0, "The filter, action menu and confirmations take every key until Enter or Esc; Ctrl+C quits from anywhere. Lists never change screen at their ends.", width, th.dim.Render)...)
+		return strings.Join(lines, "\n")
+	}
+
+	const gap = 3
+	leftW := (width - gap) / 2
+	rightW := width - gap - leftW
+	heights := make([]int, len(groups))
+	for i, g := range groups {
+		heights[i] = len(helpGroupLines(g, leftW, keyWidth)) + 1
+	}
+	// Split at a group boundary so the reading order survives; choose the
+	// boundary that balances the two columns.
+	split, best := 0, 1<<30
+	for i := 0; i <= len(groups); i++ {
+		lh, rh := 0, 0
+		for j := 0; j < i; j++ {
+			lh += heights[j]
+		}
+		for j := i; j < len(groups); j++ {
+			rh += heights[j]
+		}
+		if m := max(lh, rh); m < best {
+			best, split = m, i
+		}
+	}
+	var left, right []string
+	add := func(lines []string, target *[]string) {
+		*target = append(*target, lines...)
+		*target = append(*target, "")
+	}
+	for i, g := range groups {
+		if i < split {
+			add(helpGroupLines(g, leftW, keyWidth), &left)
+		} else {
+			add(helpGroupLines(g, rightW, keyWidth), &right)
+		}
+	}
+	if len(left) <= len(right) {
+		add(helpStatusLines(leftW), &left)
+	} else {
+		add(helpStatusLines(rightW), &right)
+	}
+	height := max(len(left), len(right))
+	rows := make([]string, 0, height+2)
+	rows = append(rows, header...)
+	rows = append(rows, "")
+	for i := 0; i < height; i++ {
+		l, r := "", ""
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		rows = append(rows, padTo(l, leftW)+strings.Repeat(" ", gap)+padTo(r, rightW))
+	}
+	return strings.Join(rows, "\n")
 }

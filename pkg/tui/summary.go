@@ -72,7 +72,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		} else {
 			s.localRepos++
 		}
-		if r.IsArchived {
+		if r.IsArchived || r.Status == git.StatusArchived {
 			s.archived++
 		}
 		if r.HasUnstagedChanges {
@@ -114,7 +114,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		})
 	}
 	if m.OrgRefreshFailed {
-		s.attention = append(s.attention, summaryAttention{priority: 0, title: "Repository snapshot unavailable", detail: m.orgRefreshFailureDetail()})
+		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Repository snapshot unavailable", detail: m.orgRefreshFailureDetail()})
 	}
 	if m.LocalScanFailed {
 		title := "Local repository metadata incomplete"
@@ -144,7 +144,7 @@ func (m Model) buildOrgSummary() orgSummary {
 			s.attention = append(s.attention, summaryAttention{
 				priority: 1,
 				title:    runSummaryName(r),
-				detail:   "waiting for GitHub, approval, concurrency or a runner",
+				detail:   "waiting for GitHub, approval or a runner",
 			})
 		case jobs.JobFailed:
 			s.failedRuns++
@@ -183,7 +183,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		if detail == "" {
 			detail = "some Actions data could not be loaded"
 		}
-		s.attention = append(s.attention, summaryAttention{priority: 0, title: "Actions snapshot incomplete", detail: detail})
+		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Actions snapshot incomplete", detail: detail})
 	}
 	if m.RunnerFetchFailed && !m.RunnerPermissionDenied {
 		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Runner snapshot unavailable", detail: "press r to retry"})
@@ -244,74 +244,476 @@ func (m Model) summaryContent(width, height int) string {
 		}, "\n"), width, height)
 	}
 
-	repositoryRows := append([]string{
-		summaryMetric(kindSuccess, fmt.Sprintf("%d local", s.localRepos), fmt.Sprintf("%d not cloned", s.newRepos)),
-		summaryMetric(summaryProblemKind(s.repoProblems), fmt.Sprintf("%d need attention", s.repoProblems), fmt.Sprintf("%d with local changes", s.dirty)),
-	}, m.repositoryConcernRows(s)...)
-
-	var body string
-	if width >= 96 {
-		// Three columns; each section is laid out at its own column width so
-		// rules and rows end inside the column instead of being clipped.
-		gap := 2
-		columnWidth := (width - gap*2) / 3
-		lastWidth := width - columnWidth*2 - gap*2
-		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			summaryFit(summarySection("Repositories", repositoryRows, columnWidth), columnWidth, 4), strings.Repeat(" ", gap),
-			summaryFit(summarySection("Actions", m.actionSummaryRows(s), columnWidth), columnWidth, 4), strings.Repeat(" ", gap),
-			summaryFit(summarySection("Runners", m.runnerSummaryRows(s), lastWidth), lastWidth, 4),
-		)
-	} else {
-		body = lipgloss.JoinVertical(lipgloss.Left,
-			summarySection("Repositories", repositoryRows, width), "",
-			summarySection("Actions", m.actionSummaryRows(s), width), "",
-			summarySection("Runners", m.runnerSummaryRows(s), width))
-	}
-
-	content := lipgloss.JoinVertical(lipgloss.Left, title, headline, "", body)
-	remaining := max(0, height-lipgloss.Height(content))
-	if remaining > 0 && remaining < 3 {
-		content = lipgloss.JoinVertical(lipgloss.Left, content, m.firstAttentionLine(s, width))
-	} else if remaining >= 3 {
-		attention := m.summaryAttentionRows(s, width, min(remaining-2, 5))
-		content = lipgloss.JoinVertical(lipgloss.Left, content, "", summarySectionHeader("Needs attention", width), attention)
-	}
-	return summaryFit(content, width, height)
-}
-
-func (m Model) repositoryConcernRows(s orgSummary) []string {
-	if m.TargetOrg == "" {
-		return []string{summaryMetric(kindUnknown, "Review counts unavailable", "set a GitHub owner")}
-	}
-	if s.countsLoaded == 0 && s.repositories > 0 {
-		if m.IsOrgSyncing {
-			return []string{summaryLoading(m, "Loading review counts")}
+	titleRow := " " + title + "  " + th.dim.Render("workspace overview")
+	if s.repositories == 0 && !m.IsOrgSyncing && !m.IsJobQueueLoading && !m.IsRunnersLoading {
+		lines := []string{titleRow, headline, "", rule("GET STARTED", width), th.strong.Render("No repositories in this workspace")}
+		for _, text := range []string{
+			"freshen reads sibling checkouts in " + git.ShortenHomePath(m.TargetDir) + ".",
+			"Press r to refresh, or start freshen with -dir <path> and an optional -owner.",
+			"? lists every key.",
+		} {
+			lines = append(lines, strings.Split(ansi.Wrap(th.dim.Render(text), width, ""), "\n")...)
 		}
-		return []string{summaryMetric(kindWarning, "Review counts unavailable", "press r to retry")}
+		return summaryFit(strings.Join(lines, "\n"), width, height)
 	}
-	concerns := s.openPRs + s.openIssues
-	kind := kindSuccess
-	if concerns > 0 {
-		kind = kindWarning
+	tiles := m.renderSummaryTiles(s, width, height)
+
+	content := []string{titleRow, headline, ""}
+	content = append(content, strings.Split(tiles, "\n")...)
+	content = append(content, "")
+	used := len(content)
+
+	// Two desks: what needs a decision first, then the work already moving.
+	// Both columns render only real snapshot rows; empty states say so.
+	gap := 3
+	leftW := max(24, (width-gap)*3/5)
+	rightW := max(18, width-gap-leftW)
+	attention := m.attentionPanel(s, leftW, max(3, height-used-2))
+	inFlight := m.inFlightPanel(s, rightW, max(3, height-used-2))
+	block := lipgloss.JoinHorizontal(lipgloss.Top, attention, strings.Repeat(" ", gap), inFlight)
+	content = append(content, strings.Split(block, "\n")...)
+	used = len(content)
+
+	remaining := height - used
+	if remaining >= 6 {
+		content = append(content, "")
+		available := max(2, remaining-2)
+		health := m.repoHealthPanel(s, leftW, available)
+		recent := m.recentPanel(s, rightW, available)
+		bottom := lipgloss.JoinHorizontal(lipgloss.Top, health, strings.Repeat(" ", gap), recent)
+		content = append(content, strings.Split(bottom, "\n")...)
 	}
-	prs := countPhrase(s.openPRs, "open PR", "open PRs")
-	issues := countPhrase(s.openIssues, "open issue", "open issues")
-	detail := issues
-	if s.countsLoaded < s.repositories {
-		detail += fmt.Sprintf(" · counts from %d/%d repositories", s.countsLoaded, s.repositories)
+
+	if used = len(content); height-used >= 11 {
+		content = append(content, "")
+		avail := height - used - 1
+		snapshot := m.snapshotPanel(leftW, avail)
+		keys := keysPanel(rightW, avail)
+		footer := lipgloss.JoinHorizontal(lipgloss.Top, snapshot, strings.Repeat(" ", gap), keys)
+		content = append(content, strings.Split(footer, "\n")...)
 	}
-	if s.countsStale > 0 {
-		detail += " · last successful refresh for " + countPhrase(s.countsStale, "repository", "repositories")
-	}
-	if m.RepoCountsFetchFailed {
-		detail += " · refresh incomplete"
-	}
-	if s.countsLoaded < s.repositories || s.countsStale > 0 || m.RepoCountsFetchFailed {
-		return []string{summaryMetric(kind, "Known: "+prs, detail)}
-	}
-	return []string{summaryMetric(kind, prs, issues)}
+
+	return summaryFit(strings.Join(content, "\n"), width, height)
 }
 
+// healthLabel names the header dot in words, so it is never colour alone.
+func healthLabel(k statusKind) string {
+	switch k {
+	case kindFailure:
+		return "failures"
+	case kindWarning:
+		return "review"
+	case kindRunning:
+		return "working"
+	case kindSuccess:
+		return "healthy"
+	}
+	return "unknown"
+}
+
+type summaryTile struct {
+	label, figure, detail, tallDetail string
+	kind                              statusKind
+}
+
+func (m Model) summaryTiles(s orgSummary) []summaryTile {
+	loading := m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading
+	repos := summaryTile{label: "Repositories", kind: summaryProblemKind(s.repoProblems)}
+	switch {
+	case m.OrgRefreshFailed && len(m.Repos) == 0:
+		repos.figure, repos.detail, repos.kind = "Unavailable", "press r to retry", kindWarning
+	case loading && len(m.Repos) == 0:
+		repos.figure, repos.detail, repos.kind = "Loading", "reading workspace and GitHub", kindRunning
+	default:
+		repos.figure = fmt.Sprintf("%d local · %d not cloned", s.localRepos, s.newRepos)
+		repos.detail = attentionPhrase(s.repoProblems)
+		repos.tallDetail = fmt.Sprintf("%d with local changes · %d archived", s.dirty, s.archived)
+		if m.OrgRefreshFailed {
+			if s.repoProblems == 0 {
+				repos.kind = kindWarning
+			}
+			repos.tallDetail = "repository snapshot unavailable · press r to retry"
+		}
+	}
+
+	actions := summaryTile{label: "Actions", kind: summaryProblemKind(s.failedRuns)}
+	switch {
+	case m.TargetOrg == "":
+		actions.figure, actions.detail, actions.kind = "Not configured", "set a GitHub owner", kindUnknown
+	case m.JobQueueFetchFailed && len(m.JobQueue) == 0:
+		actions.figure, actions.detail, actions.kind = "Actions data unavailable", "press r to retry", kindWarning
+	case loading && len(m.JobQueue) == 0:
+		actions.figure, actions.detail, actions.kind = "Loading", "reading runs and jobs", kindRunning
+	case m.JobQueueFetchFailed:
+		actions.figure = fmt.Sprintf("Known: %d running · %d queued", s.runningRuns, s.queuedRuns)
+		actions.detail, actions.kind = "Actions data incomplete", kindWarning
+		if s.failedRuns > 0 {
+			actions.detail = fmt.Sprintf("%d recent failures · data incomplete", s.failedRuns)
+			actions.kind = kindFailure
+		}
+	default:
+		actions.figure = fmt.Sprintf("%d running · %d queued", s.runningRuns, s.queuedRuns)
+		actions.detail = countPhrase(s.failedRuns, "recent failure", "recent failures")
+		actions.tallDetail = fmt.Sprintf("%d waiting for a runner, approval or concurrency", s.waitingRuns)
+	}
+
+	runners := summaryTile{label: "Runners", kind: summaryProblemKind(s.runnerOffline)}
+	switch {
+	case m.TargetOrg == "":
+		runners.figure, runners.detail, runners.kind = "Not configured", "set a GitHub owner", kindUnknown
+	case m.RunnerPermissionDenied:
+		runners.figure = fmt.Sprintf("%d observed busy", s.runnerBusy)
+		runners.detail, runners.kind = "fleet totals unavailable", kindUnknown
+		runners.tallDetail = "showing observed assignments only"
+	case m.RunnerFetchFailed && len(m.Runners) == 0:
+		runners.figure, runners.detail, runners.kind = "Runner data unavailable", "press r to retry", kindWarning
+	case loading && len(m.Runners) == 0:
+		runners.figure, runners.detail, runners.kind = "Loading", "reading runner fleet", kindRunning
+	case m.RunnerFetchFailed:
+		runners.figure = fmt.Sprintf("Known: %d busy · %d idle", s.runnerBusy, s.runnerIdle)
+		runners.detail, runners.kind = "showing last observed state", kindWarning
+	default:
+		runners.figure = fmt.Sprintf("%d busy · %d idle", s.runnerBusy, s.runnerIdle)
+		runners.detail = fmt.Sprintf("%d offline · %d maintenance", s.runnerOffline, s.runnerMaintenance)
+		runners.tallDetail = fmt.Sprintf("%d unknown", s.runnerUnknown)
+	}
+
+	concerns := summaryTile{label: "Concerns", kind: kindSuccess}
+	switch {
+	case m.TargetOrg == "":
+		concerns.figure, concerns.detail, concerns.kind = "Not configured", "set a GitHub owner", kindUnknown
+	case s.repositories == 0 && loading:
+		concerns.figure, concerns.detail, concerns.kind = "Loading", "reading review counts", kindRunning
+	case s.countsLoaded == 0 && s.repositories > 0 && loading:
+		concerns.figure, concerns.detail, concerns.kind = "Loading", "reading review counts", kindRunning
+	case s.countsLoaded == 0 && s.repositories > 0:
+		concerns.figure, concerns.detail, concerns.kind = "Counts unavailable", "press r to retry", kindWarning
+	default:
+		concerns.figure = fmt.Sprintf("%d open PRs · %d open issues", s.openPRs, s.openIssues)
+		concerns.detail = countPhrase(s.concernRepos, "repo with review", "repos with review")
+		concerns.tallDetail = fmt.Sprintf("review counts for %d/%d repositories", s.countsLoaded, s.repositories)
+		if s.concernRepos > 0 {
+			concerns.kind = kindWarning
+		}
+	}
+	return []summaryTile{repos, actions, runners, concerns}
+}
+
+// renderSummaryTiles lays out four operational tiles: four across on wide
+// terminals, two by two in the middle, and one per line on narrow ones.
+func (m Model) renderSummaryTiles(s orgSummary, width, height int) string {
+	tiles := m.summaryTiles(s)
+	tall := height >= 34
+	render := func(t summaryTile, w int) string {
+		lines := []string{tileHeader(t.label, t.kind, w), figureLine(t.figure, w), statusLine(t.kind, t.detail, w)}
+		if tall && t.tallDetail != "" {
+			lines = append(lines, fitLine(th.dim.Render(t.tallDetail), w))
+		}
+		return strings.Join(lines, "\n")
+	}
+	if width >= 112 {
+		gap := 3
+		w := (width - gap*3) / 4
+		last := width - w*3 - gap*3
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			render(tiles[0], w), strings.Repeat(" ", gap),
+			render(tiles[1], w), strings.Repeat(" ", gap),
+			render(tiles[2], w), strings.Repeat(" ", gap),
+			render(tiles[3], last))
+	}
+	gap := 3
+	w := (width - gap) / 2
+	last := width - w - gap
+	return lipgloss.JoinVertical(lipgloss.Left,
+		lipgloss.JoinHorizontal(lipgloss.Top, render(tiles[0], w), strings.Repeat(" ", gap), render(tiles[1], last)),
+		"",
+		lipgloss.JoinHorizontal(lipgloss.Top, render(tiles[2], w), strings.Repeat(" ", gap), render(tiles[3], last)))
+}
+
+// tileHeader is the tile label, rule and status glyph on one line.
+func tileHeader(label string, kind statusKind, width int) string {
+	g := th.glyph(kind)
+	label = th.tileLabel.Render(label)
+	used := ansi.StringWidth(label) + 2 + ansi.StringWidth(g)
+	if used >= width {
+		return fitLine(label, width)
+	}
+	return label + " " + th.divider.Render(strings.Repeat("─", width-used)) + " " + g
+}
+
+// figureLine gives the first number the strongest weight and keeps its unit
+// and companions muted, so the eye lands on the count first.
+func figureLine(figure string, width int) string {
+	parts := strings.SplitN(figure, " ", 2)
+	line := th.strong.Render(parts[0])
+	if len(parts) == 2 {
+		line += " " + th.dim.Render(parts[1])
+	}
+	return fitLine(line, width)
+}
+
+// statusLine is a coloured glyph plus a muted phrase, never colour alone.
+func statusLine(kind statusKind, detail string, width int) string {
+	return fitLine(th.glyph(kind)+" "+th.dim.Render(detail), width)
+}
+
+func (m Model) attentionPanel(s orgSummary, width, limit int) string {
+	lines := []string{panelHeader("Needs attention", len(s.attention), width)}
+	rows := strings.Split(m.summaryAttentionRows(s, width, max(1, limit-1)), "\n")
+	lines = append(lines, rows...)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
+	var rows []string
+	seenRuns := map[string]bool{}
+	for _, run := range m.actionRuns() {
+		if run.run.Status != jobs.JobRunning && run.run.Status != jobs.JobWaiting && run.run.Status != jobs.JobQueued {
+			continue
+		}
+		title := runSummaryName(run.run)
+		var detail string
+		switch {
+		case width < 55:
+			if run.run.Status == jobs.JobRunning {
+				if len(run.jobs) == 0 {
+					detail = "jobs not reported"
+				} else {
+					detail = fmt.Sprintf("%d/%d jobs", completion(run.jobs), len(run.jobs))
+				}
+			} else if !run.run.CreatedAt.IsZero() {
+				detail = "waiting " + compactAgo(time.Since(run.run.CreatedAt))
+			} else {
+				detail = string(run.run.Status)
+			}
+		default:
+			detail = m.countBar(completion(run.jobs), len(run.jobs), "jobs", jobKind(run.run.Status))
+			if width >= 70 {
+				if timing := runTiming(run.run, time.Now()); timing != "" {
+					detail += " · " + timing
+				}
+			}
+		}
+		rows = append(rows, joinEnds(th.status(jobKind(run.run.Status), title), th.dim.Render(detail), width))
+		seenRuns[runKey(run.run)] = true
+	}
+	for _, r := range m.Runners {
+		if r.Status != jobs.RunnerRunning {
+			continue
+		}
+		detail := r.Platform
+		if j := findJobForRunner(r, m.JobQueue); j != nil {
+			// A runner assigned to a run already listed is the same work item.
+			if seenRuns[fmt.Sprintf("%s/%d", j.Repo, j.RunID)] {
+				continue
+			}
+			detail = "running " + j.Name
+		}
+		rows = append(rows, joinEnds(th.status(kindRunning, r.Name), th.dim.Render(detail), width))
+	}
+	total := len(rows)
+	header := panelHeader("In flight", total, width)
+	if total == 0 {
+		if m.IsJobQueueLoading || m.IsRunnersLoading || m.IsOrgSyncing {
+			rows = append(rows, m.Spinner.View()+th.strong.Render("Loading runs and runners"))
+		} else {
+			rows = append(rows, th.status(kindSuccess, "No runs in flight"), th.dim.Render("The snapshot shows no running or waiting work."))
+		}
+		return strings.Join(append([]string{header}, rows...), "\n")
+	}
+	maxRows := max(1, limit-1)
+	if total > maxRows {
+		keep := max(0, maxRows-1)
+		rows = rows[:keep]
+		rows = append(rows, th.dim.Render(fmt.Sprintf("+ %d more", total-keep)))
+	}
+	return strings.Join(append([]string{header}, rows...), "\n")
+}
+func (m Model) repoHealthPanel(s orgSummary, width, limit int) string {
+	lines := []string{panelHeader("Repository health", s.repositories, width)}
+	repos := append([]*git.RepoItem(nil), m.Repos...)
+	rank := func(r *git.RepoItem) int {
+		switch {
+		case r.Status == git.StatusError || r.Status == git.StatusRebaseConflict:
+			return 0
+		case r.HasUnstagedChanges || r.LocalMetadataStale || r.CountsStale:
+			return 1
+		case r.Behind > 0 || r.Ahead > 0:
+			return 2
+		}
+		return 3
+	}
+	sort.SliceStable(repos, func(i, j int) bool { return rank(repos[i]) < rank(repos[j]) })
+	for i, r := range repos {
+		if i >= max(1, limit-2) {
+			if len(repos) > i {
+				lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more repositories", len(repos)-i)))
+			}
+			break
+		}
+		kind, label := repoKind(r.Status)
+		if r.IsNew {
+			kind, label = kindUnknown, "not cloned"
+		}
+		detail := ""
+		if !r.IsNew {
+			detail = r.CurrentBranch
+		}
+		sep := " · "
+		if detail == "" {
+			sep = ""
+		}
+		if r.HasLoadedCounts {
+			detail += fmt.Sprintf("%s%s · %s", sep, countPhrase(r.OpenPRsCount, "PR", "PRs"), countPhrase(r.OpenIssuesCount, "issue", "issues"))
+		} else {
+			detail += sep + "counts not loaded"
+		}
+		meta := label
+		if div := repoDivergence(r); div != "" {
+			meta += "  " + div
+		}
+		if detail != "" && detail != label {
+			meta += "  " + detail
+		}
+		lines = append(lines, joinLeft(th.status(kind, r.Name), th.dim.Render(meta), width, width*2/5))
+	}
+	if len(m.Repos) == 0 {
+		if m.IsOrgSyncing {
+			lines = append(lines, m.Spinner.View()+th.dim.Render("Loading repositories"))
+		} else {
+			lines = append(lines, th.dim.Render("No repositories in this snapshot."))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// snapshotPanel states where the data came from and how often it refreshes,
+// so a quiet dashboard still explains itself on a tall terminal.
+func (m Model) snapshotPanel(width, limit int) string {
+	lines := []string{panelHeader("Snapshot", 0, width)}
+	row := func(label, value string) string {
+		return joinLeft(th.dim.Render(label), th.body.Render(fitLine(value, width)), width, min(14, width/3))
+	}
+	owner := m.TargetOrg
+	if owner == "" {
+		owner = "local workspace"
+	}
+	lines = append(lines,
+		row("workspace", git.ShortenHomePath(m.TargetDir)),
+		row("owner", owner),
+		row("refreshed", m.freshness()),
+		row("intervals", fmt.Sprintf("repos %s · CI %s · runners %s", compactAgo(repoTickInterval), compactAgo(m.actionsPollInterval()), compactAgo(runnerJobTickInterval))),
+	)
+	if limit > 0 && len(lines) > limit {
+		lines = lines[:limit]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// keysPanel is the dashboard's short key reference; ? still lists every
+// binding for the current screen.
+func keysPanel(width, limit int) string {
+	lines := []string{panelHeader("Keys", 0, width)}
+	rows := [][2]string{
+		{"0–4", "switch screen"},
+		{"enter", "open the selection"},
+		{"space", "actions for the selection"},
+		{"s", "sync or clone"},
+		{"v / f", "job queue / run filter"},
+		{"[ / ]", "detail tabs"},
+		{"r", "refresh this screen"},
+		{"?", "every key and the status legend"},
+	}
+	for _, r := range rows {
+		if limit > 0 && len(lines) >= limit {
+			break
+		}
+		lines = append(lines, joinLeft(th.keyPrimary.Render(r[0]), th.dim.Render(r[1]), width, 6))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) recentPanel(_ orgSummary, width, limit int) string {
+	var runs []actionRun
+	for _, run := range m.actionRuns() {
+		if terminalStatus(run.run.Status) {
+			runs = append(runs, run)
+		}
+	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		ti, tj := runFinished(runs[i].run), runFinished(runs[j].run)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return runs[i].run.ID > runs[j].run.ID
+	})
+	lines := []string{panelHeader("Recent runs", len(runs), width)}
+	maxRows := max(1, limit-2)
+	shown := 0
+	for _, run := range runs {
+		if shown >= maxRows {
+			break
+		}
+		detail := runTiming(run.run, time.Now())
+		if detail == "" {
+			detail = "finished"
+		}
+		lines = append(lines, joinEnds(th.status(jobKind(run.run.Status), runSummaryName(run.run)), th.dim.Render(detail), width))
+		shown++
+	}
+	if shown == 0 {
+		if m.IsJobQueueLoading {
+			lines = append(lines, m.Spinner.View()+th.dim.Render("Loading recent runs"))
+		} else {
+			lines = append(lines, th.dim.Render("No finished runs in this snapshot."))
+		}
+		return strings.Join(lines, "\n")
+	}
+	if shown < len(runs) {
+		if shown == maxRows {
+			// The final row is the overflow notice, so the count matches the
+			// visible rows above it.
+			lines = lines[:len(lines)-1]
+			shown--
+		}
+		lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more finished runs", len(runs)-shown)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// runFinished is the time a terminal run finished, falling back to its start
+// or creation time when GitHub omits a completion timestamp.
+func runFinished(r *jobs.RunItem) time.Time {
+	switch {
+	case !r.CompletedAt.IsZero():
+		return r.CompletedAt
+	case !r.StartedAt.IsZero():
+		return r.StartedAt
+	}
+	return r.CreatedAt
+}
+
+// attentionPhrase keeps the tile copy grammatical for one and many.
+func attentionPhrase(n int) string {
+	if n == 1 {
+		return "1 needs attention"
+	}
+	return fmt.Sprintf("%d need attention", n)
+}
+
+// panelHeader is a section title with its count right-aligned on the rule.
+func panelHeader(title string, count, width int) string {
+	countText := ""
+	if count > 0 {
+		countText = fmt.Sprintf(" %d ", count)
+	}
+	label := th.tileLabel.Render(strings.ToUpper(title))
+	used := ansi.StringWidth(label) + ansi.StringWidth(countText)
+	if used >= width {
+		return fitLine(label, width)
+	}
+	return label + " " + th.divider.Render(strings.Repeat("─", max(0, width-used-1))) + th.dim.Render(countText)
+}
 func (m Model) summaryHeadline(s orgSummary) string {
 	base := fmt.Sprintf("%d repositories", s.repositories)
 	if s.archived > 0 {
@@ -351,57 +753,6 @@ func (m Model) orgRefreshFailureDetail() string {
 	}
 	return "last successful refresh " + jobs.FormatDuration(time.Since(m.LastOrgRefresh)) + " ago"
 }
-
-func (m Model) actionSummaryRows(s orgSummary) []string {
-	if m.TargetOrg == "" {
-		return []string{summaryMetric(kindUnknown, "Not configured", "set a GitHub owner"), ""}
-	}
-	if m.IsJobQueueLoading && len(m.JobQueue) == 0 {
-		return []string{summaryLoading(m, "Loading runs"), ""}
-	}
-	if m.JobQueueFetchFailed {
-		if len(m.JobQueue) == 0 {
-			return []string{summaryMetric(kindWarning, "Actions data unavailable", "press r to retry"), ""}
-		}
-		return []string{
-			summaryMetric(kindRunning, fmt.Sprintf("Known: %d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
-			summaryMetric(kindWarning, "Actions data incomplete", "press r to retry"),
-		}
-	}
-	return []string{
-		summaryMetric(kindRunning, fmt.Sprintf("%d running", s.runningRuns), fmt.Sprintf("%d queued · %d waiting", s.queuedRuns, s.waitingRuns)),
-		summaryMetric(summaryProblemKind(s.failedRuns), fmt.Sprintf("%d recent failures", s.failedRuns), "current snapshot"),
-	}
-}
-
-func (m Model) runnerSummaryRows(s orgSummary) []string {
-	if m.TargetOrg == "" {
-		return []string{summaryMetric(kindUnknown, "Not configured", "set a GitHub owner"), ""}
-	}
-	if m.RunnerPermissionDenied {
-		return []string{
-			summaryMetric(kindRunning, fmt.Sprintf("%d observed busy", s.runnerBusy), "active assignments only"),
-			summaryMetric(kindUnknown, "Fleet totals unavailable", "runner permission required"),
-		}
-	}
-	if m.IsRunnersLoading && len(m.Runners) == 0 {
-		return []string{summaryLoading(m, "Loading runners"), ""}
-	}
-	if m.RunnerFetchFailed {
-		if len(m.Runners) == 0 {
-			return []string{summaryMetric(kindWarning, "Runner data unavailable", "press r to retry"), ""}
-		}
-		return []string{
-			summaryMetric(kindRunning, fmt.Sprintf("Known: %d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
-			summaryMetric(kindWarning, "Runner data unavailable", "showing last observed state"),
-		}
-	}
-	return []string{
-		summaryMetric(kindRunning, fmt.Sprintf("%d busy", s.runnerBusy), fmt.Sprintf("%d idle", s.runnerIdle)),
-		summaryMetric(summaryProblemKind(s.runnerOffline), fmt.Sprintf("%d offline", s.runnerOffline), fmt.Sprintf("%d maintenance · %d unknown", s.runnerMaintenance, s.runnerUnknown)),
-	}
-}
-
 func (m Model) compactRunnerSummary(s orgSummary) string {
 	if m.TargetOrg == "" {
 		return "not configured"
@@ -458,37 +809,65 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 		}
 		return summaryMetric(kindSuccess, "Nothing needs attention", "in this snapshot")
 	}
+	var fails, review []summaryAttention
+	for _, a := range s.attention {
+		if a.priority == 0 {
+			fails = append(fails, a)
+		} else {
+			review = append(review, a)
+		}
+	}
+	grouped := width >= 60 && limit >= 5 && len(fails) > 0 && len(review) > 0
+	var rows []string
+	add := func(a summaryAttention) {
+		kind := kindWarning
+		if a.priority == 0 {
+			kind = kindFailure
+		}
+		rows = append(rows, summaryFit(summaryMetric(kind, a.title, a.detail), width, 1))
+	}
+	if grouped {
+		rows = append(rows, summaryFit(th.tileLabel.Render(fmt.Sprintf("FAILURES (%d)", len(fails))), width, 1))
+		for i, a := range fails {
+			if len(rows) >= limit-1 {
+				rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", len(fails)-i+len(review))+"  use 1–4 for details"), width, 1))
+				return strings.Join(rows, "\n")
+			}
+			add(a)
+		}
+		if len(review) > 0 && len(rows) >= limit-1 {
+			rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", len(review))+"  use 1–4 for details"), width, 1))
+			return strings.Join(rows, "\n")
+		}
+		if len(review) > 0 {
+			rows = append(rows, summaryFit(th.tileLabel.Render(fmt.Sprintf("REVIEW (%d)", len(review))), width, 1))
+			shown := 0
+			for _, a := range review {
+				if len(rows) >= limit-1 {
+					break
+				}
+				add(a)
+				shown++
+			}
+			if remaining := len(review) - shown; remaining > 0 {
+				rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", remaining))+"  "+th.dim.Render("use 1–4 for details"), width, 1))
+			}
+		}
+		return strings.Join(rows, "\n")
+	}
+
 	renderCount := min(limit, len(s.attention))
 	if len(s.attention) > limit {
 		renderCount = max(0, limit-1)
 	}
-	rows := make([]string, 0, limit)
 	for _, a := range s.attention[:renderCount] {
-		kind := kindUnknown
-		switch a.priority {
-		case 0:
-			kind = kindFailure
-		case 1:
-			kind = kindWarning
-		}
-		rows = append(rows, summaryFit(summaryMetric(kind, a.title, a.detail), width, 1))
+		add(a)
 	}
 	if remaining := len(s.attention) - renderCount; remaining > 0 {
 		rows = append(rows, summaryFit(th.dim.Render("+ ")+th.strong.Render(fmt.Sprintf("%d more", remaining))+"  "+th.dim.Render("use 1–4 for details"), width, 1))
 	}
 	return strings.Join(rows, "\n")
 }
-
-func summarySection(title string, rows []string, width int) string {
-	lines := append([]string{summarySectionHeader(title, width)}, rows...)
-	return summaryFit(strings.Join(lines, "\n"), width, len(lines))
-}
-
-func summarySectionHeader(title string, width int) string {
-	return sectionRule(title, width)
-}
-
-// summaryMetric is one Overview row: status glyph, bold figure, muted detail.
 func summaryMetric(kind statusKind, title, detail string) string {
 	line := th.glyph(kind) + " " + th.strong.Render(title)
 	if detail != "" {

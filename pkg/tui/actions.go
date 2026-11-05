@@ -41,11 +41,17 @@ func (m Model) menuActions() []uiAction {
 	if m.ActionTarget.IsArchived {
 		return append(actions, uiAction{"delete", "Delete archived clone", "Delete this local repository from disk. This cannot be undone.", true})
 	}
+	pushDetail := "Commit all changes, push, create a PR and switch to the default branch."
+	if m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
+		pushDetail = "Branch or default branch is unread; refresh first. " + pushDetail
+	} else if m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+		pushDetail = "On the default branch; switch to a feature branch first. " + pushDetail
+	}
 	return append(actions,
 		uiAction{"sync", "Sync repository", "Run the repository sync workflow, including stash/pull/reapply", false},
 		uiAction{"sync-all", "Sync all repositories", "Run sync across every active repository", true},
 		uiAction{"switch", "Switch branch", "Toggle between the original and default branch", false},
-		uiAction{"push", "Commit, push and create PR", "Commit all changes, push, create a PR and switch to the default branch", true},
+		uiAction{"push", "Commit, push and create PR", pushDetail, true},
 		uiAction{"prune", "Prune branches and worktrees", "Remove clean secondary worktrees, prune expired registrations, and delete non-default branches already reachable from a remote. Changed or unavailable worktrees and branches with local-only commits are kept.", true})
 }
 func (m *Model) captureActionTarget() {
@@ -73,6 +79,7 @@ func (m *Model) captureActionTarget() {
 	m.ActionURL = m.selectedURL()
 }
 func (m Model) menuContent() string {
+	width := max(1, m.Width-2)
 	if m.PendingAction != "" {
 		for _, a := range m.menuActions() {
 			if a.id == m.PendingAction {
@@ -84,17 +91,58 @@ func (m Model) menuContent() string {
 				if m.ActionTarget != nil && a.id == "prune" {
 					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
 				}
-				return th.warning.Render(statusGlyphs[kindWarning]+" Confirm: "+a.label) + "\n\n" + th.strong.Render(target) + "\n\n" + detail + "\n\n" + th.key.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
+				if m.ActionTarget != nil && a.id == "push" {
+					target := m.ActionTarget
+					branch := target.CurrentBranch
+					base := target.DefaultBranch
+					if branch != "" && base != "" {
+						detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
+						if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
+							detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
+						} else if branch == base {
+							detail += "\nChanged files not read; open Branches to review."
+						} else {
+							detail += "\nChanged files not read; open Branches to review before confirming."
+						}
+						detail += fmt.Sprintf("\nCommit message: WIP: Updates on branch '%s'", branch)
+					}
+				}
+				confirmLine := th.keyPrimary.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
+				if m.Width < 60 || m.Height < 16 {
+					confirmLine = th.key.Render("Esc") + " cancels · resize the terminal to read the full confirmation"
+				} else if a.id == "push" && m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
+					confirmLine = th.key.Render("Esc") + " cancels"
+				} else if a.id == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+					confirmLine = th.key.Render("Esc") + " cancels · switch to a feature branch first"
+				}
+				lines := []string{
+					rule("CONFIRM", width),
+					th.warning.Render(statusGlyphs[kindWarning] + " " + a.label),
+					"",
+					th.strong.Render(target),
+					"",
+					detail,
+					"",
+					confirmLine,
+				}
+				for i := range lines {
+					if i > 0 {
+						lines[i] = ansi.Wrap(lines[i], width, "")
+					} else {
+						lines[i] = fitLine(lines[i], width)
+					}
+				}
+				return strings.Join(lines, "\n")
 			}
 		}
 	}
-	title := "Actions"
+	title := "Select action"
 	if m.ActionTarget != nil {
-		title += " / " + m.ActionTarget.Name
+		title += " for " + m.ActionTarget.Name
 	}
 	// Budget in rendered rows: every row is cut or wrapped to the body width
 	// here, so View's wrap adds none, and the selected action always shows.
-	width := max(1, m.Width-2)
+	width = max(1, m.Width-2)
 	fit := func(s string) string { return ansi.Truncate(s, width, "…") }
 	actions := m.menuActions()
 	var tail []string
@@ -105,7 +153,7 @@ func (m Model) menuContent() string {
 	if m.BusyAction != "" {
 		tail = append(tail, "", fit("A repository action is already running."))
 	}
-	head := []string{fit(th.strong.Render(title)), ""}
+	head := []string{rule("ACTIONS", width), fit(th.strong.Render(title)), ""}
 	avail := m.bodyHeight()
 	for len(head)+len(tail) >= avail && len(tail) > 0 {
 		tail = tail[:len(tail)-1]
@@ -118,14 +166,16 @@ func (m Model) menuContent() string {
 	lines := head
 	for i := start; i < min(len(actions), start+count); i++ {
 		a := actions[i]
-		line := "  " + a.label
-		if i == m.MenuIndex {
-			line = th.cursor.Render("›") + " " + th.selected.Render(a.label)
-		}
+		suffix := ""
 		if a.confirm {
-			line += th.dim.Render("  (asks to confirm)")
+			suffix = "  (asks to confirm)"
 		}
-		lines = append(lines, fit(line))
+		if i == m.MenuIndex {
+			body := padTo(" "+a.label+suffix, max(0, width-1))
+			lines = append(lines, th.cursor.Render("›")+th.rowSelected.Render(body))
+			continue
+		}
+		lines = append(lines, fit("  "+a.label+th.dim.Render(suffix)))
 	}
 	return strings.Join(append(lines, tail...), "\n")
 }
@@ -169,6 +219,16 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		return m.startSyncCmd([]*git.RepoItem{m.ActionTarget}, false, false)
 	}
 	target := m.ActionTarget
+	if id == "push" && target != nil && (target.CurrentBranch == "" || target.DefaultBranch == "") {
+		m.setToast("Branch or default branch is unread; press r to refresh before pushing.", 2)
+		m.PendingAction = ""
+		return nil
+	}
+	if id == "push" && target != nil && target.CurrentBranch == target.DefaultBranch {
+		m.setToast("Cannot raise a PR from the default branch. Switch to a feature branch first.", 2)
+		m.PendingAction = ""
+		return nil
+	}
 	url := m.ActionURL
 	dir := m.TargetDir
 	ctx := m.ctx
@@ -269,6 +329,11 @@ func (m *Model) executeAction(id string) tea.Cmd {
 				target.Logs = append(target.Logs, "Could not re-read the checked-out branch after "+label+"; press r to retry.")
 			}
 			target.BranchDetails = getRepoBranchDetails(readCtx, target.Path, target.DefaultBranch)
+			if checkout, err := readLocalCheckout(readCtx, target.Path); err == nil {
+				target.Ahead, target.Behind, target.HasUpstream = checkout.Ahead, checkout.Behind, checkout.HasUpstream
+			} else {
+				target.HasUpstream = false
+			}
 			cancel()
 		}
 		return result

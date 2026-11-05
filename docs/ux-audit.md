@@ -75,6 +75,94 @@ Reviewed on 13 October 2026 against `f324ced`.
 | A cancelled archived-repo delete could still start: the worker launched without checking the context, and a path validation that finished after the deadline went on to `os.RemoveAll` | The delete refuses an ended context, and a start gate decides once whether the removal begins or the caller gave up; a stopped delete removes nothing and says so |
 | Refresh discarded git read failures: a failed checkout check dropped a known repository (local-only) or read as "not a checkout", and failed branch reads blanked known branches with no warning | `git.ReadLocalCheckout` returns its failures; the refresh keeps the previous record or branch, marks it stale, lists unknown directories as "Read Err" and reports incomplete local metadata |
 
+## Visual system and density pass
+
+Reviewed on 5 November 2026 against `689c0c3`.
+
+| Finding | Change |
+|---|---|
+| The Overview left most of a 120×30 body empty, gave three thin text columns equal weight, and truncated operational statements at wider sizes | A priority-led dashboard: four tiles with figures, status and (on tall terminals) a second detail line; grouped `FAILURES`/`REVIEW` rows; an in-flight desk; repository health and recent runs; a snapshot/key block only when there is room. Narrow terminals get a 2×2 or stacked layout |
+| Lists were two-line cards at every width, with no column headings, full-row selection or use for the right half of a wide terminal | Lists become one-row tables from 100 columns with aligned item/detail columns; from 140 columns a read-only preview of the selected repository, run, job or runner sits beside the list. Enter still opens the full screen |
+| The selected row highlighted only its text, and muted/failure/running text on the selection surface fell below 4.5:1 | Selection uses a full-row surface and a left accent; the surface was darkened and muted sage lightened so every body colour clears WCAG AA against the dark capture background, with a separate light-palette test. `TestThemeBodyContrast` measures the palette |
+| A loading repository snapshot rendered checked `0 need attention` and `0 open PRs`; a degraded snapshot's repository tile kept its success check | Loading tiles and panels say what they are reading; degraded tiles carry the warning and name the unavailable snapshot |
+| `NO_COLOR` dropped the reverse-video selection because Lip Gloss selected the Ascii profile, although it kept the colourless glyphs and words | `NO_COLOR` selects the ANSI attribute profile, so bold, underline and reverse survive while colour stays off |
+| Tabs at very narrow widths collapsed to single letters with no explanation, and the old minimum rendered a clipped frame | The full chrome now starts at 40×12 with two-letter tab labels; below that a resize notice names the supported size and the quit key |
+| Short detail pages reported `100% scrolled` even when every line fitted | Detail status says `all content shown` until the content actually overflows |
+| The progress bar used Charm's purple default gradient, the only off-palette colour in the frame | The bar uses the leaf/mint palette |
+| The fixture's Issues/PRs counts contradicted empty detail lists, weakening the demo | The demo fixture seeds matching issues and pull requests and a larger, varied workspace |
+| The action menu and confirmation were unframed text over the list | Both open with a rule; the selected action uses the same full-row surface; confirmation names its consequence and keys |
+| The README screenshot still showed the retired two-panel layout | The screenshot and interface description now show the Overview dashboard |
+
+The measurable checks added or extended by this pass: exact frame bounds at
+30×10, 40×12, 60×18, 80×24, 120×30 and 200×50; a wide-layout density check; a
+preview overflow check; table click geometry; loading and degraded honesty;
+grouped-attention copy; measured palette contrast; and a 200×50 render
+benchmark. `go build ./...`, `go test -race ./...` and `make lint` pass locally.
+
+### Panel repair pass
+
+Reviewed on 5 November 2026 after the first independent panel.
+
+| Finding | Change |
+|---|---|
+| List tables put the status inside a variable-length title, so names and details did not line up | Tables use fixed `STATUS`, `REPOSITORY` and `SIGNALS` columns; the status column is sized per screen and the detail column starts at one cell for every row |
+| A failed run or job still showed a green/mint progress bar | The bar colour follows the state: green for success, red for failure, blue for running, amber for queued/attention, muted for skipped/unknown |
+| The push confirmation did not name what it would commit | It now shows the branch and PR base, the changed files (or says they are unread), and the exact `WIP: Updates on branch '<branch>'` message |
+| Long rows were cut mid-word without a signal | Every frame clip uses an ellipsis; narrow rows state that content continues |
+| A degraded snapshot mixed a red header warning, an amber chip and a failure group | Incomplete snapshots are review items, not failures; the chip says `partial · failures` when real failures coexist; the header warning uses `!` |
+| Wide Overviews left blank rows while lists overflowed | Review, health and recent limits use the available height and reserve a row for `+ N more` |
+| Narrow tab labels changed between two- and three-letter forms and could hide a screen | Narrow layouts use the same three-letter labels; numbers are dropped before a screen is clipped |
+| `!` meant stale data in the legend but marked review items; “ranked”, “unknown availability” and “1 jobs” read awkwardly | Legend, tile copy and pluralisation now match the states; step states use `running`/`passed`/`failed` rather than raw API values |
+| Help was one long column; screen keys fell below the fold | Wide terminals use two balanced columns; the screen keys and status legend fit without scrolling at 120 columns |
+| Enter from Concerns opened Logs | It opens PRs when the repository has open PRs, otherwise Issues |
+| Failed-job logs were unformatted and the GitHub link had no key hint | Job logs use the same timestamp/command/error highlighting as sync logs; the link names `(o)` |
+| Empty and denied states advertised actions that did nothing | Empty lists drop `open`/`actions`; denied runner lists explain the permission and retry path; queued jobs say logs are not available yet |
+| The palette assumed a dark terminal | `FRESHEN_LIGHT=1` or a light `COLORFGBG` selects a dark-on-light palette with the same measured contrast floor |
+| The wordmark's leading glyph was a status mark | The header leads with a leaf mark; health is named by the state chip (and remains explicit at narrow widths) |
+| Repositories had no CI state beside the branch | The repository table shows the newest observed run (`CI ↻ #42`, `CI ✗ #40 9m ago`) before the branch and counts |
+
+The panel repair added tests for column alignment, status-aware bars, Actions
+recency, archived counts, CI state, the concerns tab, push confirmation detail,
+light-theme contrast, and the read-only preview. `go build ./...`,
+`go test -race ./...` and `make lint` pass locally.
+
+### Review and panel repair
+
+Reviewed on 5 November 2026 after code review and the first panel.
+
+| Finding | Change |
+|---|---|
+| Repository and concern tables still buried PR/issue counts inside the detail text, and had no ahead/behind signal | Tables have fixed `PRs` and `ISSUES` columns; `ReadLocalCheckout` records ahead/behind from the upstream and the table/preview/health show `↑2 ↓1`, `↓3 behind` or `up to date` |
+| Progress bars in the light palette used the dark fills | `progressFill` selects light-theme bar colours; a test requires 3:1 against white |
+| A push confirmation on the default branch looked runnable | It warns that Freshen will refuse, hides the confirm hint, and `executeAction` refuses before starting work |
+| A confirmation that does not fit the terminal still advertised Enter | The status row says to resize and the footer offers only cancel/quit |
+| Actions and Runners used uppercase status words while repositories used lowercase | All status labels are lowercase (`running`, `passed`, `queued`, `busy`, `offline`) |
+| The CI signal and failure reason disappeared from the two-line narrow layout | The card subtitle leads with the failure message and CI run before branch and counts |
+| Concerns marked every ranked row `review` | The status column says `PRs` or `issues` for single-signal rows |
+| A tight run/job list did not advertise its way back | `esc back` appears in the footer on run and job lists |
+| ISO timestamps and `--- FAIL` lines were unstyled | Log highlighting covers ISO timestamps, `##[error]`, `##[warning]`, `##[group]`, `--- FAIL`, bare `FAIL` and panics |
+| Narrow help put the current screen's keys last | Narrow help starts with the current screen's group |
+| Preview cut its last section without a cue | A clipped preview ends with `…`; job previews disclose cached or unavailable job details |
+| Denied fleet text clipped at 40 columns | Empty-state messages wrap to the list width |
+| Loading tiles could hide an already-known failure | Fetch failures take precedence over loading; known failure counts remain on the tile |
+
+The screenshot was regenerated at the final layout. `go build ./...`,
+`GOTOOLCHAIN=go1.26.5 make lint` and `GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1 go test -race -count=1 ./...` pass locally.
+
+### Final panel polish
+
+| Finding | Change |
+|---|---|
+| A timestamped `##[error]` line lost its red because the timestamp span ended with a foreground reset | Severity is decided first and the whole line is styled as one span; the timestamp/command styling only applies to neutral lines |
+| The repository table's detail column was still labelled `BRANCH · COUNTS` after counts became columns | It is `SIGNALS`, covering divergence, failure, CI and branch |
+| Table detail text carried the same weight as names | The detail column is dimmed; the status and item columns carry the emphasis |
+| Repository detail headers omitted ahead/behind | The header shows `↑2 ↓1` / `↓3 behind` beside the branch |
+| The wide Overview's overflow row sat against the footer hint | The bottom block reserves one row of breathing space |
+| The default-branch push body still said Enter confirms | The body, footer, menu detail and guard all say the action is unavailable until a feature branch is checked out |
+| Run/job empty lists omitted the back hint | The empty-list footer advertises `esc back` for run/job/queue layers |
+| Breadcrumb run states and normal repository status messages kept their original case | Run states use the lowercase labels; repository status messages equal to the kind label use the lowercase label |
+
 ## Verification
 
 `pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,
