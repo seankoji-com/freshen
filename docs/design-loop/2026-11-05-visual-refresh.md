@@ -55,7 +55,8 @@ screen semantics, data-honesty rules and leaf/mint identity are unchanged.
 ## Known minor issues (deferred)
 
 The accepted candidate meets the design target. These confirmed edge cases are
-tracked separately rather than changing the accepted visual design:
+tracked in [#183](https://github.com/seankoji-com/freshen/issues/183) rather
+than changing the accepted visual design:
 
 - Log lines for repositories or branches named exactly `failed` or `failure`
   render red even when the line is informational.
