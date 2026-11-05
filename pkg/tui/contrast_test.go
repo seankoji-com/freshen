@@ -153,6 +153,33 @@ func TestTimestampedErrorLogStaysRed(t *testing.T) {
 	}
 }
 
+// Log severity must not treat package names such as errors/conflict as
+// failures, and a success glyph must win over an error word in the branch.
+func TestLogSeverityClassification(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(0)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	saved := th
+	t.Cleanup(func() { th = saved })
+	th = newThemeMode(false, false)
+
+	cases := []struct {
+		line, colour string
+	}{
+		{"ok  github.com/acme/beta/errors 0.02s", "201;139"},
+		{"--- PASS: TestParse_error", "201;139"},
+		{"󰄬 Switched branch to 'fix/error-handling'.", "201;139"},
+		{"󰀪 git merge --abort failed", "245;158;11"},
+		{"Pull failed: conflict", "240;113;120"},
+	}
+	for _, tc := range cases {
+		out := highlightLogLine(tc.line)
+		if !strings.Contains(out, tc.colour) {
+			t.Errorf("%q rendered %q, want colour %s", tc.line, out, tc.colour)
+		}
+	}
+}
+
 // The wide Overview must use the height it is given, not leave half the body
 // empty. This is the defect that opened the design run.
 func TestOverviewWideLayoutUsesSpace(t *testing.T) {

@@ -63,9 +63,12 @@ func (m *Model) updateViewport() {
 
 		branchDetail := "not cloned"
 		if !item.IsNew {
-			branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
-			if item.CurrentBranch != item.DefaultBranch {
-				branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+			branchDetail = item.CurrentBranch
+			if m.Width >= 60 {
+				branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+				if item.CurrentBranch != item.DefaultBranch {
+					branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+				}
 			}
 		}
 		branchLink := Hyperlink("branch "+branchDetail, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
@@ -249,16 +252,16 @@ func highlightLogLine(line string) string {
 	}
 	trimmed := strings.TrimSpace(line)
 	switch {
-	case strings.Contains(trimmed, "##[error]") || reFail.MatchString(trimmed) || strings.Contains(trimmed, "panic:"):
+	case strings.Contains(trimmed, "##[error]") || strings.Contains(trimmed, "--- FAIL") || reFail.MatchString(trimmed) || strings.Contains(trimmed, "panic:"):
 		return th.fg(th.red).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "##[warning]"):
+	case strings.Contains(trimmed, "##[warning]") || strings.Contains(trimmed, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
 	case strings.Contains(trimmed, "##[group]"):
 		return th.fg(th.blue).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "󰅙") || strings.Contains(trimmed, "error") || strings.Contains(trimmed, "Failed") || strings.Contains(trimmed, "CONFLICT") || strings.Contains(trimmed, "conflict"):
-		return th.fg(th.red).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "󰄬") || rePass.MatchString(trimmed) || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
+	case strings.Contains(trimmed, "󰄬") || rePass.MatchString(trimmed) || reOK.MatchString(trimmed) || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))
+	case reErrorWord.MatchString(trimmed):
+		return th.fg(th.red).Render(ansi.Strip(line))
 	}
 
 	render := func(style lipgloss.Style) func(string) string {

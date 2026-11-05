@@ -1590,8 +1590,16 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 	}
 	s := &syncSession{item: item, emit: emit}
 	defer func() {
-		ok, ahead, behind := readAheadBehind(ctx, item.Path)
+		// The sync's own deadline is cancelled by a later defer, so this final
+		// read gets its own bounded context.
+		readCtx, cancel := context.WithTimeout(context.Background(), branchReadTimeout)
+		ok, ahead, behind := readAheadBehind(readCtx, item.Path)
+		cancel()
 		item.HasUpstream, item.Ahead, item.Behind = ok, ahead, behind
+		// The final finish snapshot was published before this read; publish one
+		// more so the TUI receives the divergence that belongs to the final
+		// branch state.
+		s.publish()
 	}()
 
 	item.Status = StatusSyncing

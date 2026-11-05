@@ -42,7 +42,9 @@ func (m Model) menuActions() []uiAction {
 		return append(actions, uiAction{"delete", "Delete archived clone", "Delete this local repository from disk. This cannot be undone.", true})
 	}
 	pushDetail := "Commit all changes, push, create a PR and switch to the default branch."
-	if m.ActionTarget != nil && m.ActionTarget.CurrentBranch != "" && m.ActionTarget.DefaultBranch != "" && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+	if m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
+		pushDetail += " Branch or default branch is unread; refresh first."
+	} else if m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
 		pushDetail += " This repository is on its default branch; switch to a feature branch first."
 	}
 	return append(actions,
@@ -93,20 +95,26 @@ func (m Model) menuContent() string {
 					target := m.ActionTarget
 					branch := target.CurrentBranch
 					base := target.DefaultBranch
-					detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
-					if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
-						detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
-					} else if branch == base {
-						detail += "\nChanged files not read; open Branches to review."
+					if branch == "" || base == "" {
+						detail += "\n\nBranch or default branch is unread; press r to refresh before pushing."
 					} else {
-						detail += "\nChanged files not read; open Branches to review before confirming."
+						detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
+						if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
+							detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
+						} else if branch == base {
+							detail += "\nChanged files not read; open Branches to review."
+						} else {
+							detail += "\nChanged files not read; open Branches to review before confirming."
+						}
+						detail += fmt.Sprintf("\nCommit message: WIP: Updates on branch '%s'", branch)
 					}
-					detail += fmt.Sprintf("\nCommit message: WIP: Updates on branch '%s'", branch)
 				}
 				confirmLine := th.keyPrimary.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
 				if m.Width < 60 || m.Height < 16 {
 					confirmLine = th.key.Render("Esc") + " cancels · resize the terminal to read the full confirmation"
-				} else if a.id == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch != "" && m.ActionTarget.DefaultBranch != "" && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+				} else if a.id == "push" && m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
+					confirmLine = th.key.Render("Esc") + " cancels · refresh to read the branch"
+				} else if a.id == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
 					confirmLine = th.key.Render("Esc") + " cancels · switch to a feature branch first"
 				}
 				lines := []string{
@@ -213,7 +221,12 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		return m.startSyncCmd([]*git.RepoItem{m.ActionTarget}, false, false)
 	}
 	target := m.ActionTarget
-	if id == "push" && target != nil && target.CurrentBranch != "" && target.DefaultBranch != "" && target.CurrentBranch == target.DefaultBranch {
+	if id == "push" && target != nil && (target.CurrentBranch == "" || target.DefaultBranch == "") {
+		m.setToast("Branch or default branch is unread; press r to refresh before pushing.", 2)
+		m.PendingAction = ""
+		return nil
+	}
+	if id == "push" && target != nil && target.CurrentBranch == target.DefaultBranch {
 		m.setToast("Cannot raise a PR from the default branch. Switch to a feature branch first.", 2)
 		m.PendingAction = ""
 		return nil

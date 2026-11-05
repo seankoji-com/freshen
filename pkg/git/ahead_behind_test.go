@@ -45,3 +45,24 @@ func TestReadLocalCheckoutWithoutUpstream(t *testing.T) {
 		t.Fatalf("local-only branch: %+v, want no upstream and no divergence", got)
 	}
 }
+
+// The sync's final emitted snapshot carries the refreshed divergence, so a
+// pulled branch stops showing a stale behind count in the TUI.
+func TestSyncPublishesFinalDivergence(t *testing.T) {
+	f := newSyncFixture(t)
+	f.pushUpstream()
+	runGit(t, f.work, "fetch", "origin")
+
+	item := &RepoItem{Name: "work", Path: f.work, HasUpstream: true, Behind: 3, Logs: []string{}}
+	var last *RepoItem
+	SyncRepository(context.Background(), item, func(snapshot *RepoItem) {
+		last = snapshot
+	}, true)
+
+	if last == nil {
+		t.Fatal("sync emitted no snapshot")
+	}
+	if !last.HasUpstream || last.Behind != 0 || last.Ahead != 0 {
+		t.Fatalf("final snapshot divergence: %+v, want up to date", last)
+	}
+}
