@@ -43,9 +43,9 @@ func (m Model) menuActions() []uiAction {
 	}
 	pushDetail := "Commit all changes, push, create a PR and switch to the default branch."
 	if m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
-		pushDetail += " Branch or default branch is unread; refresh first."
+		pushDetail = "Branch or default branch is unread; refresh first. " + pushDetail
 	} else if m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
-		pushDetail += " This repository is on its default branch; switch to a feature branch first."
+		pushDetail = "On the default branch; switch to a feature branch first. " + pushDetail
 	}
 	return append(actions,
 		uiAction{"sync", "Sync repository", "Run the repository sync workflow, including stash/pull/reapply", false},
@@ -95,9 +95,7 @@ func (m Model) menuContent() string {
 					target := m.ActionTarget
 					branch := target.CurrentBranch
 					base := target.DefaultBranch
-					if branch == "" || base == "" {
-						detail += "\n\nBranch or default branch is unread; press r to refresh before pushing."
-					} else {
+					if branch != "" && base != "" {
 						detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
 						if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
 							detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
@@ -113,7 +111,7 @@ func (m Model) menuContent() string {
 				if m.Width < 60 || m.Height < 16 {
 					confirmLine = th.key.Render("Esc") + " cancels · resize the terminal to read the full confirmation"
 				} else if a.id == "push" && m.ActionTarget != nil && (m.ActionTarget.CurrentBranch == "" || m.ActionTarget.DefaultBranch == "") {
-					confirmLine = th.key.Render("Esc") + " cancels · refresh to read the branch"
+					confirmLine = th.key.Render("Esc") + " cancels"
 				} else if a.id == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
 					confirmLine = th.key.Render("Esc") + " cancels · switch to a feature branch first"
 				}

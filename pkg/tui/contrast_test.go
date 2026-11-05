@@ -167,10 +167,13 @@ func TestLogSeverityClassification(t *testing.T) {
 		line, colour string
 	}{
 		{"ok  github.com/acme/beta/errors 0.02s", "201;139"},
+		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/conflict 0.03s", "201;139"},
+		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/errors 0.03s", "201;139"},
 		{"--- PASS: TestParse_error", "201;139"},
 		{"󰄬 Switched branch to 'fix/error-handling'.", "201;139"},
 		{"󰀪 git merge --abort failed", "245;158;11"},
 		{"Pull failed: conflict", "240;113;120"},
+		{"󰅙 something happened", "240;113;120"},
 	}
 	for _, tc := range cases {
 		out := highlightLogLine(tc.line)

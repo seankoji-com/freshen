@@ -395,7 +395,7 @@ func (m Model) entries() []screenEntry {
 			if ci != "" {
 				head += ci + " · "
 			}
-			detail := head + strings.Join(base, " · ")
+			detail := strings.TrimSpace(strings.TrimRight(head+strings.Join(base, " · "), " ·"))
 			cardParts := append([]string{}, base...)
 			if div := repoDivergence(r); div != "" {
 				cardParts = append([]string{div}, cardParts...)

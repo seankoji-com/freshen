@@ -63,15 +63,26 @@ func (m *Model) updateViewport() {
 
 		branchDetail := "not cloned"
 		if !item.IsNew {
-			branchDetail = item.CurrentBranch
-			if m.Width >= 60 {
-				branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
-				if item.CurrentBranch != item.DefaultBranch {
-					branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+			switch {
+			case item.CurrentBranch == "":
+				branchDetail = "unread"
+			case m.Width < 80:
+				branchDetail = item.CurrentBranch
+			default:
+				branchDetail = item.CurrentBranch
+				if item.DefaultBranch != "" {
+					branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+					if item.CurrentBranch != item.DefaultBranch {
+						branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+					}
 				}
 			}
 		}
-		branchLink := Hyperlink("branch "+branchDetail, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
+		branchLabel := "branch " + branchDetail
+		if m.Width < 60 {
+			branchLabel = branchDetail
+		}
+		branchLink := Hyperlink(branchLabel, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 
 		counts := "PR and issue counts not loaded"
 		if item.HasLoadedCounts {
@@ -251,16 +262,19 @@ func highlightLogLine(line string) string {
 		return line
 	}
 	trimmed := strings.TrimSpace(line)
+	// GitHub job-log lines start with an ISO timestamp; classify the content
+	// after it so a timestamped "ok .../errors" is still a passing line.
+	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(trimmed, "##[error]") || strings.Contains(trimmed, "--- FAIL") || reFail.MatchString(trimmed) || strings.Contains(trimmed, "panic:"):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || strings.Contains(classify, "󰅙"):
 		return th.fg(th.red).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "##[warning]") || strings.Contains(trimmed, "󰀪"):
+	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "##[group]"):
+	case strings.Contains(classify, "##[group]"):
 		return th.fg(th.blue).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "󰄬") || rePass.MatchString(trimmed) || reOK.MatchString(trimmed) || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
+	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || reOK.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case reErrorWord.MatchString(trimmed):
+	case reErrorWord.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	}
 

@@ -108,7 +108,11 @@ func (m Model) repoPreview(e screenEntry) []string {
 	if r.IsNew {
 		lines = append(lines, th.dim.Render("not cloned · press s to clone"))
 	} else {
-		lines = append(lines, th.dim.Render("branch "+r.CurrentBranch))
+		branch := r.CurrentBranch
+		if branch == "" {
+			branch = "unread; press r to refresh"
+		}
+		lines = append(lines, th.dim.Render("branch "+branch))
 		if r.DefaultBranch != "" && r.CurrentBranch != r.DefaultBranch {
 			lines = append(lines, th.dim.Render("default "+r.DefaultBranch))
 		}
