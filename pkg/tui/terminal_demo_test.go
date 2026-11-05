@@ -105,7 +105,7 @@ func demoFixtureModel() Model {
 	m.Repos = append(m.Repos,
 		&git.RepoItem{Name: "gamma", GHRepoName: "gamma", Path: "/tmp/freshen-fixture/gamma", CurrentBranch: "docs/install", DefaultBranch: "main", Status: git.StatusUpToDate, StatusMsg: "Up to date", HasLoadedCounts: true, OpenPRsCount: 1, OpenIssuesCount: 0},
 		&git.RepoItem{Name: "delta", GHRepoName: "delta", Path: "/tmp/freshen-fixture/delta", CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusUpdated, StatusMsg: "Updated", HasUnstagedChanges: true, HasLoadedCounts: true},
-		&git.RepoItem{Name: "epsilon", GHRepoName: "epsilon", Path: "/tmp/freshen-fixture/epsilon", CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusArchived, StatusMsg: "Archived", HasLoadedCounts: true},
+		&git.RepoItem{Name: "epsilon", GHRepoName: "epsilon", Path: "/tmp/freshen-fixture/epsilon", CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusArchived, StatusMsg: "Archived", IsArchived: true, HasLoadedCounts: true},
 		&git.RepoItem{Name: "zeta", GHRepoName: "zeta", Path: "/tmp/freshen-fixture/zeta", CurrentBranch: "release/2.4", DefaultBranch: "main", Status: git.StatusError, StatusMsg: "Pull failed: diverged", HasLoadedCounts: true, OpenIssuesCount: 2},
 	)
 	m.Repos[0].IssuesList = []git.IssueItem{
@@ -161,6 +161,9 @@ func demoFixtureModel() Model {
 		}
 		if st == git.StatusError {
 			repo.StatusMsg = "Pull failed: diverged"
+		}
+		if st == git.StatusArchived {
+			repo.IsArchived = true
 		}
 		if i%5 == 0 {
 			repo.HasUnstagedChanges = true

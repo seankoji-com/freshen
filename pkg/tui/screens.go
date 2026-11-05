@@ -65,6 +65,10 @@ func (m Model) actionRuns() []actionRun {
 		if ai {
 			return runs[i].run.ID < runs[j].run.ID
 		}
+		ti, tj := runFinished(runs[i].run), runFinished(runs[j].run)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
 		return runs[i].run.ID > runs[j].run.ID
 	})
 	return runs

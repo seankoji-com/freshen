@@ -56,6 +56,54 @@ func TestAttentionGroupsFailuresAndReview(t *testing.T) {
 	}
 }
 
+// The Actions Recent view must use the same completion ordering as the
+// Overview's recent panel, not the transport ID order.
+func TestActionsRecentOrdersByCompletion(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActiveFocus = FocusJobs
+	m.ActionsFilter = 2
+	now := time.Now()
+	newer := &jobs.RunItem{ID: 10, Number: 1, Repo: "newer", Workflow: "CI", Status: jobs.JobPassed, JobsKnown: true,
+		StartedAt: now.Add(-3 * time.Minute), CompletedAt: now.Add(-1 * time.Minute)}
+	older := &jobs.RunItem{ID: 99, Number: 2, Repo: "older", Workflow: "CI", Status: jobs.JobPassed, JobsKnown: true,
+		StartedAt: now.Add(-12 * time.Minute), CompletedAt: now.Add(-10 * time.Minute)}
+	m.JobQueue = []*jobs.JobItem{
+		{ID: "run:99", RunID: 99, Repo: "older", Run: older, IsRunHeader: true, Status: jobs.JobPassed},
+		{ID: "run:10", RunID: 10, Repo: "newer", Run: newer, IsRunHeader: true, Status: jobs.JobPassed},
+	}
+	entries := m.entries()
+	if len(entries) < 1 || !strings.Contains(entries[0].title, "newer") {
+		t.Fatalf("Actions Recent did not put the newest completion first: %+v", entries)
+	}
+}
+
+// An archived status and the archived flag are the same fact; counts must not
+// disagree with the health panel's label.
+func TestArchivedCountMatchesStatus(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos = append(m.Repos, &git.RepoItem{Name: "old", Path: "/tmp/old", Status: git.StatusArchived})
+	s := m.buildOrgSummary()
+	if s.archived != 1 {
+		t.Fatalf("archived count = %d, want 1", s.archived)
+	}
+	view := stripped(m.summaryContent(160, 40))
+	if strings.Contains(view, "0 archived") {
+		t.Fatalf("Overview says 0 archived while an archived repository is present:\n%s", view)
+	}
+}
+
+// A not-cloned repository must not repeat its status as its branch detail.
+func TestHealthPanelDoesNotRepeatStatus(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[1].IsNew = true
+	m.Repos[1].CurrentBranch = ""
+	m.Repos[1].HasLoadedCounts = true
+	view := stripped(m.repoHealthPanel(m.buildOrgSummary(), 100, 6))
+	if strings.Contains(view, "not cloned  not cloned") {
+		t.Fatalf("health panel repeated the not-cloned status:\n%s", view)
+	}
+}
+
 // A click inside the read-only preview must not retarget the list selection.
 func TestPreviewClickDoesNotChangeSelection(t *testing.T) {
 	m := smokeFixtureModel()

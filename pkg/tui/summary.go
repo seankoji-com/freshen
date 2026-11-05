@@ -72,7 +72,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		} else {
 			s.localRepos++
 		}
-		if r.IsArchived {
+		if r.IsArchived || r.Status == git.StatusArchived {
 			s.archived++
 		}
 		if r.HasUnstagedChanges {
@@ -529,16 +529,24 @@ func (m Model) repoHealthPanel(s orgSummary, width, limit int) string {
 		if r.IsNew {
 			kind, label = kindUnknown, "not cloned"
 		}
-		detail := r.CurrentBranch
-		if r.IsNew || detail == "" {
-			detail = "not cloned"
+		detail := ""
+		if !r.IsNew {
+			detail = r.CurrentBranch
+		}
+		sep := " · "
+		if detail == "" {
+			sep = ""
 		}
 		if r.HasLoadedCounts {
-			detail += fmt.Sprintf(" · %s · %s", countPhrase(r.OpenPRsCount, "PR", "PRs"), countPhrase(r.OpenIssuesCount, "issue", "issues"))
+			detail += fmt.Sprintf("%s%s · %s", sep, countPhrase(r.OpenPRsCount, "PR", "PRs"), countPhrase(r.OpenIssuesCount, "issue", "issues"))
 		} else {
-			detail += " · counts not loaded"
+			detail += sep + "counts not loaded"
 		}
-		lines = append(lines, joinLeft(th.status(kind, r.Name), th.dim.Render(label+"  "+detail), width, width*2/5))
+		meta := label
+		if detail != "" && detail != label {
+			meta += "  " + detail
+		}
+		lines = append(lines, joinLeft(th.status(kind, r.Name), th.dim.Render(meta), width, width*2/5))
 	}
 	if len(m.Repos) == 0 {
 		if m.IsOrgSyncing {
