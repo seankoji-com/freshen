@@ -250,30 +250,45 @@ func repoDivergence(r *git.RepoItem) string {
 	return "up to date"
 }
 
-// repoCI names the newest workflow run observed for a repository, so the
-// repository table can carry CI state without opening Actions.
-func (m Model) repoCI(repo string) string {
-	var latest *jobs.RunItem
+// ciRunsByRepo indexes the newest observed run per repository once for a
+// render, so listing many repositories does not rebuild the whole run list per
+// row.
+func (m Model) ciRunsByRepo() map[string]*jobs.RunItem {
+	latest := make(map[string]*jobs.RunItem)
 	for _, ar := range m.actionRuns() {
 		r := ar.run
-		if r.Repo != repo {
+		if r.Repo == "" {
 			continue
 		}
-		if latest == nil || r.CreatedAt.After(latest.CreatedAt) || (r.CreatedAt.Equal(latest.CreatedAt) && r.ID > latest.ID) {
-			latest = r
+		prev := latest[r.Repo]
+		if prev == nil || r.CreatedAt.After(prev.CreatedAt) || (r.CreatedAt.Equal(prev.CreatedAt) && r.ID > prev.ID) {
+			latest[r.Repo] = r
 		}
 	}
-	if latest == nil {
-		return ""
+	return latest
+}
+
+// ciLabel names one run for the repository table.
+func ciLabel(r *jobs.RunItem) string {
+	label := fmt.Sprintf("CI %s #%d", statusGlyphs[jobKind(r.Status)], r.Number)
+	if r.Number == 0 {
+		label = fmt.Sprintf("CI %s run %d", statusGlyphs[jobKind(r.Status)], r.ID)
 	}
-	label := fmt.Sprintf("CI %s #%d", statusGlyphs[jobKind(latest.Status)], latest.Number)
-	if latest.Number == 0 {
-		label = fmt.Sprintf("CI %s run %d", statusGlyphs[jobKind(latest.Status)], latest.ID)
-	}
-	if terminalStatus(latest.Status) && !latest.CompletedAt.IsZero() {
-		label += " " + compactAgo(time.Since(latest.CompletedAt)) + " ago"
+	if terminalStatus(r.Status) && !r.CompletedAt.IsZero() {
+		label += " " + compactAgo(time.Since(r.CompletedAt)) + " ago"
 	}
 	return label
+}
+
+// repoCI names the newest workflow run observed for a repository.
+func (m Model) repoCI(repo string) string {
+	if repo == "" {
+		return ""
+	}
+	if r := m.ciRunsByRepo()[repo]; r != nil {
+		return ciLabel(r)
+	}
+	return ""
 }
 
 func (m Model) entries() []screenEntry {
@@ -337,6 +352,7 @@ func (m Model) entries() []screenEntry {
 			})
 		}
 	case FocusRepos:
+		ciRuns := m.ciRunsByRepo()
 		for i, r := range m.Repos {
 			base := make([]string, 0, 4)
 			switch {
@@ -356,13 +372,27 @@ func (m Model) entries() []screenEntry {
 				base = append(base, "local metadata from last snapshot")
 			}
 			head := ""
+			if r.CountsStale {
+				head = "counts stale · "
+			}
+			if r.LocalMetadataStale {
+				head = "local metadata stale · " + head
+			}
 			if div := repoDivergence(r); div != "" {
-				head = div + " · "
+				head = div + " · " + head
 			}
 			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
 				head += r.StatusMsg + " · "
 			}
-			if ci := m.repoCI(r.Name); ci != "" {
+			ghName := r.GHRepoName
+			if ghName == "" {
+				ghName = r.Name
+			}
+			ci := ""
+			if run := ciRuns[ghName]; run != nil {
+				ci = ciLabel(run)
+			}
+			if ci != "" {
 				head += ci + " · "
 			}
 			detail := head + strings.Join(base, " · ")
@@ -370,7 +400,7 @@ func (m Model) entries() []screenEntry {
 			if div := repoDivergence(r); div != "" {
 				cardParts = append([]string{div}, cardParts...)
 			}
-			if ci := m.repoCI(r.Name); ci != "" {
+			if ci != "" {
 				cardParts = append([]string{ci}, cardParts...)
 			}
 			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
@@ -578,7 +608,7 @@ func (m Model) tableLayout(width int) tableLayout {
 	detailLabel := "SIGNALS"
 	switch m.ActiveFocus {
 	case FocusRepos:
-		status = 12
+		status = 17
 	case FocusRunners:
 		status, itemLabel, detailLabel = 13, "RUNNER", "PLATFORM · ASSIGNMENT"
 	case FocusConcerns:
@@ -599,10 +629,11 @@ func (m Model) tableLayout(width int) tableLayout {
 		labels = append(labels, "PRs", "ISSUES")
 		widths = append(widths, 4, 6)
 	}
-	detail := max(8, inner-len(widths)*2)
+	detail := inner - len(widths)*2
 	for _, w := range widths {
 		detail -= w
 	}
+	detail = max(8, detail)
 	labels = append(labels, detailLabel)
 	widths = append(widths, detail)
 	return tableLayout{labels: labels, widths: widths}

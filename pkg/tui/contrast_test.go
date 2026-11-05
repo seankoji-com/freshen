@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -8,6 +9,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/seankoji-com/freshen/pkg/git"
+	"github.com/seankoji-com/freshen/pkg/jobs"
 )
 
 // relativeLuminance is the WCAG 2.x definition for an sRGB hex colour.
@@ -141,6 +144,13 @@ func TestTimestampedErrorLogStaysRed(t *testing.T) {
 	if !strings.HasSuffix(out, "\x1b[0m") {
 		t.Fatalf("error line is not a single styled span: %q", out)
 	}
+	out = highlightLogLine("2026-11-05T01:02:03Z FAIL github.com/x/y 0.12s")
+	if !strings.Contains(out, "240;113;120") {
+		t.Fatalf("timestamped error line lost its red span: %q", out)
+	}
+	if !strings.HasSuffix(out, "\x1b[0m") {
+		t.Fatalf("error line is not a single styled span: %q", out)
+	}
 }
 
 // The wide Overview must use the height it is given, not leave half the body
@@ -189,5 +199,23 @@ func BenchmarkOverviewView200(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = m.View()
+	}
+}
+
+func BenchmarkEntriesLarge(b *testing.B) {
+	m := smokeFixtureModel()
+	m.ActiveFocus = FocusRepos
+	m.Repos = nil
+	for i := 0; i < 200; i++ {
+		m.Repos = append(m.Repos, &git.RepoItem{Name: fmt.Sprintf("repo-%03d", i), GHRepoName: fmt.Sprintf("repo-%03d", i), Path: fmt.Sprintf("/tmp/repo-%03d", i), CurrentBranch: "main", DefaultBranch: "main", Status: git.StatusUpToDate, HasLoadedCounts: true})
+	}
+	m.JobQueue = nil
+	for i := 0; i < 400; i++ {
+		r := &jobs.RunItem{ID: int64(i + 1), Number: i + 1, Repo: fmt.Sprintf("repo-%03d", i%200), Workflow: "CI", Status: jobs.JobPassed, JobsKnown: true}
+		m.JobQueue = append(m.JobQueue, &jobs.JobItem{ID: fmt.Sprintf("run:%d", i+1), RunID: int64(i + 1), Repo: r.Repo, Run: r, IsRunHeader: true, Status: jobs.JobPassed})
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.entries()
 	}
 }

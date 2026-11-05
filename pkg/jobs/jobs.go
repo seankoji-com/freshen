@@ -113,6 +113,10 @@ func SanitizeTerminal(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
+		if r == '\t' {
+			b.WriteString("    ")
+			continue
+		}
 		if (r < 0x20 && r != ' ') || r == 0x7F {
 			continue
 		}

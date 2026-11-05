@@ -118,6 +118,13 @@ func (m Model) repoPreview(e screenEntry) []string {
 	} else {
 		lines = append(lines, th.dim.Render("review counts not loaded"))
 	}
+	ghName := r.GHRepoName
+	if ghName == "" {
+		ghName = r.Name
+	}
+	if ci := m.repoCI(ghName); ci != "" {
+		lines = append(lines, th.dim.Render(ci))
+	}
 	if div := repoDivergence(r); div != "" {
 		lines = append(lines, th.dim.Render("upstream "+div))
 	}

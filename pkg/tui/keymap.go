@@ -154,7 +154,7 @@ func (m Model) footerBindings() []key.Binding {
 	}
 	switch {
 	case m.PendingAction != "":
-		if !m.confirmationFits() || (m.PendingAction == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch) {
+		if !m.confirmationFits() || (m.PendingAction == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch != "" && m.ActionTarget.DefaultBranch != "" && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch) {
 			add(relabel(k.Cancel, "cancel"), relabel(k.ForceQuit, "quit"))
 		} else {
 			add(k.Confirm, relabel(k.ForceQuit, "quit"), k.Cancel)

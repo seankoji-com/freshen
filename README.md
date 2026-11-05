@@ -104,11 +104,11 @@ every other key except Esc and `Ctrl+C` is ignored. Repository actions run in
 the background with busy and result feedback. Navigation never moves to another
 screen merely because you reach the end of a list.
 
-The header shows the owner, a health dot and how old the current screen's data is
+The header leads with a leaf mark, shows the owner and how old the current screen's data is
 ("updated 8s ago · every 20s"; on narrow terminals just a spinner while a refresh
 runs); tabs carry counts of failures (`✗`), running work (`↻`) and concerns. A
 state chip names the snapshot's health (`healthy`, `review`, `failures`, `partial`,
-`syncing`, `local`, `empty`). On terminals at least 100 columns wide lists become dense
+`loading`, `stale`, `local`, `empty`). On terminals at least 100 columns wide lists become dense
 one-row tables; from 140 columns a read-only preview of the selected repository,
 run, job or runner sits beside the list. Enter still opens the full screen. The
 breadcrumb row shows the drill-down path, such as `Actions › alpha / CI #42 ›

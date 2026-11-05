@@ -1322,7 +1322,9 @@ type LocalCheckout struct {
 // readAheadBehind reads the divergence from the branch's upstream. A missing
 // upstream is not an error; the caller simply has no divergence to show.
 func readAheadBehind(ctx context.Context, path string) (ok bool, ahead, behind int) {
-	lines, readErr := readGitLines(ctx, path, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+	readCtx, cancel := context.WithTimeout(ctx, branchReadTimeout)
+	defer cancel()
+	lines, readErr := readGitLines(readCtx, path, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
 	if readErr != "" || len(lines) == 0 {
 		return false, 0, 0
 	}
@@ -1587,6 +1589,10 @@ func SyncRepository(ctx context.Context, item *RepoItem, emit SyncProgress, safe
 		return
 	}
 	s := &syncSession{item: item, emit: emit}
+	defer func() {
+		ok, ahead, behind := readAheadBehind(ctx, item.Path)
+		item.HasUpstream, item.Ahead, item.Behind = ok, ahead, behind
+	}()
 
 	item.Status = StatusSyncing
 	s.log("[%s] 󰓦 Starting sync for %s", time.Now().Format("15:04:05"), item.Name)

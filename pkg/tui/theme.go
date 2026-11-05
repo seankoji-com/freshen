@@ -83,7 +83,7 @@ var th = newTheme(noColorRequested())
 // termenv.ANSI: attributes (bold, reverse, underline) without colour. Lip
 // Gloss otherwise selects the Ascii profile when NO_COLOR is set, which drops
 // the reverse-video selection too; NO_COLOR asks for no colour, not no styling.
-const ansiProfile = 1
+const ansiProfile = 2
 
 func init() {
 	if noColorRequested() {

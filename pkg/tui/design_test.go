@@ -124,6 +124,47 @@ func TestDefaultBranchPushRefuses(t *testing.T) {
 	}
 }
 
+// Count cells distinguish unknown and stale values, and divergence names both
+// directions.
+func TestCountCellAndDivergence(t *testing.T) {
+	if got := countCell(0, false, false); got != "—" {
+		t.Fatalf("unknown count = %q, want em dash", got)
+	}
+	if got := countCell(2, true, true); got != "2*" {
+		t.Fatalf("stale count = %q, want 2*", got)
+	}
+	r := &git.RepoItem{HasUpstream: true, Ahead: 2, Behind: 1}
+	if got := repoDivergence(r); got != "↑2 ↓1" {
+		t.Fatalf("divergence = %q, want ↑2 ↓1", got)
+	}
+	r = &git.RepoItem{HasUpstream: true, Behind: 3}
+	if got := repoDivergence(r); got != "↓3 behind" {
+		t.Fatalf("divergence = %q, want ↓3 behind", got)
+	}
+}
+
+// A runner refresh failure is partial data, not a review-only snapshot.
+func TestRunnerFailureChipIsPartial(t *testing.T) {
+	m := smokeFixtureModel()
+	m.RunnerFetchFailed = true
+	label, kind := m.snapshotChip()
+	if label != "partial" || kind != kindWarning {
+		t.Fatalf("runner failure chip = %q/%d, want partial/warning", label, kind)
+	}
+}
+
+// CI is matched by the GitHub repository name when the local folder is aliased.
+func TestRepositoryCIAlias(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].Name = "local-alpha"
+	m.Repos[0].GHRepoName = "alpha"
+	m.ActiveFocus = FocusRepos
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 120, Height: 30})
+	if content := stripped(m.listContent()); !strings.Contains(content, "CI ↻ #42") {
+		t.Fatalf("aliased repository lost its CI state:\n%s", content)
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()

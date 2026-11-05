@@ -105,7 +105,7 @@ Reviewed on 5 November 2026 after the first independent panel.
 
 | Finding | Change |
 |---|---|
-| List tables put the status inside a variable-length title, so names and details did not line up | Tables use fixed `STATUS`, `ITEM` and `DETAIL` columns; the status column is sized per screen and the detail column starts at one cell for every row |
+| List tables put the status inside a variable-length title, so names and details did not line up | Tables use fixed `STATUS`, `REPOSITORY` and `SIGNALS` columns; the status column is sized per screen and the detail column starts at one cell for every row |
 | A failed run or job still showed a green/mint progress bar | The bar colour follows the state: green for success, red for failure, blue for running, amber for queued/attention, muted for skipped/unknown |
 | The push confirmation did not name what it would commit | It now shows the branch and PR base, the changed files (or says they are unread), and the exact `WIP: Updates on branch '<branch>'` message |
 | Long rows were cut mid-word without a signal | Every frame clip uses an ellipsis; narrow rows state that content continues |

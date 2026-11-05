@@ -249,13 +249,15 @@ func highlightLogLine(line string) string {
 	}
 	trimmed := strings.TrimSpace(line)
 	switch {
-	case strings.Contains(trimmed, "##[error]") || strings.Contains(trimmed, "--- FAIL") || strings.HasPrefix(trimmed, "FAIL") || strings.Contains(trimmed, "panic:"):
+	case strings.Contains(trimmed, "##[error]") || reFail.MatchString(trimmed) || strings.Contains(trimmed, "panic:"):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(trimmed, "##[warning]"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
 	case strings.Contains(trimmed, "##[group]"):
 		return th.fg(th.blue).Render(ansi.Strip(line))
-	case strings.Contains(trimmed, "PASS") || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
+	case strings.Contains(trimmed, "󰅙") || strings.Contains(trimmed, "error") || strings.Contains(trimmed, "Failed") || strings.Contains(trimmed, "CONFLICT") || strings.Contains(trimmed, "conflict"):
+		return th.fg(th.red).Render(ansi.Strip(line))
+	case strings.Contains(trimmed, "󰄬") || rePass.MatchString(trimmed) || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))
 	}
 

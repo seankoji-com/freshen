@@ -231,7 +231,7 @@ func (m Model) overallKind() statusKind {
 // a partial snapshot is live. It agrees with the header dot.
 func (m Model) snapshotChip() (string, statusKind) {
 	switch {
-	case m.OrgRefreshFailed || m.JobQueueFetchFailed:
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
 		if m.overallKind() == kindFailure {
 			return "partial · failures", kindFailure
 		}

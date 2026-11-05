@@ -701,6 +701,9 @@ func copyRepoState(dst, src *git.RepoItem) {
 	dst.OriginalBranch = src.OriginalBranch
 	dst.CurrentBranch = src.CurrentBranch
 	dst.DefaultBranch = src.DefaultBranch
+	dst.Ahead = src.Ahead
+	dst.Behind = src.Behind
+	dst.HasUpstream = src.HasUpstream
 	dst.HasUnstagedChanges = src.HasUnstagedChanges
 	dst.ExistingPRURL = src.ExistingPRURL
 	dst.Stashed = src.Stashed

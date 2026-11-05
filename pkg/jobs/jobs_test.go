@@ -45,6 +45,11 @@ func TestSanitizeTerminal(t *testing.T) {
 			want:  "run[31mred[0mbelldel",
 		},
 		{
+			name:  "expands tabs so test output stays readable",
+			input: "FAIL\tgithub.com/acme/beta\t0.41s",
+			want:  "FAIL    github.com/acme/beta    0.41s",
+		},
+		{
 			name:  "preserves spaces and normal text",
 			input: "fix: normal PR title #64",
 			want:  "fix: normal PR title #64",
