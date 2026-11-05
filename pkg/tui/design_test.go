@@ -180,6 +180,23 @@ func TestRepositoryDetailHeaderShowsDivergence(t *testing.T) {
 	}
 }
 
+// An unread default branch and a failure message must both be visible.
+func TestDetailShowsUnreadDefaultAndStatusMessage(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].DefaultBranch = ""
+	m.Repos[0].StatusMsg = "Pull failed: diverged"
+	m.ActiveFocus = FocusRepos
+	m.SelectedIndex = 0
+	m.ScreenCursor[FocusRepos] = m.Repos[0].Path + "/" + m.Repos[0].Name
+	m.Detail = true
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m.updateViewport()
+	view := stripped(m.Viewport.View())
+	if !strings.Contains(view, "default branch unread") || !strings.Contains(view, "Pull failed: diverged") {
+		t.Fatalf("detail lost unread/status information:\n%s", view)
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()

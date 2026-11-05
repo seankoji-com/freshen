@@ -96,15 +96,25 @@ func (m *Model) updateViewport() {
 			branchPart += th.dim.Render(sep) + th.dim.Render(div)
 		}
 		status := m.renderStatusBadge(item)
-		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, th.dim.Render(sep), status)
-		fmt.Fprintf(&sb, " %s", counts)
-		extra := ""
-		if !item.IsNew && item.DefaultBranch == "" {
-			extra = "default branch unread; press r to refresh"
-		} else if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
-			extra = item.StatusMsg
+		if m.Viewport.Width < 40 {
+			fmt.Fprintf(&sb, " %s\n %s\n %s\n", repoLink, branchPart, status)
+		} else {
+			budget := m.Viewport.Width - 1 - ansi.StringWidth(repoLink) - 2*ansi.StringWidth(sep) - ansi.StringWidth(status)
+			if budget < 8 {
+				budget = 8
+			}
+			branchPart = fitLine(branchPart, budget)
+			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, th.dim.Render(sep), status)
 		}
-		if extra != "" {
+		fmt.Fprintf(&sb, " %s", counts)
+		var extras []string
+		if !item.IsNew && item.DefaultBranch == "" {
+			extras = append(extras, "default branch unread; press r to refresh")
+		}
+		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
+			extras = append(extras, item.StatusMsg)
+		}
+		for _, extra := range extras {
 			for _, line := range strings.Split(ansi.Wrap(extra, max(1, m.Viewport.Width-2), ""), "\n") {
 				sb.WriteString("\n  " + th.dim.Render(line))
 			}
@@ -274,7 +284,7 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reErrorStart.MatchString(classify):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || reErrorStart.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
@@ -282,7 +292,7 @@ func highlightLogLine(line string) string {
 		return th.fg(th.blue).Render(ansi.Strip(line))
 	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || reOK.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorWord.MatchString(classify):
+	case strings.Contains(classify, "panic:") || reErrorWord.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	}
 

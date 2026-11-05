@@ -177,6 +177,8 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"󰀪 git merge --abort failed", "245;158;11"},
 		{"Pull failed: conflict", "240;113;120"},
 		{"Tests: 1 failed, 20 passed", "240;113;120"},
+		{"FAIL package/TestPASS", "240;113;120"},
+		{"Tests failed.", "240;113;120"},
 		{"Automatic merge failed; fix conflicts", "240;113;120"},
 		{"error: HTTP 403", "240;113;120"},
 		{"󰅙 something happened", "240;113;120"},
