@@ -166,6 +166,10 @@ func (m Model) footerBindings() []key.Binding {
 	case m.detailVisible():
 		add(pair(k.Up, k.Down, "scroll"), relabel(k.Back, "back"), pair(k.PrevTab, k.NextTab, "tab"), relabel(k.Menu, "actions"), relabel(k.Refresh, "refresh"), k.Quit, relabel(k.Help, "keys"))
 	default:
+		if len(m.entries()) == 0 {
+			add(pair(k.Up, k.Down, "move"), relabel(k.Filter, "filter"), relabel(k.Refresh, "refresh"), relabel(k.Jump, "screens"), k.Quit, relabel(k.Help, "keys"))
+			break
+		}
 		add(pair(k.Up, k.Down, "move"), relabel(k.Open, "open"), relabel(k.Filter, "filter"), relabel(k.ToggleQueue, queue), relabel(k.CycleRuns, "filter runs"),
 			relabel(k.Menu, "actions"), relabel(k.Refresh, "refresh"), relabel(k.Jump, "screens"), k.Quit, relabel(k.Help, "keys"))
 	}

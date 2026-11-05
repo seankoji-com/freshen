@@ -35,11 +35,11 @@ type screenTab struct {
 }
 
 var tabNames = map[FocusType][3]string{
-	FocusOverview: {"Overview", "Org", "Ov"},
-	FocusRepos:    {"Repositories", "Repos", "Re"},
-	FocusJobs:     {"Actions", "CI", "Ac"},
-	FocusRunners:  {"Runners", "Run", "Ru"},
-	FocusConcerns: {"Concerns", "Concerns", "Co"},
+	FocusOverview: {"Overview", "Ovw", "Ovw"},
+	FocusRepos:    {"Repositories", "Rep", "Rep"},
+	FocusJobs:     {"Actions", "Act", "Act"},
+	FocusRunners:  {"Runners", "Rnr", "Rnr"},
+	FocusConcerns: {"Concerns", "Con", "Con"},
 }
 
 // tabBadge is a short count for a tab, or "" when there is nothing to flag.
@@ -79,13 +79,17 @@ func (m Model) tabBadge(f FocusType, s orgSummary) string {
 func (m Model) screenTabs() []screenTab {
 	summary := m.buildOrgSummary()
 	for _, variant := range []struct {
-		name   int
-		badges bool
-	}{{0, true}, {0, false}, {1, false}, {2, false}} {
+		name    int
+		badges  bool
+		numbers bool
+	}{{0, true, true}, {0, false, true}, {1, false, true}, {1, false, false}, {2, false, false}} {
 		tabs := make([]screenTab, 0, len(screenOrder))
 		x := 1
 		for i, f := range screenOrder {
-			label := fmt.Sprintf("%d %s", i, tabNames[f][variant.name])
+			label := tabNames[f][variant.name]
+			if variant.numbers {
+				label = fmt.Sprintf("%d %s", i, label)
+			}
 			if variant.badges {
 				if badge := m.tabBadge(f, summary); badge != "" {
 					label += " " + badge
@@ -211,10 +215,10 @@ func joinEnds(left, right string, width int) string {
 func (m Model) overallKind() statusKind {
 	s := m.buildOrgSummary()
 	switch {
-	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
-		return kindWarning
 	case s.repoProblems > 0 || s.failedRuns > 0 || (s.runnerOffline > 0 && !m.RunnerPermissionDenied):
 		return kindFailure
+	case m.OrgRefreshFailed || m.JobQueueFetchFailed || (m.RunnerFetchFailed && !m.RunnerPermissionDenied):
+		return kindWarning
 	case len(s.attention) > 0:
 		return kindWarning
 	case s.repositories == 0:
@@ -230,6 +234,9 @@ func (m Model) overallKind() statusKind {
 func (m Model) snapshotChip() (string, statusKind) {
 	switch {
 	case m.OrgRefreshFailed || m.JobQueueFetchFailed:
+		if m.overallKind() == kindFailure {
+			return "partial · failures", kindFailure
+		}
 		return "partial", kindWarning
 	case m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading:
 		if len(m.Repos) == 0 {
@@ -237,6 +244,9 @@ func (m Model) snapshotChip() (string, statusKind) {
 		}
 		return "syncing", kindRunning
 	case m.TargetOrg == "":
+		if len(m.Repos) == 0 {
+			return "empty", kindUnknown
+		}
 		return "local", m.overallKind()
 	case m.LocalScanFailed:
 		return "stale", kindWarning
@@ -246,7 +256,7 @@ func (m Model) snapshotChip() (string, statusKind) {
 }
 
 func (m Model) headerRow() string {
-	left := " " + th.glyph(m.overallKind()) + " " + th.brand.Render("freshen")
+	left := " " + th.brand.Render("❧") + " " + th.brand.Render("freshen")
 	owner := m.TargetOrg
 	if owner == "" {
 		owner = git.ShortenHomePath(m.TargetDir)
@@ -254,8 +264,11 @@ func (m Model) headerRow() string {
 	if owner != "" {
 		left += "  " + th.owner.Render(owner)
 	}
+	if m.Width < 48 {
+		left += "  " + th.glyph(m.overallKind())
+	}
 	if m.JobQueueFetchFailed {
-		left += "  " + th.toastError.Render(statusGlyphs[kindFailure]+" Actions incomplete")
+		left += "  " + th.warning.Render(statusGlyphs[kindWarning]+" Actions incomplete")
 	}
 	if full := th.dim.Render(m.freshness()) + " "; ansi.StringWidth(left)+ansi.StringWidth(full)+2 <= m.Width || !m.screenRefreshing() {
 		return joinEnds(left, full, m.Width)
@@ -516,7 +529,7 @@ func (m Model) contextSummary() string {
 				}
 			}
 			if m.QueueView {
-				s = fmt.Sprintf("%d jobs not started", queuedJobs)
+				s = countPhrase(queuedJobs, "job not started", "jobs not started")
 			} else {
 				s = fmt.Sprintf("%d running · %d queued · %d waiting · %d queued jobs", running, queued, waiting, queuedJobs)
 			}
@@ -714,31 +727,33 @@ func hangingWrap(lead string, indent int, text string, width int, style func(...
 	return out
 }
 
-// helpContent is the ? overlay. Its key list is generated from keys(), the
-// same bindings the handlers match, for the screen beneath the overlay. Every
-// row is wrapped to the body width, so scrolling reaches all of it.
-func (m Model) helpContent() string {
-	width := max(1, m.Width-2)
+// helpKeyWidth is the widest key label in the groups.
+func helpKeyWidth(groups []helpGroup) int {
+	width := 0
+	for _, g := range groups {
+		for _, b := range g.bindings {
+			width = max(width, ansi.StringWidth(b.Help().Key))
+		}
+	}
+	return width
+}
+
+// helpGroupLines renders one group at a column width.
+func helpGroupLines(g helpGroup, width, keyWidth int) []string {
 	plain := func(s ...string) string { return strings.Join(s, " ") }
-	groups := m.helpGroups()
-	keyWidth := 0
-	for _, g := range groups {
-		for _, b := range g.bindings {
-			keyWidth = max(keyWidth, ansi.StringWidth(b.Help().Key))
-		}
+	lines := []string{th.section.Render(g.title)}
+	for _, b := range g.bindings {
+		k := b.Help().Key
+		lead := "  " + th.key.Render(k) + strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)
+		lines = append(lines, hangingWrap(lead, keyWidth+4, b.Help().Desc, width, plain)...)
 	}
-	lines := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
-	lines = append(lines, "")
-	for _, g := range groups {
-		lines = append(lines, th.section.Render(g.title))
-		for _, b := range g.bindings {
-			k := b.Help().Key
-			lead := "  " + th.key.Render(k) + strings.Repeat(" ", keyWidth-ansi.StringWidth(k)+2)
-			lines = append(lines, hangingWrap(lead, keyWidth+4, b.Help().Desc, width, plain)...)
-		}
-		lines = append(lines, "")
-	}
-	lines = append(lines, th.section.Render("Status"))
+	return lines
+}
+
+// helpStatusLines is the shared status legend.
+func helpStatusLines(width int) []string {
+	plain := func(s ...string) string { return strings.Join(s, " ") }
+	lines := []string{th.section.Render("Status")}
 	for _, legend := range []struct {
 		kind statusKind
 		text string
@@ -749,12 +764,88 @@ func (m Model) helpContent() string {
 		{kindQueued, "queued · not started, waiting for approval or a runner"},
 		{kindSkipped, "skipped · skipped, cancelled, archived, maintenance"},
 		{kindUnknown, "unknown · not synced or not reported"},
-		{kindWarning, "attention · incomplete or stale data"},
+		{kindWarning, "attention · review item, incomplete or stale data"},
 	} {
 		glyph := th.glyph(legend.kind)
 		lines = append(lines, hangingWrap("  "+glyph+"  ", 4+ansi.StringWidth(glyph), legend.text, width, plain)...)
 	}
-	lines = append(lines, "")
-	lines = append(lines, hangingWrap("", 0, "The filter, action menu and confirmations take every key until Enter or Esc; Ctrl+C quits from anywhere. Lists never change screen at their ends.", width, th.dim.Render)...)
-	return strings.Join(lines, "\n")
+	return lines
+}
+
+// helpContent is the ? overlay. Its key list is generated from keys(), the
+// same bindings the handlers match, for the screen beneath the overlay. Wide
+// terminals use two columns so the current screen's keys stay above the fold.
+func (m Model) helpContent() string {
+	width := max(1, m.Width-2)
+	groups := m.helpGroups()
+	keyWidth := helpKeyWidth(groups)
+	header := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
+
+	if width < 100 {
+		lines := append([]string{}, header...)
+		lines = append(lines, "")
+		for _, g := range groups {
+			lines = append(lines, helpGroupLines(g, width, keyWidth)...)
+			lines = append(lines, "")
+		}
+		lines = append(lines, helpStatusLines(width)...)
+		lines = append(lines, "")
+		lines = append(lines, hangingWrap("", 0, "The filter, action menu and confirmations take every key until Enter or Esc; Ctrl+C quits from anywhere. Lists never change screen at their ends.", width, th.dim.Render)...)
+		return strings.Join(lines, "\n")
+	}
+
+	const gap = 3
+	leftW := (width - gap) / 2
+	rightW := width - gap - leftW
+	heights := make([]int, len(groups))
+	for i, g := range groups {
+		heights[i] = len(helpGroupLines(g, leftW, keyWidth)) + 1
+	}
+	// Split at a group boundary so the reading order survives; choose the
+	// boundary that balances the two columns.
+	split, best := 0, 1<<30
+	for i := 0; i <= len(groups); i++ {
+		lh, rh := 0, 0
+		for j := 0; j < i; j++ {
+			lh += heights[j]
+		}
+		for j := i; j < len(groups); j++ {
+			rh += heights[j]
+		}
+		if m := max(lh, rh); m < best {
+			best, split = m, i
+		}
+	}
+	var left, right []string
+	add := func(lines []string, target *[]string) {
+		*target = append(*target, lines...)
+		*target = append(*target, "")
+	}
+	for i, g := range groups {
+		if i < split {
+			add(helpGroupLines(g, leftW, keyWidth), &left)
+		} else {
+			add(helpGroupLines(g, rightW, keyWidth), &right)
+		}
+	}
+	if len(left) <= len(right) {
+		add(helpStatusLines(leftW), &left)
+	} else {
+		add(helpStatusLines(rightW), &right)
+	}
+	height := max(len(left), len(right))
+	rows := make([]string, 0, height+2)
+	rows = append(rows, header...)
+	rows = append(rows, "")
+	for i := 0; i < height; i++ {
+		l, r := "", ""
+		if i < len(left) {
+			l = left[i]
+		}
+		if i < len(right) {
+			r = right[i]
+		}
+		rows = append(rows, padTo(l, leftW)+strings.Repeat(" ", gap)+padTo(r, rightW))
+	}
+	return strings.Join(rows, "\n")
 }

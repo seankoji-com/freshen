@@ -67,8 +67,19 @@ func (m Model) previewPanel(width, height int) string {
 
 func (m Model) emptyPreview(width, height int) string {
 	lines := []string{rule("PREVIEW", width), th.dim.Render("Select an item to preview it.")}
+	switch {
+	case m.ActiveFocus == FocusRunners && m.RunnerPermissionDenied:
+		lines[1] = th.dim.Render("Fleet access unavailable. Runners appear here when observed in job assignments.")
+	case m.ActiveFocus == FocusJobs && m.TargetOrg == "":
+		lines[1] = th.dim.Render("Actions needs a GitHub owner.")
+	case m.ActiveFocus == FocusRunners && m.TargetOrg == "":
+		lines[1] = th.dim.Render("Runners need a GitHub owner.")
+	}
 	if len(lines) > height {
 		lines = lines[:height]
+	}
+	for i := range lines {
+		lines[i] = fitLine(lines[i], width)
 	}
 	return padBlock(strings.Join(lines, "\n"), width)
 }

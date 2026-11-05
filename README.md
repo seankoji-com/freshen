@@ -121,7 +121,9 @@ the current screen stay on the last row.
 Status is always a glyph plus a word, never colour alone: `✓` success, `✗`
 failure, `↻` running, `◌` queued or waiting, `⊘` skipped or cancelled, `?`
 unknown, `!` needs attention. Set `NO_COLOR=1` to turn colour off; the selected
-row then uses reverse video.
+row then uses reverse video. For a light terminal, set `FRESHEN_LIGHT=1` (or
+leave `COLORFGBG` with a light background); freshen uses a dark-on-light palette
+with the same contrast floor.
 
 Actions retains all job results. Bars count completed jobs or steps, including
 skipped/cancelled steps; they do not estimate remaining time. Runs show how long

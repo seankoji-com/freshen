@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/lipgloss"
@@ -58,6 +59,24 @@ type theme struct {
 // disables colour while keeping bold, underline and reverse attributes.
 func noColorRequested() bool { return os.Getenv("NO_COLOR") != "" }
 
+// lightRequested chooses a light-terminal palette. FRESHEN_LIGHT wins; then a
+// COLORFGBG background of 7 or 15. The default is dark because the app does not
+// paint its own background and most terminals in this workflow are dark.
+func lightRequested() bool {
+	switch os.Getenv("FRESHEN_LIGHT") {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	parts := strings.Split(os.Getenv("COLORFGBG"), ";")
+	if len(parts) >= 2 {
+		bg := parts[len(parts)-1]
+		return bg == "15" || bg == "7"
+	}
+	return false
+}
+
 var th = newTheme(noColorRequested())
 
 // termenv.ANSI: attributes (bold, reverse, underline) without colour. Lip
@@ -73,24 +92,36 @@ func init() {
 }
 
 func newTheme(noColor bool) theme {
+	return newThemeMode(noColor, lightRequested())
+}
+
+func newThemeMode(noColor, light bool) theme {
 	c := func(hex string) lipgloss.TerminalColor {
 		if noColor {
 			return lipgloss.NoColor{}
 		}
 		return lipgloss.Color(hex)
 	}
+	primary, secondary, green := "#78B159", "#56BFA8", "#72C98B"
+	yellow, red, blue := "#F59E0B", "#F07178", "#5B9BF8"
+	muted, text, surface, line := "#8CA096", "#DCE7E0", "#223028", "#2E4038"
+	if light {
+		primary, secondary, green = "#276B2B", "#126B5C", "#1E7A3A"
+		yellow, red, blue = "#8A5A00", "#B3261E", "#1F5FBF"
+		muted, text, surface, line = "#4E6258", "#1B2A22", "#E4EEE7", "#C9D8CF"
+	}
 	t := theme{
 		noColor:   noColor,
-		primary:   c("#78B159"), // Leaf green
-		secondary: c("#56BFA8"), // Dew mint
-		green:     c("#72C98B"), // Fresh green
-		yellow:    c("#F59E0B"), // Warm amber
-		red:       c("#F07178"), // Coral red
-		blue:      c("#5B9BF8"), // Clear blue
-		muted:     c("#8CA096"), // Muted sage, lightened for 4.5:1 on the surface
-		text:      c("#DCE7E0"), // Frosted white
-		surface:   c("#223028"), // Deep leaf surface, dark enough for failure text
-		line:      c("#2E4038"), // Structural rules, never body text
+		primary:   c(primary),
+		secondary: c(secondary),
+		green:     c(green),
+		yellow:    c(yellow),
+		red:       c(red),
+		blue:      c(blue),
+		muted:     c(muted),
+		text:      c(text),
+		surface:   c(surface),
+		line:      c(line),
 	}
 	s := lipgloss.NewStyle
 	t.brand = s().Bold(true).Foreground(t.primary)
@@ -187,6 +218,28 @@ func (t theme) newProgress() progress.Model {
 	// The bar stays inside the leaf/mint identity instead of Charm's default
 	// purple gradient, which was the only off-palette colour in the frame.
 	return progress.New(progress.WithGradient("#78B159", "#56BFA8"), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+}
+
+// progressFor colours a bar by the state it describes: a failed run must not
+// show a reassuring green bar just because its jobs finished.
+func (t theme) progressFor(k statusKind) progress.Model {
+	if t.noColor {
+		p := progress.New(progress.WithSolidFill(""), progress.WithoutPercentage())
+		p.EmptyColor = ""
+		return p
+	}
+	fill := "#8CA096"
+	switch k {
+	case kindSuccess:
+		fill = "#78B159"
+	case kindFailure:
+		fill = "#F07178"
+	case kindRunning:
+		fill = "#5B9BF8"
+	case kindQueued, kindWarning:
+		fill = "#F59E0B"
+	}
+	return progress.New(progress.WithSolidFill(fill), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
 }
 
 func jobKind(s jobs.JobStatus) statusKind {

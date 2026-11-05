@@ -309,6 +309,13 @@ func (m *Model) openEntry() tea.Cmd {
 			return m.fetchOpenJobLogs()
 		}
 	default:
+		if m.ActiveFocus == FocusConcerns {
+			if r := m.Repos[e.index]; r.OpenPRsCount > 0 {
+				m.ActiveTab = TabPRs
+			} else if r.OpenIssuesCount > 0 {
+				m.ActiveTab = TabIssues
+			}
+		}
 		m.Detail = true
 		if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
 			return m.loadRepoDetail()

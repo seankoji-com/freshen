@@ -430,7 +430,7 @@ func TestNoColorRemovesColourButKeepsMeaning(t *testing.T) {
 	})
 
 	t.Setenv("NO_COLOR", "")
-	th = newTheme(noColorRequested())
+	th = newThemeMode(noColorRequested(), false)
 	m := smokeFixtureModel()
 	m.ProgressBar = th.newProgress()
 	press(&m, "2")
@@ -439,7 +439,7 @@ func TestNoColorRemovesColourButKeepsMeaning(t *testing.T) {
 	}
 
 	t.Setenv("NO_COLOR", "1")
-	th = newTheme(noColorRequested())
+	th = newThemeMode(noColorRequested(), false)
 	for _, st := range uxStates {
 		m := smokeFixtureModel()
 		m.ProgressBar = th.newProgress()
@@ -498,7 +498,7 @@ func TestRunsShowTimingAndFailureReason(t *testing.T) {
 	press(&m, "2")
 	press(&m, "f") // Needs attention
 	list := stripped(m.listContent())
-	if !strings.Contains(list, "✗ FAILED  beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
+	if !strings.Contains(list, "✗ FAILED") || !strings.Contains(list, "beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
 		t.Fatalf("failed run lacks status or timing:\n%s", list)
 	}
 	press(&m, "enter")

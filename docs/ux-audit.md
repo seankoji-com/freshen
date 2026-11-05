@@ -99,6 +99,33 @@ preview overflow check; table click geometry; loading and degraded honesty;
 grouped-attention copy; measured palette contrast; and a 200×50 render
 benchmark. `go build ./...`, `go test -race ./...` and `make lint` pass locally.
 
+### Panel repair pass
+
+Reviewed on 5 November 2026 after the first independent panel.
+
+| Finding | Change |
+|---|---|
+| List tables put the status inside a variable-length title, so names and details did not line up | Tables use fixed `STATUS`, `ITEM` and `DETAIL` columns; the status column is sized per screen and the detail column starts at one cell for every row |
+| A failed run or job still showed a green/mint progress bar | The bar colour follows the state: green for success, red for failure, blue for running, amber for queued/attention, muted for skipped/unknown |
+| The push confirmation did not name what it would commit | It now shows the branch and PR base, the changed files (or says they are unread), and the exact `WIP: Updates on branch '<branch>'` message |
+| Long rows were cut mid-word without a signal | Every frame clip uses an ellipsis; narrow rows state that content continues |
+| A degraded snapshot mixed a red header warning, an amber chip and a failure group | Incomplete snapshots are review items, not failures; the chip says `partial · failures` when real failures coexist; the header warning uses `!` |
+| Wide Overviews left blank rows while lists overflowed | Review, health and recent limits use the available height and reserve a row for `+ N more` |
+| Narrow tab labels changed between two- and three-letter forms and could hide a screen | Narrow layouts use the same three-letter labels; numbers are dropped before a screen is clipped |
+| `!` meant stale data in the legend but marked review items; “ranked”, “unknown availability” and “1 jobs” read awkwardly | Legend, tile copy and pluralisation now match the states; step states use `running`/`passed`/`failed` rather than raw API values |
+| Help was one long column; screen keys fell below the fold | Wide terminals use two balanced columns; the screen keys and status legend fit without scrolling at 120 columns |
+| Enter from Concerns opened Logs | It opens PRs when the repository has open PRs, otherwise Issues |
+| Failed-job logs were unformatted and the GitHub link had no key hint | Job logs use the same timestamp/command/error highlighting as sync logs; the link names `(o)` |
+| Empty and denied states advertised actions that did nothing | Empty lists drop `open`/`actions`; denied runner lists explain the permission and retry path; queued jobs say logs are not available yet |
+| The palette assumed a dark terminal | `FRESHEN_LIGHT=1` or a light `COLORFGBG` selects a dark-on-light palette with the same measured contrast floor |
+| The wordmark's leading glyph was a status mark | The header leads with a leaf mark; health is named by the state chip (and remains explicit at narrow widths) |
+| Repositories had no CI state beside the branch | The repository table shows the newest observed run (`CI ↻ #42`, `CI ✗ #40 9m ago`) before the branch and counts |
+
+The panel repair added tests for column alignment, status-aware bars, Actions
+recency, archived counts, CI state, the concerns tab, push confirmation detail,
+light-theme contrast, and the read-only preview. `go build ./...`,
+`go test -race ./...` and `make lint` pass locally.
+
 ## Verification
 
 `pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,

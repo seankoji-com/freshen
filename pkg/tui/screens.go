@@ -15,6 +15,7 @@ import (
 // survive polling and sorting; index resolves the current backing slice only.
 type screenEntry struct {
 	key, title, subtitle string
+	status, item, detail string
 	index                int
 }
 type actionRun struct {
@@ -133,6 +134,31 @@ func stepKind(s jobs.GHJobStep) statusKind {
 	return kindUnknown
 }
 
+// stepLabel turns GitHub's API values into the same vocabulary as job states.
+func stepLabel(s jobs.GHJobStep) string {
+	switch s.Status {
+	case "in_progress":
+		return "running"
+	case "completed":
+		switch s.Conclusion {
+		case "success":
+			return "passed"
+		case "failure", "timed_out":
+			return "failed"
+		case "skipped":
+			return "skipped"
+		case "cancelled":
+			return "cancelled"
+		}
+		return "completed"
+	case "queued", "pending":
+		return "queued"
+	case "waiting":
+		return "waiting"
+	}
+	return s.Status
+}
+
 // failedStep names the first failing step GitHub reported for a job, the
 // quickest pointer to why a run failed.
 func failedStep(j *jobs.JobItem) string {
@@ -160,17 +186,44 @@ func stepSummary(j *jobs.JobItem) (done int, current string) {
 func stateBadge(s jobs.JobStatus) string {
 	return th.status(jobKind(s), string(s))
 }
-func (m Model) countBar(done, total int, noun string) string {
+func (m Model) countBar(done, total int, noun string, kind statusKind) string {
 	if total == 0 {
 		return noun + " not reported"
 	}
-	p := m.ProgressBar
+	p := th.progressFor(kind)
 	p.Width = min(14, max(4, m.Width/8))
 	if m.singleLineList() {
 		p.Width = 4
 	}
 	return fmt.Sprintf("%s %d/%d %s complete", p.ViewAs(float64(done)/float64(total)), done, total, noun)
 }
+
+// repoCI names the newest workflow run observed for a repository, so the
+// repository table can carry CI state without opening Actions.
+func (m Model) repoCI(repo string) string {
+	var latest *jobs.RunItem
+	for _, ar := range m.actionRuns() {
+		r := ar.run
+		if r.Repo != repo {
+			continue
+		}
+		if latest == nil || r.CreatedAt.After(latest.CreatedAt) || (r.CreatedAt.Equal(latest.CreatedAt) && r.ID > latest.ID) {
+			latest = r
+		}
+	}
+	if latest == nil {
+		return ""
+	}
+	label := fmt.Sprintf("CI %s #%d", statusGlyphs[jobKind(latest.Status)], latest.Number)
+	if latest.Number == 0 {
+		label = fmt.Sprintf("CI %s run %d", statusGlyphs[jobKind(latest.Status)], latest.ID)
+	}
+	if terminalStatus(latest.Status) && !latest.CompletedAt.IsZero() {
+		label += " " + compactAgo(time.Since(latest.CompletedAt)) + " ago"
+	}
+	return label
+}
+
 func (m Model) entries() []screenEntry {
 	var entries []screenEntry
 	switch m.ActiveFocus {
@@ -184,7 +237,10 @@ func (m Model) entries() []screenEntry {
 				}
 				entries = append(entries, screenEntry{
 					key: r.Path + "/" + r.Name, index: i,
-					title: r.Name + "  " + th.status(kindUnknown, "counts unknown"), subtitle: detail + " · not ranked",
+					status: th.status(kindUnknown, "unknown"),
+					item:   r.Name,
+					detail: detail + " · not ranked",
+					title:  r.Name + "  " + th.status(kindUnknown, "counts unknown"), subtitle: detail + " · not ranked",
 				})
 				continue
 			}
@@ -208,9 +264,16 @@ func (m Model) entries() []screenEntry {
 			if r.CountsStale {
 				detail += " · counts from last successful refresh"
 			}
+			entryDetail := detail
+			if len(badges) > 0 {
+				entryDetail = strings.Join(badges, " · ") + " · " + detail
+			}
 			entries = append(entries, screenEntry{
 				key: r.Path + "/" + r.Name, index: i,
-				title: r.Name + "  " + strings.Join(badges, "  "), subtitle: detail,
+				status: th.status(kindWarning, "review"),
+				item:   r.Name,
+				detail: entryDetail,
+				title:  r.Name + "  " + strings.Join(badges, "  "), subtitle: detail,
 			})
 		}
 	case FocusRepos:
@@ -240,10 +303,16 @@ func (m Model) entries() []screenEntry {
 			if r.LocalMetadataStale {
 				parts = append(parts, "local metadata from last snapshot")
 			}
+			head := ""
 			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
-				parts = append(parts, r.StatusMsg)
+				head = r.StatusMsg + " · "
 			}
+			if ci := m.repoCI(r.Name); ci != "" {
+				head += ci + " · "
+			}
+			detail := head + strings.Join(parts, " · ")
 			entries = append(entries, screenEntry{key: r.Path + "/" + r.Name, index: i,
+				status: m.renderStatusBadge(r), item: r.Name, detail: detail,
 				title: r.Name + "  " + m.renderStatusBadge(r), subtitle: strings.Join(parts, " · ")})
 		}
 	case FocusRunners:
@@ -260,13 +329,15 @@ func (m Model) entries() []screenEntry {
 			if len(r.Tags) > 0 {
 				subtitle += " · labels: " + strings.Join(r.Tags, ", ")
 			}
-			entries = append(entries, screenEntry{key: r.ID, index: i, title: r.Name + "  " + th.status(kind, label), subtitle: subtitle})
+			entries = append(entries, screenEntry{key: r.ID, index: i,
+				status: th.status(kind, label), item: r.Name, detail: subtitle,
+				title: r.Name + "  " + th.status(kind, label), subtitle: subtitle})
 		}
 	case FocusJobs:
 		if m.OpenRun != nil {
 			for i, j := range m.runJobs() {
 				done, current := stepSummary(j)
-				detail := m.countBar(done, len(j.Steps), "steps")
+				detail := m.countBar(done, len(j.Steps), "steps", jobKind(j.Status))
 				if current != "" {
 					detail += " · " + current
 				}
@@ -279,7 +350,9 @@ func (m Model) entries() []screenEntry {
 				if j.Duration != "" && j.Duration != "-" {
 					detail += " · " + j.Duration
 				}
-				entries = append(entries, screenEntry{key: j.ID, index: i, title: stateBadge(j.Status) + "  " + strings.TrimPrefix(j.Name, j.Repo+" / "), subtitle: detail})
+				entries = append(entries, screenEntry{key: j.ID, index: i,
+					status: stateBadge(j.Status), item: strings.TrimPrefix(j.Name, j.Repo+" / "), detail: detail,
+					title: stateBadge(j.Status) + "  " + strings.TrimPrefix(j.Name, j.Repo+" / "), subtitle: detail})
 			}
 		} else if m.QueueView {
 			for i, j := range m.JobQueue {
@@ -292,12 +365,14 @@ func (m Model) entries() []screenEntry {
 				}
 				if j.Status == jobs.JobRunning {
 					done, current := stepSummary(j)
-					subtitle = m.countBar(done, len(j.Steps), "steps") + " · " + current + " · " + subtitle
+					subtitle = m.countBar(done, len(j.Steps), "steps", jobKind(j.Status)) + " · " + current + " · " + subtitle
 				}
 				if !j.CreatedAt.IsZero() && j.Status == jobs.JobQueued {
 					subtitle = "Waiting " + jobs.FormatDuration(time.Since(j.CreatedAt)) + " · " + subtitle
 				}
-				entries = append(entries, screenEntry{key: j.ID, index: i, title: stateBadge(j.Status) + "  " + j.Name, subtitle: subtitle})
+				entries = append(entries, screenEntry{key: j.ID, index: i,
+					status: stateBadge(j.Status), item: j.Name, detail: subtitle,
+					title: stateBadge(j.Status) + "  " + j.Name, subtitle: subtitle})
 			}
 		} else {
 			for i, r := range m.actionRuns() {
@@ -307,11 +382,12 @@ func (m Model) entries() []screenEntry {
 				if m.ActionsFilter == 1 && r.run.Status != jobs.JobFailed && r.run.Status != jobs.JobWaiting {
 					continue
 				}
-				title := fmt.Sprintf("%s  %s / %s  #%d", stateBadge(r.run.Status), r.run.Repo, r.run.Workflow, r.run.Number)
+				item := fmt.Sprintf("%s / %s  #%d", r.run.Repo, r.run.Workflow, r.run.Number)
 				if r.run.Number == 0 {
-					title = fmt.Sprintf("%s  %s / %s  run %d", stateBadge(r.run.Status), r.run.Repo, r.run.Workflow, r.run.ID)
+					item = fmt.Sprintf("%s / %s  run %d", r.run.Repo, r.run.Workflow, r.run.ID)
 				}
-				progress := m.countBar(completion(r.jobs), len(r.jobs), "jobs")
+				title := stateBadge(r.run.Status) + "  " + item
+				progress := m.countBar(completion(r.jobs), len(r.jobs), "jobs", jobKind(r.run.Status))
 				if !r.run.JobsKnown {
 					progress = "Enter to load jobs"
 				}
@@ -329,7 +405,9 @@ func (m Model) entries() []screenEntry {
 				if r.run.Title != "" {
 					sub += " · " + r.run.Title
 				}
-				entries = append(entries, screenEntry{key: runKey(r.run), index: i, title: title, subtitle: sub})
+				entries = append(entries, screenEntry{key: runKey(r.run), index: i,
+					status: stateBadge(r.run.Status), item: item, detail: sub,
+					title: title, subtitle: sub})
 			}
 		}
 	}
@@ -413,29 +491,39 @@ func (m Model) singleLineList() bool {
 	return true
 }
 
-func (m Model) listColumnLabels() (string, string) {
+func (m Model) listColumnLabels() (string, string, string) {
 	switch m.ActiveFocus {
 	case FocusJobs:
 		if m.OpenRun != nil {
-			return "JOB", "PROGRESS · STATE"
+			return "STATUS", "JOB", "PROGRESS · STATE"
 		}
 		if m.QueueView {
-			return "JOB", "RUN · WAITING"
+			return "STATUS", "JOB", "RUN · WAITING"
 		}
-		return "RUN", "PROGRESS · TIMING"
+		return "STATUS", "RUN", "PROGRESS · TIMING"
 	case FocusRunners:
-		return "RUNNER", "PLATFORM · ASSIGNMENT"
+		return "STATUS", "RUNNER", "PLATFORM · ASSIGNMENT"
 	case FocusConcerns:
-		return "REPOSITORY", "SIGNAL"
+		return "STATUS", "REPOSITORY", "SIGNAL"
 	}
-	return "REPOSITORY", "BRANCH · COUNTS"
+	return "STATUS", "REPOSITORY", "BRANCH · COUNTS"
 }
 
-// listTableWidths splits the list column into the item and detail columns.
-func (m Model) listTableWidths(width int) (item, detail int) {
-	inner := max(20, width)
-	item = min(64, max(24, inner*2/5))
-	return item, max(8, inner-item-4)
+// listTableWidths splits the list column into status, item and detail columns.
+// The status column is fixed so names and details line up down the table.
+func (m Model) listTableWidths(width int) (status, item, detail int) {
+	status = 11
+	switch m.ActiveFocus {
+	case FocusRepos:
+		status = 12
+	case FocusRunners:
+		status = 13
+	case FocusConcerns:
+		status = 9
+	}
+	item = min(44, max(26, width/4))
+	detail = max(8, width-status-item-6)
+	return status, item, detail
 }
 func (m Model) selectionKey() string {
 	if m.ActiveFocus == FocusJobs && m.OpenRun != nil {
@@ -543,7 +631,7 @@ func (m Model) listContentWidth(width int) string {
 		case m.ActiveFocus == FocusRunners && m.IsRunnersLoading:
 			return m.Spinner.View() + " Loading runners…"
 		case m.ActiveFocus == FocusRunners && m.RunnerPermissionDenied:
-			return "Fleet access unavailable. Runners appear here when observed in job assignments."
+			return "Fleet access unavailable. Runners appear here when observed in job assignments.\nRe-authenticate gh with runner read permission, or ask an organization admin."
 		case m.ActiveFocus == FocusRunners && m.RunnerFetchFailed:
 			return "Runner fetch failed. Press r to retry."
 		case m.ActiveFocus == FocusRunners:
@@ -559,11 +647,11 @@ func (m Model) listContentWidth(width int) string {
 		lines = append(lines, th.warning.Render(coverageWarning), "")
 	}
 	if m.singleLineList() {
-		itemW, detailW := m.listTableWidths(width)
-		headItem, headDetail := m.listColumnLabels()
-		lines = append(lines, "  "+columnHeader([]string{headItem, headDetail}, []int{itemW, detailW}, 2))
+		statusW, itemW, detailW := m.listTableWidths(width)
+		headStatus, headItem, headDetail := m.listColumnLabels()
+		lines = append(lines, "  "+columnHeader([]string{headStatus, headItem, headDetail}, []int{statusW, itemW, detailW}, 2))
 		for i, e := range es {
-			lines = append(lines, m.tableRow(e, i+start == selected, width, itemW, detailW))
+			lines = append(lines, m.tableRow(e, i+start == selected, width, statusW, itemW, detailW))
 		}
 		return strings.Join(lines, "\n")
 	}
@@ -582,13 +670,13 @@ func (m Model) listContentWidth(width int) string {
 
 // tableRow is one dense list row. The selected row drops nested colours so the
 // surface highlight and text contrast survive the whole row.
-func (m Model) tableRow(e screenEntry, selected bool, width, itemW, detailW int) string {
+func (m Model) tableRow(e screenEntry, selected bool, width, statusW, itemW, detailW int) string {
 	w := max(8, width)
 	if selected {
-		body := " " + padTo(ansi.Strip(e.title), itemW) + "  " + padTo(ansi.Strip(e.subtitle), detailW)
-		return th.cursor.Render("›") + th.rowSelected.Render(padTo(body, max(0, w-1)))
+		body := padTo(ansi.Strip(e.status), statusW) + "  " + padTo(ansi.Strip(e.item), itemW) + "  " + padTo(ansi.Strip(e.detail), detailW)
+		return th.cursor.Render("› ") + th.rowSelected.Render(padTo(body, max(0, w-2)))
 	}
-	return "  " + padTo(e.title, itemW) + "  " + th.dim.Render(fitLine(e.subtitle, detailW))
+	return "  " + padTo(e.status, statusW) + "  " + padTo(e.item, itemW) + "  " + th.dim.Render(fitLine(e.detail, detailW))
 }
 func fitFrame(content string, width, height int) string {
 	lines := strings.Split(content, "\n")
@@ -596,7 +684,7 @@ func fitFrame(content string, width, height int) string {
 		lines = lines[:height]
 	}
 	for i := range lines {
-		lines[i] = ansi.Truncate(lines[i], max(0, width), "")
+		lines[i] = ansi.Truncate(lines[i], max(0, width), "…")
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
@@ -624,7 +712,7 @@ func (m Model) jobDetailContent() string {
 	} else if j.Run != nil && j.Run.JobsStale {
 		sb.WriteString("Cached job state from the previous poll; refreshing.\n\n")
 	}
-	fmt.Fprintf(&sb, "%s  %s\n%s\n\n", stateBadge(j.Status), j.Name, Hyperlink("Open job in GitHub", m.jobURL(j)))
+	fmt.Fprintf(&sb, "%s  %s\n%s\n\n", stateBadge(j.Status), j.Name, Hyperlink("Open job in GitHub", m.jobURL(j))+th.dim.Render("  (o)"))
 	if j.RunnerName != "" {
 		fmt.Fprintf(&sb, "Runner: %s\n", j.RunnerName)
 	} else {
@@ -643,18 +731,14 @@ func (m Model) jobDetailContent() string {
 		sb.WriteString(th.toastError.Render(failed) + "\n")
 	}
 	done, _ := stepSummary(j)
-	fmt.Fprintf(&sb, "\n%s\n\n", m.countBar(done, len(j.Steps), "steps"))
+	fmt.Fprintf(&sb, "\n%s\n\n", m.countBar(done, len(j.Steps), "steps", jobKind(j.Status)))
 	for _, s := range j.Steps {
-		state := s.Status
-		if s.Conclusion != "" {
-			state = s.Conclusion
-		}
-		fmt.Fprintf(&sb, "%2d  %s %s\n", s.Number, th.status(stepKind(s), fmt.Sprintf("%-11s", state)), s.Name)
+		fmt.Fprintf(&sb, "%2d  %s %s\n", s.Number, th.status(stepKind(s), fmt.Sprintf("%-9s", stepLabel(s))), s.Name)
 	}
 	sb.WriteString("\n" + th.section.Render("Log tail (last 200 lines)") + "\n\n")
 	sb.WriteString(m.logStatusLine(j))
 	for _, line := range j.Logs {
-		sb.WriteString(jobs.SanitizeTerminal(line) + "\n")
+		sb.WriteString(highlightLogLine(jobs.SanitizeTerminal(line)) + "\n")
 	}
 	return sb.String()
 }
@@ -667,6 +751,8 @@ func (m Model) logStatusLine(j *jobs.JobItem) string {
 	switch {
 	case m.LogLoading == j.ID && !kept:
 		return m.Spinner.View() + " Loading logs…\n"
+	case j.Status == jobs.JobQueued || j.Status == jobs.JobWaiting:
+		return "Logs are not available until this job starts.\n"
 	case m.LogErrors[j.ID] != "":
 		msg := "Log fetch failed: " + jobs.SanitizeTerminal(m.LogErrors[j.ID]) + ". Press r to retry."
 		if kept {

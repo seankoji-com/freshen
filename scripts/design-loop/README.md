@@ -17,6 +17,10 @@ send-keys` names sent in order before capturing (`0`–`4`, `Tab`, `Enter`,
 through `ansi_to_html.py` and headless Chrome, so colours, reverse video and
 Unicode cell widths are preserved.
 
+Set `DESIGN_BG` and `DESIGN_FG` when capturing a themed UI on a different
+terminal background, for example `DESIGN_BG=#FFFFFF DESIGN_FG=#1B2A22
+FRESHEN_LIGHT=1 scripts/design-loop/capture.sh out 120 30 1`.
+
 Requirements: Go, tmux, Python 3, and Google Chrome or Chromium. The script
 builds the test binary in a self-cleaning temporary directory.
 

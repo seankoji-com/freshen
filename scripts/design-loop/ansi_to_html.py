@@ -5,11 +5,12 @@ Only SGR sequences are interpreted; other CSI sequences are dropped. The page is
 sized for a monospace terminal screenshot and uses the freshen palette defaults.
 """
 import html
+import os
 import re
 import sys
 
-DEFAULT_FG = "#DCE7E0"
-DEFAULT_BG = "#101613"
+DEFAULT_FG = os.environ.get("DESIGN_FG", "#DCE7E0")
+DEFAULT_BG = os.environ.get("DESIGN_BG", "#101613")
 
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
 # Any CSI except SGR: keep SGR intact for the parser below.

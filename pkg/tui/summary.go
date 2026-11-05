@@ -114,7 +114,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		})
 	}
 	if m.OrgRefreshFailed {
-		s.attention = append(s.attention, summaryAttention{priority: 0, title: "Repository snapshot unavailable", detail: m.orgRefreshFailureDetail()})
+		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Repository snapshot unavailable", detail: m.orgRefreshFailureDetail()})
 	}
 	if m.LocalScanFailed {
 		title := "Local repository metadata incomplete"
@@ -183,7 +183,7 @@ func (m Model) buildOrgSummary() orgSummary {
 		if detail == "" {
 			detail = "some Actions data could not be loaded"
 		}
-		s.attention = append(s.attention, summaryAttention{priority: 0, title: "Actions snapshot incomplete", detail: detail})
+		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Actions snapshot incomplete", detail: detail})
 	}
 	if m.RunnerFetchFailed && !m.RunnerPermissionDenied {
 		s.attention = append(s.attention, summaryAttention{priority: 1, title: "Runner snapshot unavailable", detail: "press r to retry"})
@@ -277,8 +277,9 @@ func (m Model) summaryContent(width, height int) string {
 	remaining := height - used
 	if remaining >= 6 {
 		content = append(content, "")
-		health := m.repoHealthPanel(s, leftW, max(2, remaining/2))
-		recent := m.recentPanel(s, rightW, max(2, remaining/2))
+		available := max(2, remaining-1)
+		health := m.repoHealthPanel(s, leftW, available)
+		recent := m.recentPanel(s, rightW, available)
 		bottom := lipgloss.JoinHorizontal(lipgloss.Top, health, strings.Repeat(" ", gap), recent)
 		content = append(content, strings.Split(bottom, "\n")...)
 	}
@@ -368,7 +369,7 @@ func (m Model) summaryTiles(s orgSummary) []summaryTile {
 	default:
 		runners.figure = fmt.Sprintf("%d busy · %d idle", s.runnerBusy, s.runnerIdle)
 		runners.detail = fmt.Sprintf("%d offline · %d maintenance", s.runnerOffline, s.runnerMaintenance)
-		runners.tallDetail = fmt.Sprintf("%d unknown availability", s.runnerUnknown)
+		runners.tallDetail = fmt.Sprintf("%d unknown", s.runnerUnknown)
 	}
 
 	concerns := summaryTile{label: "Concerns", kind: kindSuccess}
@@ -383,7 +384,7 @@ func (m Model) summaryTiles(s orgSummary) []summaryTile {
 		concerns.figure, concerns.detail, concerns.kind = "Counts unavailable", "press r to retry", kindWarning
 	default:
 		concerns.figure = fmt.Sprintf("%d open PRs · %d open issues", s.openPRs, s.openIssues)
-		concerns.detail = fmt.Sprintf("%d ranked", s.concernRepos)
+		concerns.detail = countPhrase(s.concernRepos, "repo with review", "repos with review")
 		concerns.tallDetail = fmt.Sprintf("review counts for %d/%d repositories", s.countsLoaded, s.repositories)
 		if s.concernRepos > 0 {
 			concerns.kind = kindWarning
@@ -479,7 +480,7 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 				detail = string(run.run.Status)
 			}
 		default:
-			detail = m.countBar(completion(run.jobs), len(run.jobs), "jobs")
+			detail = m.countBar(completion(run.jobs), len(run.jobs), "jobs", jobKind(run.run.Status))
 			if width >= 70 {
 				if timing := runTiming(run.run, time.Now()); timing != "" {
 					detail += " · " + timing
@@ -519,7 +520,7 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 func (m Model) repoHealthPanel(s orgSummary, width, limit int) string {
 	lines := []string{panelHeader("Repository health", s.repositories, width)}
 	for i, r := range m.Repos {
-		if i >= max(1, limit-1) {
+		if i >= max(1, limit-2) {
 			if len(m.Repos) > i {
 				lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more repositories", len(m.Repos)-i)))
 			}
@@ -619,7 +620,7 @@ func (m Model) recentPanel(_ orgSummary, width, limit int) string {
 		return runs[i].run.ID > runs[j].run.ID
 	})
 	lines := []string{panelHeader("Recent runs", len(runs), width)}
-	maxRows := max(1, limit-1)
+	maxRows := max(1, limit-2)
 	shown := 0
 	for _, run := range runs {
 		if shown >= maxRows {
@@ -788,7 +789,6 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 			review = append(review, a)
 		}
 	}
-	maxReview := 6
 	grouped := width >= 60 && limit >= 5 && len(fails) > 0 && len(review) > 0
 	var rows []string
 	add := func(a summaryAttention) {
@@ -811,7 +811,7 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 			rows = append(rows, summaryFit(th.tileLabel.Render(fmt.Sprintf("REVIEW (%d)", len(review))), width, 1))
 			shown := 0
 			for _, a := range review {
-				if shown >= maxReview || len(rows) >= limit-1 {
+				if len(rows) >= limit-1 {
 					break
 				}
 				add(a)

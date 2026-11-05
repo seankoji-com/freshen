@@ -61,7 +61,7 @@ func colourHex(c lipgloss.TerminalColor) string {
 func TestThemeBodyContrast(t *testing.T) {
 	saved := th
 	t.Cleanup(func() { th = saved })
-	th = newTheme(false)
+	th = newThemeMode(false, false)
 
 	const background = "#101613"
 	surface := colourHex(th.surface)
@@ -81,6 +81,31 @@ func TestThemeBodyContrast(t *testing.T) {
 		for label, bg := range map[string]string{"background": background, "surface": surface} {
 			if ratio := contrastRatio(hex, bg); ratio < 4.5 {
 				t.Errorf("%s on %s is %.2f:1, want >= 4.5:1", name, label, ratio)
+			}
+		}
+	}
+}
+
+// The light palette keeps the same WCAG AA floor on a white terminal and the
+// light selection surface.
+func TestLightThemeBodyContrast(t *testing.T) {
+	saved := th
+	t.Cleanup(func() { th = saved })
+	th = newThemeMode(false, true)
+	surface := colourHex(th.surface)
+	if surface == "" {
+		t.Fatal("light theme surface is not a concrete colour")
+	}
+	colours := map[string]lipgloss.TerminalColor{
+		"text": th.text, "muted": th.muted, "primary": th.primary,
+		"secondary": th.secondary, "success": th.green, "warning": th.yellow,
+		"failure": th.red, "running": th.blue,
+	}
+	for name, c := range colours {
+		hex := colourHex(c)
+		for label, bg := range map[string]string{"white": "#FFFFFF", "surface": surface} {
+			if ratio := contrastRatio(hex, bg); ratio < 4.5 {
+				t.Errorf("light %s on %s is %.2f:1, want >= 4.5:1", name, label, ratio)
 			}
 		}
 	}

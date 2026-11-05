@@ -85,6 +85,18 @@ func (m Model) menuContent() string {
 				if m.ActionTarget != nil && a.id == "prune" {
 					detail += "\nFreshen aborts on default-branch drift. Changed or unavailable worktrees and branches with commits absent from every remote are kept."
 				}
+				if m.ActionTarget != nil && a.id == "push" {
+					target := m.ActionTarget
+					branch := target.CurrentBranch
+					base := target.DefaultBranch
+					detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
+					if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
+						detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
+					} else {
+						detail += "\nChanged files not read; open Branches to review before confirming."
+					}
+					detail += fmt.Sprintf("\nCommit message: WIP: Updates on branch '%s'", branch)
+				}
 				lines := []string{
 					rule("CONFIRM", width),
 					th.warning.Render(statusGlyphs[kindWarning] + " " + a.label),
@@ -106,9 +118,9 @@ func (m Model) menuContent() string {
 			}
 		}
 	}
-	title := "Actions"
+	title := "Select action"
 	if m.ActionTarget != nil {
-		title += " / " + m.ActionTarget.Name
+		title += " for " + m.ActionTarget.Name
 	}
 	// Budget in rendered rows: every row is cut or wrapped to the body width
 	// here, so View's wrap adds none, and the selected action always shows.

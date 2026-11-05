@@ -104,6 +104,42 @@ func TestHealthPanelDoesNotRepeatStatus(t *testing.T) {
 	}
 }
 
+// Entering a concern opens the tab that carries its signal.
+func TestConcernsOpensReviewTab(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActiveFocus = FocusConcerns
+	m.SelectedIndex = 0
+	m.ScreenCursor[FocusConcerns] = m.Repos[0].Path + "/" + m.Repos[0].Name
+	press(&m, "enter")
+	if !m.Detail || m.ActiveTab != TabPRs {
+		t.Fatalf("Concerns opened detail=%v tab=%v, want PRs", m.Detail, m.ActiveTab)
+	}
+}
+
+// The push confirmation names the branch, changed files and commit message.
+func TestPushConfirmationNamesFilesAndMessage(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActionTarget = m.Repos[0]
+	m.ActionTarget.BranchDetails.ChangedFiles = []string{"M one.go", "A two.go"}
+	m.PendingAction = "push"
+	content := stripped(m.menuContent())
+	for _, want := range []string{"Branch feat/screens → PR base main", "Changed files (2)", "Commit message: WIP: Updates on branch 'feat/screens'"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("push confirmation missing %q:\n%s", want, content)
+		}
+	}
+}
+
+// The repository table carries the newest CI run beside the branch.
+func TestRepositoryTableShowsCI(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActiveFocus = FocusRepos
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 120, Height: 30})
+	if content := stripped(m.listContent()); !strings.Contains(content, "CI ↻ #42") {
+		t.Fatalf("repository table has no CI state:\n%s", content)
+	}
+}
+
 // A click inside the read-only preview must not retarget the list selection.
 func TestPreviewClickDoesNotChangeSelection(t *testing.T) {
 	m := smokeFixtureModel()
@@ -159,7 +195,7 @@ func TestTableSelectionKeepsColumnAlignment(t *testing.T) {
 	if len(lines) < 3 {
 		t.Fatalf("short table:\n%s", strings.Join(lines, "\n"))
 	}
-	selectedIdx := strings.Index(lines[1], "feat/screens")
+	selectedIdx := strings.Index(lines[1], "CI ↻")
 	unselectedIdx := strings.Index(lines[2], "main")
 	if selectedIdx < 0 || unselectedIdx < 0 {
 		t.Fatalf("detail missing:\n%s", strings.Join(lines, "\n"))
