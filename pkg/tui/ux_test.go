@@ -33,6 +33,7 @@ var uxStates = []struct {
 	{"concerns", func(m *Model) { press(m, "4") }},
 	{"help", func(m *Model) { press(m, "2"); press(m, "?") }},
 	{"filter", func(m *Model) { press(m, "/"); press(m, "al") }},
+	{"empty-filter", func(m *Model) { press(m, "1"); press(m, "/") }},
 	{"menu", func(m *Model) { press(m, " ") }},
 	{"confirm", func(m *Model) { press(m, "X") }},
 	{"long-filter", func(m *Model) { press(m, "/"); press(m, strings.Repeat("abcdefghij", 7)+"wxyz") }},
@@ -467,7 +468,7 @@ func TestStatusSemanticsNeverDependOnColourAlone(t *testing.T) {
 		}
 	}
 	for _, s := range []jobs.JobStatus{jobs.JobQueued, jobs.JobRunning, jobs.JobPassed, jobs.JobFailed, jobs.JobCancelled, jobs.JobSkipped, jobs.JobWaiting, jobs.JobUnknown} {
-		if got := stripped(stateBadge(s)); got != statusGlyphs[jobKind(s)]+" "+string(s) {
+		if got := stripped(stateBadge(s)); got != statusGlyphs[jobKind(s)]+" "+jobLabel(s) {
 			t.Fatalf("job %s rendered %q", s, got)
 		}
 	}
@@ -498,7 +499,7 @@ func TestRunsShowTimingAndFailureReason(t *testing.T) {
 	press(&m, "2")
 	press(&m, "f") // Needs attention
 	list := stripped(m.listContent())
-	if !strings.Contains(list, "✗ FAILED") || !strings.Contains(list, "beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
+	if !strings.Contains(list, "✗ failed") || !strings.Contains(list, "beta / Release  #9") || !strings.Contains(list, "took 4m · finished 6m ago") {
 		t.Fatalf("failed run lacks status or timing:\n%s", list)
 	}
 	press(&m, "enter")

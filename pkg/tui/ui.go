@@ -59,9 +59,6 @@ func columnHeader(cols []string, widths []int, gap int) string {
 	return strings.TrimRight(sb.String(), " ")
 }
 
-// joinColumns places cells side by side at fixed widths. The final cell takes
-// the remaining width so a row never overflows.
-
 func joinLeft(left, right string, width, leftW int) string {
 	if width <= 0 {
 		return ""

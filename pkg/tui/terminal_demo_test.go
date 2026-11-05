@@ -119,6 +119,10 @@ func demoFixtureModel() Model {
 		{Number: 39, Title: "Keep the previous log tail on failure", HeadRefName: "fix/log-tail", URL: "https://github.com/fixture-org/alpha/pull/39"},
 	}
 	m.Repos[0].HasLoadedIssues, m.Repos[0].HasLoadedPRs = true, true
+	m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+	m.Repos[2].HasUpstream = true
+	m.Repos[3].HasUpstream, m.Repos[3].Behind = true, 3
+	m.Repos[5].HasUpstream, m.Repos[5].Behind = true, 2
 	m.Repos[2].PRsList = []git.PRItem{{Number: 7, Title: "Clarify the docs install path", HeadRefName: "docs/install", URL: "https://github.com/fixture-org/gamma/pull/7"}}
 	m.Repos[2].HasLoadedPRs = true
 	m.Repos[5].IssuesList = []git.IssueItem{
@@ -165,6 +169,8 @@ func demoFixtureModel() Model {
 		if st == git.StatusArchived {
 			repo.IsArchived = true
 		}
+		repo.HasUpstream = true
+		repo.Ahead, repo.Behind = i%2, i%3
 		if i%5 == 0 {
 			repo.HasUnstagedChanges = true
 		}

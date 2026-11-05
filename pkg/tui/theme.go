@@ -41,6 +41,7 @@ var statusGlyphs = map[statusKind]string{
 // from th rather than building ad-hoc lipgloss styles.
 type theme struct {
 	noColor bool
+	light   bool
 
 	primary, secondary, green, yellow, red, blue, muted, text, surface, line lipgloss.TerminalColor
 
@@ -48,7 +49,7 @@ type theme struct {
 	tabActive, tabInactive, subTabActive, subTabInactive lipgloss.Style
 	crumb, crumbCurrent, cursor                          lipgloss.Style
 	rowSelected, rowDetail                               lipgloss.Style
-	tableHeader, tileLabel, chip                         lipgloss.Style
+	tableHeader, tileLabel                               lipgloss.Style
 	key, keyDesc, keySep, keyPrimary                     lipgloss.Style
 	toastInfo, toastError, warning, link                 lipgloss.Style
 	pr, issue, branchHeading, worktreeHeading            lipgloss.Style
@@ -112,6 +113,7 @@ func newThemeMode(noColor, light bool) theme {
 	}
 	t := theme{
 		noColor:   noColor,
+		light:     light,
 		primary:   c(primary),
 		secondary: c(secondary),
 		green:     c(green),
@@ -142,14 +144,12 @@ func newThemeMode(noColor, light bool) theme {
 	t.rowDetail = s().Foreground(t.text).Background(t.surface)
 	t.tableHeader = s().Bold(true).Foreground(t.muted)
 	t.tileLabel = s().Bold(true).Foreground(t.secondary)
-	t.chip = s().Bold(true).Foreground(t.text).Background(t.surface).Padding(0, 1)
 	if noColor {
 		// Without colour a background highlight disappears; reverse video keeps
 		// the selected row visible alongside the › cursor.
 		t.tabActive = t.tabActive.Reverse(true)
 		t.rowSelected = t.rowSelected.Reverse(true)
 		t.rowDetail = t.rowDetail.Reverse(true)
-		t.chip = t.chip.Reverse(true)
 	}
 	t.key = s().Bold(true).Foreground(t.secondary)
 	t.keyPrimary = s().Bold(true).Foreground(t.primary)
@@ -228,18 +228,38 @@ func (t theme) progressFor(k statusKind) progress.Model {
 		p.EmptyColor = ""
 		return p
 	}
+	return progress.New(progress.WithSolidFill(t.progressFill(k)), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+}
+
+// progressFill is the bar colour for a state, chosen from the active palette.
+func (t theme) progressFill(k statusKind) string {
 	fill := "#8CA096"
+	if t.light {
+		fill = "#4E6258"
+	}
 	switch k {
 	case kindSuccess:
 		fill = "#78B159"
+		if t.light {
+			fill = "#1E7A3A"
+		}
 	case kindFailure:
 		fill = "#F07178"
+		if t.light {
+			fill = "#B3261E"
+		}
 	case kindRunning:
 		fill = "#5B9BF8"
+		if t.light {
+			fill = "#1F5FBF"
+		}
 	case kindQueued, kindWarning:
 		fill = "#F59E0B"
+		if t.light {
+			fill = "#8A5A00"
+		}
 	}
-	return progress.New(progress.WithSolidFill(fill), progress.WithoutPercentage(), progress.WithColorProfile(lipgloss.ColorProfile()))
+	return fill
 }
 
 func jobKind(s jobs.JobStatus) statusKind {
@@ -262,15 +282,15 @@ func jobKind(s jobs.JobStatus) statusKind {
 func runnerKind(s jobs.RunnerStatus) (statusKind, string) {
 	switch s {
 	case jobs.RunnerRunning:
-		return kindRunning, "BUSY"
+		return kindRunning, "busy"
 	case jobs.RunnerIdle:
-		return kindSuccess, "IDLE"
+		return kindSuccess, "idle"
 	case jobs.RunnerOffline:
-		return kindFailure, "OFFLINE"
+		return kindFailure, "offline"
 	case jobs.RunnerMaintenance:
-		return kindSkipped, "MAINTENANCE"
+		return kindSkipped, "maintenance"
 	default:
-		return kindUnknown, "UNKNOWN"
+		return kindUnknown, "unknown"
 	}
 }
 

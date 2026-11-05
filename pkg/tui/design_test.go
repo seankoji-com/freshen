@@ -104,6 +104,16 @@ func TestHealthPanelDoesNotRepeatStatus(t *testing.T) {
 	}
 }
 
+// A complete snapshot with only open-PR review items is "review", not
+// "partial" (that word is reserved for incomplete data).
+func TestSnapshotChipNamesReviewNotPartial(t *testing.T) {
+	m := smokeFixtureModel()
+	label, _ := m.snapshotChip()
+	if label != "review" {
+		t.Fatalf("complete review-only snapshot chip = %q, want review", label)
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()

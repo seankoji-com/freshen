@@ -19,8 +19,6 @@ const (
 )
 
 // minFrameWidth and minFrameHeight are the smallest terminal that renders the
-// full chrome; anything smaller shows a resize notice instead.
-// minFrameWidth and minFrameHeight are the smallest terminal that renders the
 // full chrome. Below them the tabs, context and hints would clip into an
 // ambiguous frame, so a resize notice with the working quit key is clearer.
 const (
@@ -634,6 +632,9 @@ func (m Model) footerView() string {
 }
 
 func (m Model) statusLine() string {
+	if m.PendingAction != "" && !m.confirmationFits() {
+		return th.warning.Render(statusGlyphs[kindWarning] + " Resize the terminal to read the full confirmation · esc cancels")
+	}
 	if m.BusyAction != "" {
 		return m.Spinner.View() + " " + m.BusyAction + th.dim.Render(" · navigation remains available")
 	}
@@ -764,12 +765,24 @@ func helpStatusLines(width int) []string {
 		{kindQueued, "queued · not started, waiting for approval or a runner"},
 		{kindSkipped, "skipped · skipped, cancelled, archived, maintenance"},
 		{kindUnknown, "unknown · not synced or not reported"},
-		{kindWarning, "attention · review item, incomplete or stale data"},
+		{kindWarning, "review · review item, incomplete or stale data"},
 	} {
 		glyph := th.glyph(legend.kind)
 		lines = append(lines, hangingWrap("  "+glyph+"  ", 4+ansi.StringWidth(glyph), legend.text, width, plain)...)
 	}
 	return lines
+}
+
+// helpScreenGroup names the group that belongs to the current screen, so a
+// narrow help column starts with the keys the user just asked about.
+func (m Model) helpScreenGroup() string {
+	switch m.ActiveFocus {
+	case FocusRepos, FocusConcerns:
+		return "Repository"
+	case FocusJobs:
+		return "Actions"
+	}
+	return ""
 }
 
 // helpContent is the ? overlay. Its key list is generated from keys(), the
@@ -782,9 +795,23 @@ func (m Model) helpContent() string {
 	header := hangingWrap("", 0, "Keys for "+strings.Join(m.breadcrumb(), crumbSep), width, th.strong.Render)
 
 	if width < 100 {
+		ordered := groups
+		if first := m.helpScreenGroup(); first != "" {
+			ordered = make([]helpGroup, 0, len(groups))
+			for _, g := range groups {
+				if g.title == first {
+					ordered = append(ordered, g)
+				}
+			}
+			for _, g := range groups {
+				if g.title != first {
+					ordered = append(ordered, g)
+				}
+			}
+		}
 		lines := append([]string{}, header...)
 		lines = append(lines, "")
-		for _, g := range groups {
+		for _, g := range ordered {
 			lines = append(lines, helpGroupLines(g, width, keyWidth)...)
 			lines = append(lines, "")
 		}

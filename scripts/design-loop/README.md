@@ -1,6 +1,6 @@
 # Design-loop screen capture
 
-Deterministic captures of the real Bubble Tea model for design review. The demo
+Repeatable captures of the real Bubble Tea model for design review. The demo
 fixture seeds repositories, runs, jobs and runners, and drops every external
 command, so a capture never contacts GitHub or mutates a checkout.
 

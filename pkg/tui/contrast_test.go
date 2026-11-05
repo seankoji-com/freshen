@@ -111,6 +111,19 @@ func TestLightThemeBodyContrast(t *testing.T) {
 	}
 }
 
+// Light progress fills stay visible as non-text graphics (3:1).
+func TestLightProgressFillContrast(t *testing.T) {
+	saved := th
+	t.Cleanup(func() { th = saved })
+	th = newThemeMode(false, true)
+	for _, k := range []statusKind{kindSuccess, kindFailure, kindRunning, kindQueued, kindWarning, kindSkipped, kindUnknown} {
+		fill := th.progressFill(k)
+		if ratio := contrastRatio(fill, "#FFFFFF"); ratio < 3.0 {
+			t.Errorf("light progress fill %s (kind %d) is %.2f:1 on white", fill, k, ratio)
+		}
+	}
+}
+
 // The wide Overview must use the height it is given, not leave half the body
 // empty. This is the defect that opened the design run.
 func TestOverviewWideLayoutUsesSpace(t *testing.T) {

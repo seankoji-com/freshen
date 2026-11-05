@@ -721,7 +721,7 @@ func TestProgressUsesAllJobsAndRealSteps(t *testing.T) {
 	}
 	press(&m, "enter")
 	content := stripped(m.listContent())
-	for _, want := range []string{"PASSED", "RUNNING", "QUEUED", "1/2 steps complete", "Run tests", "self-hosted"} {
+	for _, want := range []string{"passed", "running", "queued", "1/2 steps complete", "Run tests", "self-hosted"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("missing %q in %s", want, content)
 		}
@@ -1018,13 +1018,13 @@ func TestJobStateBadges(t *testing.T) {
 		status jobs.JobStatus
 		want   string
 	}{
-		{jobs.JobRunning, "↻ RUNNING"},
-		{jobs.JobPassed, "✓ PASSED"},
-		{jobs.JobFailed, "✗ FAILED"},
-		{jobs.JobQueued, "◌ QUEUED"},
-		{jobs.JobWaiting, "◌ WAITING"},
-		{jobs.JobCancelled, "⊘ CANCELLED"},
-		{jobs.JobSkipped, "⊘ SKIPPED"},
+		{jobs.JobRunning, "↻ running"},
+		{jobs.JobPassed, "✓ passed"},
+		{jobs.JobFailed, "✗ failed"},
+		{jobs.JobQueued, "◌ queued"},
+		{jobs.JobWaiting, "◌ waiting"},
+		{jobs.JobCancelled, "⊘ cancelled"},
+		{jobs.JobSkipped, "⊘ skipped"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.want, func(t *testing.T) {

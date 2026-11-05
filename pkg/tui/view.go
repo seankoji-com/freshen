@@ -252,9 +252,16 @@ func highlightLogLine(line string) string {
 	line = reURL.ReplaceAllStringFunc(line, render(th.link))
 	line = reQuoted.ReplaceAllStringFunc(line, render(th.logQuoted))
 
-	if strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date") {
+	switch {
+	case strings.Contains(line, "##[error]") || strings.Contains(line, "--- FAIL") || strings.HasPrefix(strings.TrimSpace(line), "FAIL") || strings.Contains(line, "panic:"):
+		line = th.fg(th.red).Render(line)
+	case strings.Contains(line, "##[warning]"):
+		line = th.fg(th.yellow).Render(line)
+	case strings.Contains(line, "##[group]"):
+		line = th.fg(th.blue).Render(line)
+	case strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date"):
 		line = th.fg(th.green).Render(line)
-	} else if strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict") {
+	case strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict"):
 		line = th.fg(th.red).Render(line)
 	}
 

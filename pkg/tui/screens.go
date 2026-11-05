@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 type screenEntry struct {
 	key, title, subtitle string
 	status, item, detail string
+	prs, issues          string
 	index                int
 }
 type actionRun struct {
@@ -182,9 +184,30 @@ func stepSummary(j *jobs.JobItem) (done int, current string) {
 	return done, current
 }
 
-// stateBadge renders a job or run status as glyph, label and colour.
+// stateBadge renders a job or run status as glyph, label and colour. Labels
+// stay lowercase so they read like repository states.
 func stateBadge(s jobs.JobStatus) string {
-	return th.status(jobKind(s), string(s))
+	return th.status(jobKind(s), jobLabel(s))
+}
+
+func jobLabel(s jobs.JobStatus) string {
+	switch s {
+	case jobs.JobPassed:
+		return "passed"
+	case jobs.JobFailed:
+		return "failed"
+	case jobs.JobRunning:
+		return "running"
+	case jobs.JobQueued:
+		return "queued"
+	case jobs.JobWaiting:
+		return "waiting"
+	case jobs.JobCancelled:
+		return "cancelled"
+	case jobs.JobSkipped:
+		return "skipped"
+	}
+	return "unknown"
 }
 func (m Model) countBar(done, total int, noun string, kind statusKind) string {
 	if total == 0 {
@@ -196,6 +219,35 @@ func (m Model) countBar(done, total int, noun string, kind statusKind) string {
 		p.Width = 4
 	}
 	return fmt.Sprintf("%s %d/%d %s complete", p.ViewAs(float64(done)/float64(total)), done, total, noun)
+}
+
+// countCell is one fixed-width PR or issue count. An asterisk marks a count
+// kept from an earlier refresh.
+func countCell(n int, loaded, stale bool) string {
+	if !loaded {
+		return "—"
+	}
+	out := strconv.Itoa(n)
+	if stale {
+		out += "*"
+	}
+	return out
+}
+
+// repoDivergence is the ahead/behind marker for a repository with an upstream.
+func repoDivergence(r *git.RepoItem) string {
+	if !r.HasUpstream {
+		return ""
+	}
+	switch {
+	case r.Ahead > 0 && r.Behind > 0:
+		return fmt.Sprintf("↑%d ↓%d", r.Ahead, r.Behind)
+	case r.Ahead > 0:
+		return fmt.Sprintf("↑%d ahead", r.Ahead)
+	case r.Behind > 0:
+		return fmt.Sprintf("↓%d behind", r.Behind)
+	}
+	return "up to date"
 }
 
 // repoCI names the newest workflow run observed for a repository, so the
@@ -238,7 +290,7 @@ func (m Model) entries() []screenEntry {
 				entries = append(entries, screenEntry{
 					key: r.Path + "/" + r.Name, index: i,
 					status: th.status(kindUnknown, "unknown"),
-					item:   r.Name,
+					item:   r.Name, prs: "—", issues: "—",
 					detail: detail + " · not ranked",
 					title:  r.Name + "  " + th.status(kindUnknown, "counts unknown"), subtitle: detail + " · not ranked",
 				})
@@ -264,33 +316,61 @@ func (m Model) entries() []screenEntry {
 			if r.CountsStale {
 				detail += " · counts from last successful refresh"
 			}
-			entryDetail := detail
-			if len(badges) > 0 {
-				entryDetail = strings.Join(badges, " · ") + " · " + detail
+			reviewLabel := "review"
+			if r.OpenPRsCount > 0 && r.OpenIssuesCount == 0 {
+				reviewLabel = "PRs"
+			} else if r.OpenIssuesCount > 0 && r.OpenPRsCount == 0 {
+				reviewLabel = "issues"
 			}
 			entries = append(entries, screenEntry{
 				key: r.Path + "/" + r.Name, index: i,
-				status: th.status(kindWarning, "review"),
+				status: th.status(kindWarning, reviewLabel),
 				item:   r.Name,
-				detail: entryDetail,
+				prs:    countCell(r.OpenPRsCount, r.HasLoadedCounts, r.CountsStale),
+				issues: countCell(r.OpenIssuesCount, r.HasLoadedCounts, r.CountsStale),
+				detail: detail,
 				title:  r.Name + "  " + strings.Join(badges, "  "), subtitle: detail,
 			})
 		}
 	case FocusRepos:
 		for i, r := range m.Repos {
-			parts := make([]string, 0, 5)
+			base := make([]string, 0, 4)
 			switch {
 			case r.IsNew:
-				parts = append(parts, "not cloned")
+				base = append(base, "not cloned")
 			case r.CurrentBranch != "":
 				branch := r.CurrentBranch
 				if r.DefaultBranch != "" && r.CurrentBranch != r.DefaultBranch {
 					branch += " → " + r.DefaultBranch
 				}
-				parts = append(parts, branch)
+				base = append(base, branch)
 			}
 			if r.HasUnstagedChanges {
-				parts = append(parts, "local changes")
+				base = append(base, "local changes")
+			}
+			if r.LocalMetadataStale {
+				base = append(base, "local metadata from last snapshot")
+			}
+			head := ""
+			if div := repoDivergence(r); div != "" {
+				head = div + " · "
+			}
+			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
+				head += r.StatusMsg + " · "
+			}
+			if ci := m.repoCI(r.Name); ci != "" {
+				head += ci + " · "
+			}
+			detail := head + strings.Join(base, " · ")
+			cardParts := append([]string{}, base...)
+			if div := repoDivergence(r); div != "" {
+				cardParts = append([]string{div}, cardParts...)
+			}
+			if ci := m.repoCI(r.Name); ci != "" {
+				cardParts = append([]string{ci}, cardParts...)
+			}
+			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
+				cardParts = append([]string{r.StatusMsg}, cardParts...)
 			}
 			counts := "counts not loaded"
 			if r.HasLoadedCounts {
@@ -299,21 +379,12 @@ func (m Model) entries() []screenEntry {
 					counts += " · last successful refresh"
 				}
 			}
-			parts = append(parts, counts)
-			if r.LocalMetadataStale {
-				parts = append(parts, "local metadata from last snapshot")
-			}
-			head := ""
-			if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
-				head = r.StatusMsg + " · "
-			}
-			if ci := m.repoCI(r.Name); ci != "" {
-				head += ci + " · "
-			}
-			detail := head + strings.Join(parts, " · ")
+			cardParts = append(cardParts, counts)
 			entries = append(entries, screenEntry{key: r.Path + "/" + r.Name, index: i,
 				status: m.renderStatusBadge(r), item: r.Name, detail: detail,
-				title: r.Name + "  " + m.renderStatusBadge(r), subtitle: strings.Join(parts, " · ")})
+				prs:    countCell(r.OpenPRsCount, r.HasLoadedCounts, r.CountsStale),
+				issues: countCell(r.OpenIssuesCount, r.HasLoadedCounts, r.CountsStale),
+				title:  r.Name + "  " + m.renderStatusBadge(r), subtitle: strings.Join(cardParts, " · ")})
 		}
 	case FocusRunners:
 		for i, r := range m.getMatchingRunners() {
@@ -491,40 +562,48 @@ func (m Model) singleLineList() bool {
 	return true
 }
 
-func (m Model) listColumnLabels() (string, string, string) {
-	switch m.ActiveFocus {
-	case FocusJobs:
-		if m.OpenRun != nil {
-			return "STATUS", "JOB", "PROGRESS · STATE"
-		}
-		if m.QueueView {
-			return "STATUS", "JOB", "RUN · WAITING"
-		}
-		return "STATUS", "RUN", "PROGRESS · TIMING"
-	case FocusRunners:
-		return "STATUS", "RUNNER", "PLATFORM · ASSIGNMENT"
-	case FocusConcerns:
-		return "STATUS", "REPOSITORY", "SIGNAL"
-	}
-	return "STATUS", "REPOSITORY", "BRANCH · COUNTS"
+type tableLayout struct {
+	labels []string
+	widths []int
 }
 
-// listTableWidths splits the list column into status, item and detail columns.
-// The status column is fixed so names and details line up down the table.
-func (m Model) listTableWidths(width int) (status, item, detail int) {
-	status = 11
+func (m Model) tableLayout(width int) tableLayout {
+	inner := max(20, width-2)
+	status := 11
+	itemLabel := "REPOSITORY"
+	detailLabel := "BRANCH · COUNTS"
 	switch m.ActiveFocus {
 	case FocusRepos:
 		status = 12
 	case FocusRunners:
-		status = 13
+		status, itemLabel, detailLabel = 13, "RUNNER", "PLATFORM · ASSIGNMENT"
 	case FocusConcerns:
 		status = 9
+		detailLabel = "SIGNAL"
+	case FocusJobs:
+		itemLabel, detailLabel = "RUN", "PROGRESS · TIMING"
+		if m.OpenRun != nil {
+			itemLabel, detailLabel = "JOB", "PROGRESS · STATE"
+		} else if m.QueueView {
+			itemLabel, detailLabel = "JOB", "RUN · WAITING"
+		}
 	}
-	item = min(44, max(26, width/4))
-	detail = max(8, width-status-item-6)
-	return status, item, detail
+	item := min(44, max(26, width/4))
+	labels := []string{"STATUS", itemLabel}
+	widths := []int{status, item}
+	if m.ActiveFocus == FocusRepos || m.ActiveFocus == FocusConcerns {
+		labels = append(labels, "PRs", "ISSUES")
+		widths = append(widths, 4, 6)
+	}
+	detail := max(8, inner-len(widths)*2)
+	for _, w := range widths {
+		detail -= w
+	}
+	labels = append(labels, detailLabel)
+	widths = append(widths, detail)
+	return tableLayout{labels: labels, widths: widths}
 }
+
 func (m Model) selectionKey() string {
 	if m.ActiveFocus == FocusJobs && m.OpenRun != nil {
 		return m.JobCursor
@@ -582,6 +661,13 @@ func (m Model) visibleEntries() (entries []screenEntry, start, selected int) {
 	return es[start:min(len(es), start+count)], start, selected
 }
 func (m Model) detailVisible() bool { return m.Detail || m.OpenJobID != "" }
+
+// wrapState wraps an empty-state message to the list width instead of letting
+// the frame clip it.
+func wrapState(s string, width int) string {
+	return strings.Join(strings.Split(ansi.Wrap(s, max(1, width), ""), "\n"), "\n")
+}
+
 func (m Model) listContent() string {
 	return m.listContentWidth(max(10, m.Width-2))
 }
@@ -631,7 +717,7 @@ func (m Model) listContentWidth(width int) string {
 		case m.ActiveFocus == FocusRunners && m.IsRunnersLoading:
 			return m.Spinner.View() + " Loading runners…"
 		case m.ActiveFocus == FocusRunners && m.RunnerPermissionDenied:
-			return "Fleet access unavailable. Runners appear here when observed in job assignments.\nRe-authenticate gh with runner read permission, or ask an organization admin."
+			return wrapState("Fleet access unavailable. Runners appear here when observed in job assignments.\nRe-authenticate gh with runner read permission, or ask an organization admin.", width)
 		case m.ActiveFocus == FocusRunners && m.RunnerFetchFailed:
 			return "Runner fetch failed. Press r to retry."
 		case m.ActiveFocus == FocusRunners:
@@ -647,11 +733,15 @@ func (m Model) listContentWidth(width int) string {
 		lines = append(lines, th.warning.Render(coverageWarning), "")
 	}
 	if m.singleLineList() {
-		statusW, itemW, detailW := m.listTableWidths(width)
-		headStatus, headItem, headDetail := m.listColumnLabels()
-		lines = append(lines, "  "+columnHeader([]string{headStatus, headItem, headDetail}, []int{statusW, itemW, detailW}, 2))
+		layout := m.tableLayout(width)
+		lines = append(lines, "  "+columnHeader(layout.labels, layout.widths, 2))
 		for i, e := range es {
-			lines = append(lines, m.tableRow(e, i+start == selected, width, statusW, itemW, detailW))
+			cells := []string{e.status, e.item}
+			if len(layout.widths) == 5 {
+				cells = append(cells, e.prs, e.issues)
+			}
+			cells = append(cells, e.detail)
+			lines = append(lines, m.tableRow(e, i+start == selected, width, layout, cells))
 		}
 		return strings.Join(lines, "\n")
 	}
@@ -670,14 +760,23 @@ func (m Model) listContentWidth(width int) string {
 
 // tableRow is one dense list row. The selected row drops nested colours so the
 // surface highlight and text contrast survive the whole row.
-func (m Model) tableRow(e screenEntry, selected bool, width, statusW, itemW, detailW int) string {
-	w := max(8, width)
-	if selected {
-		body := padTo(ansi.Strip(e.status), statusW) + "  " + padTo(ansi.Strip(e.item), itemW) + "  " + padTo(ansi.Strip(e.detail), detailW)
-		return th.cursor.Render("› ") + th.rowSelected.Render(padTo(body, max(0, w-2)))
+func (m Model) tableRow(e screenEntry, selected bool, width int, layout tableLayout, cells []string) string {
+	var body strings.Builder
+	for i, cell := range cells {
+		if i > 0 {
+			body.WriteString("  ")
+		}
+		if selected {
+			cell = ansi.Strip(cell)
+		}
+		body.WriteString(padTo(cell, layout.widths[i]))
 	}
-	return "  " + padTo(e.status, statusW) + "  " + padTo(e.item, itemW) + "  " + th.dim.Render(fitLine(e.detail, detailW))
+	if selected {
+		return th.cursor.Render("› ") + th.rowSelected.Render(padTo(body.String(), max(0, width-2)))
+	}
+	return "  " + body.String()
 }
+
 func fitFrame(content string, width, height int) string {
 	lines := strings.Split(content, "\n")
 	if len(lines) > height {

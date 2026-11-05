@@ -364,6 +364,9 @@ type RepoItem struct {
 	CurrentBranch      string
 	OriginalBranch     string
 	DefaultBranch      string
+	Ahead              int  // commits ahead of the upstream, when known
+	Behind             int  // commits behind the upstream, when known
+	HasUpstream        bool // false when the branch has no upstream
 	HasUnstagedChanges bool
 	ExistingPRURL      string
 	OpenIssuesCount    int
@@ -1311,6 +1314,28 @@ type LocalCheckout struct {
 	IsRepo        bool
 	CurrentBranch string // "" when it could not be read
 	DefaultBranch string // "" when it could not be read; local tiers only
+	Ahead         int    // commits ahead of the upstream, when known
+	Behind        int    // commits behind the upstream, when known
+	HasUpstream   bool
+}
+
+// readAheadBehind reads the divergence from the branch's upstream. A missing
+// upstream is not an error; the caller simply has no divergence to show.
+func readAheadBehind(ctx context.Context, path string) (ok bool, ahead, behind int) {
+	lines, readErr := readGitLines(ctx, path, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+	if readErr != "" || len(lines) == 0 {
+		return false, 0, 0
+	}
+	fields := strings.Fields(lines[0])
+	if len(fields) != 2 {
+		return false, 0, 0
+	}
+	a, errA := strconv.Atoi(fields[0])
+	b, errB := strconv.Atoi(fields[1])
+	if errA != nil || errB != nil {
+		return false, 0, 0
+	}
+	return true, a, b
 }
 
 // ReadLocalCheckout reads whether path is a checkout and, if so, its checked
@@ -1335,6 +1360,7 @@ func ReadLocalCheckout(ctx context.Context, path string) (LocalCheckout, error) 
 	if checkout.DefaultBranch, err = readDefaultBranch(ctx, path, false); err != nil {
 		failed = append(failed, "default branch ("+readFailure(err)+")")
 	}
+	checkout.HasUpstream, checkout.Ahead, checkout.Behind = readAheadBehind(ctx, path)
 	if len(failed) > 0 {
 		return checkout, fmt.Errorf("could not read the %s", strings.Join(failed, " or the "))
 	}

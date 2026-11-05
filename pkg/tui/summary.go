@@ -300,9 +300,9 @@ func (m Model) summaryContent(width, height int) string {
 func healthLabel(k statusKind) string {
 	switch k {
 	case kindFailure:
-		return "attention"
+		return "failures"
 	case kindWarning:
-		return "partial"
+		return "review"
 	case kindRunning:
 		return "working"
 	case kindSuccess:
@@ -320,16 +320,18 @@ func (m Model) summaryTiles(s orgSummary) []summaryTile {
 	loading := m.IsOrgSyncing || m.IsJobQueueLoading || m.IsRunnersLoading
 	repos := summaryTile{label: "Repositories", kind: summaryProblemKind(s.repoProblems)}
 	switch {
-	case loading && len(m.Repos) == 0:
-		repos.figure, repos.detail, repos.kind = "Loading", "reading workspace and GitHub", kindRunning
 	case m.OrgRefreshFailed && len(m.Repos) == 0:
 		repos.figure, repos.detail, repos.kind = "Unavailable", "press r to retry", kindWarning
+	case loading && len(m.Repos) == 0:
+		repos.figure, repos.detail, repos.kind = "Loading", "reading workspace and GitHub", kindRunning
 	default:
 		repos.figure = fmt.Sprintf("%d local · %d not cloned", s.localRepos, s.newRepos)
 		repos.detail = attentionPhrase(s.repoProblems)
 		repos.tallDetail = fmt.Sprintf("%d with local changes · %d archived", s.dirty, s.archived)
 		if m.OrgRefreshFailed {
-			repos.kind = kindWarning
+			if s.repoProblems == 0 {
+				repos.kind = kindWarning
+			}
 			repos.tallDetail = "repository snapshot unavailable · press r to retry"
 		}
 	}
@@ -338,13 +340,17 @@ func (m Model) summaryTiles(s orgSummary) []summaryTile {
 	switch {
 	case m.TargetOrg == "":
 		actions.figure, actions.detail, actions.kind = "Not configured", "set a GitHub owner", kindUnknown
-	case loading && len(m.JobQueue) == 0:
-		actions.figure, actions.detail, actions.kind = "Loading", "reading runs and jobs", kindRunning
 	case m.JobQueueFetchFailed && len(m.JobQueue) == 0:
 		actions.figure, actions.detail, actions.kind = "Actions data unavailable", "press r to retry", kindWarning
+	case loading && len(m.JobQueue) == 0:
+		actions.figure, actions.detail, actions.kind = "Loading", "reading runs and jobs", kindRunning
 	case m.JobQueueFetchFailed:
 		actions.figure = fmt.Sprintf("Known: %d running · %d queued", s.runningRuns, s.queuedRuns)
 		actions.detail, actions.kind = "Actions data incomplete", kindWarning
+		if s.failedRuns > 0 {
+			actions.detail = fmt.Sprintf("%d recent failures · data incomplete", s.failedRuns)
+			actions.kind = kindFailure
+		}
 	default:
 		actions.figure = fmt.Sprintf("%d running · %d queued", s.runningRuns, s.queuedRuns)
 		actions.detail = countPhrase(s.failedRuns, "recent failure", "recent failures")
@@ -359,10 +365,10 @@ func (m Model) summaryTiles(s orgSummary) []summaryTile {
 		runners.figure = fmt.Sprintf("%d observed busy", s.runnerBusy)
 		runners.detail, runners.kind = "fleet totals unavailable", kindUnknown
 		runners.tallDetail = "showing observed assignments only"
-	case loading && len(m.Runners) == 0:
-		runners.figure, runners.detail, runners.kind = "Loading", "reading runner fleet", kindRunning
 	case m.RunnerFetchFailed && len(m.Runners) == 0:
 		runners.figure, runners.detail, runners.kind = "Runner data unavailable", "press r to retry", kindWarning
+	case loading && len(m.Runners) == 0:
+		runners.figure, runners.detail, runners.kind = "Loading", "reading runner fleet", kindRunning
 	case m.RunnerFetchFailed:
 		runners.figure = fmt.Sprintf("Known: %d busy · %d idle", s.runnerBusy, s.runnerIdle)
 		runners.detail, runners.kind = "showing last observed state", kindWarning
@@ -460,6 +466,7 @@ func (m Model) attentionPanel(s orgSummary, width, limit int) string {
 
 func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 	var rows []string
+	seenRuns := map[string]bool{}
 	for _, run := range m.actionRuns() {
 		if run.run.Status != jobs.JobRunning && run.run.Status != jobs.JobWaiting && run.run.Status != jobs.JobQueued {
 			continue
@@ -467,7 +474,7 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 		title := runSummaryName(run.run)
 		var detail string
 		switch {
-		case width < 55 && (run.run.Status == jobs.JobRunning || run.run.Status == jobs.JobQueued || run.run.Status == jobs.JobWaiting):
+		case width < 55:
 			if run.run.Status == jobs.JobRunning {
 				if len(run.jobs) == 0 {
 					detail = "jobs not reported"
@@ -488,6 +495,7 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 			}
 		}
 		rows = append(rows, joinEnds(th.status(jobKind(run.run.Status), title), th.dim.Render(detail), width))
+		seenRuns[runKey(run.run)] = true
 	}
 	for _, r := range m.Runners {
 		if r.Status != jobs.RunnerRunning {
@@ -495,6 +503,10 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 		}
 		detail := r.Platform
 		if j := findJobForRunner(r, m.JobQueue); j != nil {
+			// A runner assigned to a run already listed is the same work item.
+			if seenRuns[fmt.Sprintf("%s/%d", j.Repo, j.RunID)] {
+				continue
+			}
 			detail = "running " + j.Name
 		}
 		rows = append(rows, joinEnds(th.status(kindRunning, r.Name), th.dim.Render(detail), width))
@@ -519,10 +531,23 @@ func (m Model) inFlightPanel(_ orgSummary, width, limit int) string {
 }
 func (m Model) repoHealthPanel(s orgSummary, width, limit int) string {
 	lines := []string{panelHeader("Repository health", s.repositories, width)}
-	for i, r := range m.Repos {
+	repos := append([]*git.RepoItem(nil), m.Repos...)
+	rank := func(r *git.RepoItem) int {
+		switch {
+		case r.Status == git.StatusError || r.Status == git.StatusRebaseConflict:
+			return 0
+		case r.HasUnstagedChanges || r.LocalMetadataStale || r.CountsStale:
+			return 1
+		case r.Behind > 0 || r.Ahead > 0:
+			return 2
+		}
+		return 3
+	}
+	sort.SliceStable(repos, func(i, j int) bool { return rank(repos[i]) < rank(repos[j]) })
+	for i, r := range repos {
 		if i >= max(1, limit-2) {
-			if len(m.Repos) > i {
-				lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more repositories", len(m.Repos)-i)))
+			if len(repos) > i {
+				lines = append(lines, th.dim.Render(fmt.Sprintf("+ %d more repositories", len(repos)-i)))
 			}
 			break
 		}
@@ -544,6 +569,9 @@ func (m Model) repoHealthPanel(s orgSummary, width, limit int) string {
 			detail += sep + "counts not loaded"
 		}
 		meta := label
+		if div := repoDivergence(r); div != "" {
+			meta += "  " + div
+		}
 		if detail != "" && detail != label {
 			meta += "  " + detail
 		}
@@ -802,12 +830,16 @@ func (m Model) summaryAttentionRows(s orgSummary, width, limit int) string {
 		rows = append(rows, summaryFit(th.tileLabel.Render(fmt.Sprintf("FAILURES (%d)", len(fails))), width, 1))
 		for i, a := range fails {
 			if len(rows) >= limit-1 {
-				rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", len(fails)-i)), width, 1))
+				rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", len(fails)-i+len(review))+"  use 1–4 for details"), width, 1))
 				return strings.Join(rows, "\n")
 			}
 			add(a)
 		}
-		if len(review) > 0 && len(rows) < limit-1 {
+		if len(review) > 0 && len(rows) >= limit-1 {
+			rows = append(rows, summaryFit(th.dim.Render(fmt.Sprintf("+ %d more", len(review))+"  use 1–4 for details"), width, 1))
+			return strings.Join(rows, "\n")
+		}
+		if len(review) > 0 {
 			rows = append(rows, summaryFit(th.tileLabel.Render(fmt.Sprintf("REVIEW (%d)", len(review))), width, 1))
 			shown := 0
 			for _, a := range review {

@@ -19,11 +19,19 @@ func (m Model) showPreview() bool {
 	return m.ActiveFocus != FocusOverview
 }
 
+// previewSplit is the one width calculation shared by rendering and mouse
+// hit-testing.
+func previewSplit(width int) (listW, previewW, gap int) {
+	inner := max(20, width-2)
+	gap = 3
+	listW = inner * 3 / 5
+	previewW = inner - listW - gap
+	return listW, previewW, gap
+}
+
 func (m Model) listWithPreview() string {
 	inner := max(20, m.Width-2)
-	gap := 3
-	listW := inner * 3 / 5
-	previewW := inner - listW - gap
+	listW, previewW, gap := previewSplit(m.Width)
 	if previewW < 28 {
 		return m.listContentWidth(inner)
 	}
@@ -57,7 +65,8 @@ func (m Model) previewPanel(width, height int) string {
 	}
 	lines = append([]string{rule("PREVIEW", width)}, lines...)
 	if len(lines) > height {
-		lines = lines[:height]
+		lines = lines[:max(1, height-1)]
+		lines = append(lines, th.dim.Render("…"))
 	}
 	for i := range lines {
 		lines[i] = fitLine(lines[i], width)
@@ -90,6 +99,9 @@ func (m Model) repoPreview(e screenEntry) []string {
 	}
 	r := m.Repos[e.index]
 	kind, label := repoKind(r.Status)
+	if r.IsNew {
+		kind, label = kindUnknown, "not cloned"
+	}
 	lines := []string{
 		th.strong.Render(r.Name) + "  " + th.status(kind, label),
 	}
@@ -106,8 +118,20 @@ func (m Model) repoPreview(e screenEntry) []string {
 	} else {
 		lines = append(lines, th.dim.Render("review counts not loaded"))
 	}
+	if div := repoDivergence(r); div != "" {
+		lines = append(lines, th.dim.Render("upstream "+div))
+	}
 	if r.HasUnstagedChanges {
 		lines = append(lines, th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
+	}
+	if _, label := repoKind(r.Status); r.StatusMsg != "" && !strings.EqualFold(r.StatusMsg, label) {
+		lines = append(lines, th.warning.Render(statusGlyphs[kindWarning]+" "+r.StatusMsg))
+	}
+	if r.CountsStale {
+		lines = append(lines, th.warning.Render("review counts from an earlier refresh"))
+	}
+	if r.LocalMetadataStale {
+		lines = append(lines, th.warning.Render("local metadata from an earlier snapshot"))
 	}
 	if len(r.PRsList) > 0 {
 		lines = append(lines, "", th.tileLabel.Render(fmt.Sprintf("Open PRs (%d)", len(r.PRsList))))
@@ -134,6 +158,8 @@ func (m Model) repoPreview(e screenEntry) []string {
 		lines = append(lines, "", th.warning.Render("Branches not read since the checkout moved"))
 	case d.BranchesErr != "" || d.WorktreesErr != "" || d.StatusErr != "":
 		lines = append(lines, "", th.warning.Render("Some branch reads failed · enter to retry"))
+	case r.IsNew:
+		lines = append(lines, "", th.dim.Render("No checkout to read branches."))
 	case len(d.LocalBranches)+len(d.Worktrees)+len(d.ChangedFiles) == 0:
 		lines = append(lines, "", th.dim.Render("Branches load when the detail opens."))
 	default:
@@ -159,11 +185,9 @@ func (m Model) repoPreview(e screenEntry) []string {
 	}
 	if len(r.Logs) > 0 {
 		lines = append(lines, "", th.tileLabel.Render("Last sync"))
-		for i, logLine := range r.Logs {
-			if i >= 3 {
-				break
-			}
-			lines = append(lines, th.dim.Render(fitLine(logLine, 60)))
+		start := max(0, len(r.Logs)-3)
+		for i := start; i < len(r.Logs); i++ {
+			lines = append(lines, th.dim.Render(fitLine(r.Logs[i], 60)))
 		}
 	}
 	return lines
@@ -177,6 +201,11 @@ func (m Model) jobPreview(e screenEntry) []string {
 		}
 		j := jobsForRun[e.index]
 		lines := []string{th.strong.Render(strings.TrimPrefix(j.Name, j.Repo+" / ")) + "  " + stateBadge(j.Status)}
+		if j.Run != nil && j.Run.JobsError != "" {
+			lines = append(lines, th.warning.Render("job details unavailable: "+j.Run.JobsError))
+		} else if j.Run != nil && j.Run.JobsStale {
+			lines = append(lines, th.warning.Render("cached jobs from the previous poll; refreshing"))
+		}
 		if j.RunnerName != "" {
 			lines = append(lines, th.dim.Render("on "+j.RunnerName))
 		} else {
@@ -232,6 +261,11 @@ func (m Model) jobPreview(e screenEntry) []string {
 	if ar.run.Title != "" {
 		lines = append(lines, th.dim.Render(ar.run.Title))
 	}
+	if ar.run.JobsError != "" {
+		lines = append(lines, th.warning.Render("job details unavailable: "+ar.run.JobsError))
+	} else if ar.run.JobsStale {
+		lines = append(lines, th.warning.Render("cached jobs from the previous poll; refreshing"))
+	}
 	lines = append(lines, "", th.tileLabel.Render("Jobs"))
 	if len(ar.jobs) == 0 {
 		lines = append(lines, th.dim.Render("Enter loads this run's jobs."))
@@ -267,5 +301,3 @@ func (m Model) runnerPreview(e screenEntry) []string {
 	}
 	return lines
 }
-
-// repoPreviewKind is shared by the repository preview and its detail header.

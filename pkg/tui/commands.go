@@ -264,7 +264,7 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 						repos = append(repos, unreadLocalRepo(name, path, readErr))
 					}
 				case checkout.IsRepo:
-					item := &git.RepoItem{Name: name, Path: path, CurrentBranch: checkout.CurrentBranch, OriginalBranch: checkout.CurrentBranch, DefaultBranch: checkout.DefaultBranch, Status: git.StatusPending, Logs: []string{}}
+					item := &git.RepoItem{Name: name, Path: path, CurrentBranch: checkout.CurrentBranch, OriginalBranch: checkout.CurrentBranch, DefaultBranch: checkout.DefaultBranch, Ahead: checkout.Ahead, Behind: checkout.Behind, HasUpstream: checkout.HasUpstream, Status: git.StatusPending, Logs: []string{}}
 					if readErr != nil {
 						keepKnownBranches(item, previousByPath[path])
 					}
@@ -370,6 +370,7 @@ func (m Model) loadOrgReposCmd(autoSync bool, generation uint64, previous []*git
 			if checkout.IsRepo {
 				item.CurrentBranch = checkout.CurrentBranch
 				item.OriginalBranch = checkout.CurrentBranch
+				item.Ahead, item.Behind, item.HasUpstream = checkout.Ahead, checkout.Behind, checkout.HasUpstream
 				item.DefaultBranch = checkout.DefaultBranch
 				if readErr != nil {
 					probeFailures = append(probeFailures, fmt.Sprintf("%s: %v", localDir, readErr))
@@ -878,6 +879,7 @@ func (m *Model) loadRepoDetails() tea.Cmd {
 			if checkout.IsRepo {
 				if repo.CurrentBranch == "" {
 					repo.CurrentBranch = checkout.CurrentBranch
+					repo.Ahead, repo.Behind, repo.HasUpstream = checkout.Ahead, checkout.Behind, checkout.HasUpstream
 				}
 				if repo.DefaultBranch == "" {
 					repo.DefaultBranch = checkout.DefaultBranch

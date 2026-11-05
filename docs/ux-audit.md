@@ -83,7 +83,7 @@ Reviewed on 5 November 2026 against `689c0c3`.
 |---|---|
 | The Overview left most of a 120×30 body empty, gave three thin text columns equal weight, and truncated operational statements at wider sizes | A priority-led dashboard: four tiles with figures, status and (on tall terminals) a second detail line; grouped `FAILURES`/`REVIEW` rows; an in-flight desk; repository health and recent runs; a snapshot/key block only when there is room. Narrow terminals get a 2×2 or stacked layout |
 | Lists were two-line cards at every width, with no column headings, full-row selection or use for the right half of a wide terminal | Lists become one-row tables from 100 columns with aligned item/detail columns; from 140 columns a read-only preview of the selected repository, run, job or runner sits beside the list. Enter still opens the full screen |
-| The selected row highlighted only its text, and muted/failure/running text on the selection surface fell below 4.5:1 | Selection uses a full-row surface and a left accent; the surface was darkened and muted sage lightened so every body colour clears WCAG AA. `TestThemeBodyContrast` measures the palette |
+| The selected row highlighted only its text, and muted/failure/running text on the selection surface fell below 4.5:1 | Selection uses a full-row surface and a left accent; the surface was darkened and muted sage lightened so every body colour clears WCAG AA against the dark capture background, with a separate light-palette test. `TestThemeBodyContrast` measures the palette |
 | A loading repository snapshot rendered checked `0 need attention` and `0 open PRs`; a degraded snapshot's repository tile kept its success check | Loading tiles and panels say what they are reading; degraded tiles carry the warning and name the unavailable snapshot |
 | `NO_COLOR` dropped the reverse-video selection because Lip Gloss selected the Ascii profile, although it kept the colourless glyphs and words | `NO_COLOR` selects the ANSI attribute profile, so bold, underline and reverse survive while colour stays off |
 | Tabs at very narrow widths collapsed to single letters with no explanation, and the old minimum rendered a clipped frame | The full chrome now starts at 40×12 with two-letter tab labels; below that a resize notice names the supported size and the quit key |
@@ -125,6 +125,30 @@ The panel repair added tests for column alignment, status-aware bars, Actions
 recency, archived counts, CI state, the concerns tab, push confirmation detail,
 light-theme contrast, and the read-only preview. `go build ./...`,
 `go test -race ./...` and `make lint` pass locally.
+
+### Review and panel repair
+
+Reviewed on 5 November 2026 after code review and the first panel.
+
+| Finding | Change |
+|---|---|
+| Repository and concern tables still buried PR/issue counts inside the detail text, and had no ahead/behind signal | Tables have fixed `PRs` and `ISSUES` columns; `ReadLocalCheckout` records ahead/behind from the upstream and the table/preview/health show `↑2 ↓1`, `↓3 behind` or `up to date` |
+| Progress bars in the light palette used the dark fills | `progressFill` selects light-theme bar colours; a test requires 3:1 against white |
+| A push confirmation on the default branch looked runnable | It warns that Freshen will refuse, hides the confirm hint, and `executeAction` refuses before starting work |
+| A confirmation that does not fit the terminal still advertised Enter | The status row says to resize and the footer offers only cancel/quit |
+| Actions and Runners used uppercase status words while repositories used lowercase | All status labels are lowercase (`running`, `passed`, `queued`, `busy`, `offline`) |
+| The CI signal and failure reason disappeared from the two-line narrow layout | The card subtitle leads with the failure message and CI run before branch and counts |
+| Concerns marked every ranked row `review` | The status column says `PRs` or `issues` for single-signal rows |
+| A tight run/job list did not advertise its way back | `esc back` appears in the footer on run and job lists |
+| ISO timestamps and `--- FAIL` lines were unstyled | Log highlighting covers ISO timestamps, `##[error]`, `##[warning]`, `##[group]`, `--- FAIL`, bare `FAIL` and panics |
+| Narrow help put the current screen's keys last | Narrow help starts with the current screen's group |
+| Preview cut its last section without a cue | A clipped preview ends with `…`; job previews disclose cached or unavailable job details |
+| Denied fleet text clipped at 40 columns | Empty-state messages wrap to the list width |
+| Loading tiles could hide an already-known failure | Fetch failures take precedence over loading; known failure counts remain on the tile |
+
+The screenshot was regenerated at the final layout. `go build ./...`,
+`GOTOOLCHAIN=go1.26.5 make lint` and `GIT_CONFIG_GLOBAL=/dev/null
+GIT_CONFIG_NOSYSTEM=1 go test -race -count=1 ./...` pass locally.
 
 ## Verification
 

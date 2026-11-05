@@ -90,6 +90,9 @@ func (m Model) menuContent() string {
 					branch := target.CurrentBranch
 					base := target.DefaultBranch
 					detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
+					if branch == base {
+						detail += "\nThis is the default branch; Freshen will refuse to raise a PR."
+					}
 					if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
 						detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
 					} else {
@@ -201,6 +204,11 @@ func (m *Model) executeAction(id string) tea.Cmd {
 		return m.startSyncCmd([]*git.RepoItem{m.ActionTarget}, false, false)
 	}
 	target := m.ActionTarget
+	if id == "push" && target != nil && target.CurrentBranch == target.DefaultBranch {
+		m.setToast("Cannot raise a PR from the default branch. Switch to a feature branch first.", 2)
+		m.PendingAction = ""
+		return nil
+	}
 	url := m.ActionURL
 	dir := m.TargetDir
 	ctx := m.ctx
