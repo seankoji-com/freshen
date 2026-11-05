@@ -176,6 +176,9 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"󰄬 Switched branch to 'fix/error-handling'.", "201;139"},
 		{"󰀪 git merge --abort failed", "245;158;11"},
 		{"Pull failed: conflict", "240;113;120"},
+		{"Tests: 1 failed, 20 passed", "240;113;120"},
+		{"Automatic merge failed; fix conflicts", "240;113;120"},
+		{"error: HTTP 403", "240;113;120"},
 		{"󰅙 something happened", "240;113;120"},
 	}
 	for _, tc := range cases {
@@ -188,6 +191,8 @@ func TestLogSeverityClassification(t *testing.T) {
 		"Starting sync for conflict-resolver",
 		"Branch: fix/error-handling | Default: main",
 		"Committing and pushing branch 'fix/panic-recovery'",
+		"Branch: conflict | Default: main",
+		"Starting sync for panic",
 	} {
 		if out := highlightLogLine(neutral); strings.Contains(out, "240;113;120") {
 			t.Errorf("neutral line %q rendered as failure: %q", neutral, out)

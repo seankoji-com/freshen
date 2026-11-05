@@ -91,8 +91,12 @@ func (m *Model) updateViewport() {
 			issueLink := Hyperlink(th.issue.Render(countPhrase(item.OpenIssuesCount, "open issue", "open issues")), repoURL+"/issues")
 			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
+		branchPart := branchLink
+		if div := repoDivergence(item); div != "" && m.Width >= 60 {
+			branchPart += th.dim.Render(sep) + th.dim.Render(div)
+		}
 		status := m.renderStatusBadge(item)
-		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchLink, th.dim.Render(sep), status)
+		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, th.dim.Render(sep), status)
 		fmt.Fprintf(&sb, " %s", counts)
 		extra := ""
 		if !item.IsNew && item.DefaultBranch == "" {
@@ -101,7 +105,9 @@ func (m *Model) updateViewport() {
 			extra = item.StatusMsg
 		}
 		if extra != "" {
-			sb.WriteString("\n " + th.dim.Render(extra))
+			for _, line := range strings.Split(ansi.Wrap(extra, max(1, m.Viewport.Width-2), ""), "\n") {
+				sb.WriteString("\n  " + th.dim.Render(line))
+			}
 		}
 		if item.HasUnstagedChanges {
 			sb.WriteString("\n " + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
@@ -268,7 +274,7 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙"):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reErrorStart.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))

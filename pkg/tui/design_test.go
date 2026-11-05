@@ -165,6 +165,21 @@ func TestRepositoryCIAlias(t *testing.T) {
 	}
 }
 
+// Repository detail headers keep the ahead/behind signal at normal widths.
+func TestRepositoryDetailHeaderShowsDivergence(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+	m.ActiveFocus = FocusRepos
+	m.SelectedIndex = 0
+	m.ScreenCursor[FocusRepos] = m.Repos[0].Path + "/" + m.Repos[0].Name
+	m.Detail = true
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m.updateViewport()
+	if view := stripped(m.Viewport.View()); !strings.Contains(view, "↑2 ↓1") {
+		t.Fatalf("repository detail header lost divergence:\n%s", view)
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()

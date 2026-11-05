@@ -75,14 +75,15 @@ func backoffInterval(base time.Duration, consecutiveErrors int) time.Duration {
 
 // --- Log highlighting patterns (styles live in theme.go) ---
 var (
-	reFail      = regexp.MustCompile(`^FAIL\b`)
-	rePass      = regexp.MustCompile(`\bPASS\b`)
-	reOK        = regexp.MustCompile(`^\s*ok\b`)
-	reErrorWord = regexp.MustCompile(`(?i)(?:^|[ :])(error|failed|failure|conflict|panic)(?::|\s|$)`)
-	reTimestamp = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
-	reCmd       = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
-	reURL       = regexp.MustCompile(`https?://[^\s]+`)
-	reQuoted    = regexp.MustCompile(`'[^']+'`)
+	reFail       = regexp.MustCompile(`^FAIL\b`)
+	rePass       = regexp.MustCompile(`\bPASS\b`)
+	reOK         = regexp.MustCompile(`^\s*ok\b`)
+	reErrorStart = regexp.MustCompile(`(?i)^(error|failed|failure|conflict|panic)(?::|\s)`)
+	reErrorWord  = regexp.MustCompile(`(?i)(?:^|\s)(failed|failure)(?:[,;:]|\s|$)`)
+	reTimestamp  = regexp.MustCompile(`\[\d{2}:\d{2}:\d{2}\]|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b`)
+	reCmd        = regexp.MustCompile(`\b(git pull|git push|git fetch|git rebase|git checkout|git stash|git add|gh pr create|gh pr list|gh repo list|go test|go build|shellcheck)\b`)
+	reURL        = regexp.MustCompile(`https?://[^\s]+`)
+	reQuoted     = regexp.MustCompile(`'[^']+'`)
 )
 
 // --- Messages for Bubble Tea Update Loop ---
