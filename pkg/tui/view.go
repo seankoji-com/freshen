@@ -61,21 +61,22 @@ func (m *Model) updateViewport() {
 		}
 		repoLink := Hyperlink(th.section.Render(ghName), repoURL)
 
+		sep := "  ·  "
+		if m.Width < 60 {
+			sep = " · "
+		}
 		branchDetail := "not cloned"
 		if !item.IsNew {
 			switch {
 			case item.CurrentBranch == "":
 				branchDetail = "unread"
-			case m.Width < 80:
-				branchDetail = item.CurrentBranch
+			case m.Width >= 100 && item.DefaultBranch != "":
+				branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+				if item.CurrentBranch != item.DefaultBranch {
+					branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+				}
 			default:
 				branchDetail = item.CurrentBranch
-				if item.DefaultBranch != "" {
-					branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
-					if item.CurrentBranch != item.DefaultBranch {
-						branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
-					}
-				}
 			}
 		}
 		branchLabel := "branch " + branchDetail
@@ -91,18 +92,19 @@ func (m *Model) updateViewport() {
 			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
 		status := m.renderStatusBadge(item)
-		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) && m.Width >= 60 {
-			status += th.dim.Render(" · " + item.StatusMsg)
-		}
-		sep := th.dim.Render("  ·  ")
-		branchPart := branchLink
-		if div := repoDivergence(item); div != "" && m.Width >= 60 {
-			branchPart += sep + th.dim.Render(div)
-		}
-		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchPart, sep, status)
+		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchLink, th.dim.Render(sep), status)
 		fmt.Fprintf(&sb, " %s", counts)
+		extra := ""
+		if !item.IsNew && item.DefaultBranch == "" {
+			extra = "default branch unread; press r to refresh"
+		} else if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
+			extra = item.StatusMsg
+		}
+		if extra != "" {
+			sb.WriteString("\n " + th.dim.Render(extra))
+		}
 		if item.HasUnstagedChanges {
-			sb.WriteString(sep + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
+			sb.WriteString("\n " + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
 		}
 		sb.WriteString("\n\n")
 
@@ -266,7 +268,7 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || strings.Contains(classify, "󰅙"):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙"):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
@@ -274,7 +276,7 @@ func highlightLogLine(line string) string {
 		return th.fg(th.blue).Render(ansi.Strip(line))
 	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || reOK.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case reErrorWord.MatchString(classify):
+	case reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorWord.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	}
 

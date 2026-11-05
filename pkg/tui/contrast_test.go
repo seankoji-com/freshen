@@ -169,6 +169,9 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"ok  github.com/acme/beta/errors 0.02s", "201;139"},
 		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/conflict 0.03s", "201;139"},
 		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/errors 0.03s", "201;139"},
+		{"--- PASS: TestCases/FAIL (0.00s)", "201;139"},
+		{"ok  github.com/acme/FAIL 0.10s", "201;139"},
+		{"--- FAIL: TestCases/PASS (0.00s)", "240;113;120"},
 		{"--- PASS: TestParse_error", "201;139"},
 		{"󰄬 Switched branch to 'fix/error-handling'.", "201;139"},
 		{"󰀪 git merge --abort failed", "245;158;11"},
@@ -179,6 +182,15 @@ func TestLogSeverityClassification(t *testing.T) {
 		out := highlightLogLine(tc.line)
 		if !strings.Contains(out, tc.colour) {
 			t.Errorf("%q rendered %q, want colour %s", tc.line, out, tc.colour)
+		}
+	}
+	for _, neutral := range []string{
+		"Starting sync for conflict-resolver",
+		"Branch: fix/error-handling | Default: main",
+		"Committing and pushing branch 'fix/panic-recovery'",
+	} {
+		if out := highlightLogLine(neutral); strings.Contains(out, "240;113;120") {
+			t.Errorf("neutral line %q rendered as failure: %q", neutral, out)
 		}
 	}
 }
