@@ -59,6 +59,10 @@ func (m *Model) updateViewport() {
 		if ghName == "" {
 			ghName = item.Name
 		}
+		avail := max(1, m.Viewport.Width)
+		if ansi.StringWidth(ghName) > max(1, avail-2) {
+			ghName = ansi.Truncate(ghName, max(1, avail-2), "…")
+		}
 		repoLink := Hyperlink(th.section.Render(ghName), repoURL)
 
 		sep := "  ·  "
@@ -83,28 +87,32 @@ func (m *Model) updateViewport() {
 		if m.Width < 60 {
 			branchLabel = branchDetail
 		}
-		branchLink := Hyperlink(branchLabel, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
-
 		counts := "PR and issue counts not loaded"
 		if item.HasLoadedCounts {
 			prLink := Hyperlink(th.pr.Render(countPhrase(item.OpenPRsCount, "open PR", "open PRs")), repoURL+"/pulls")
 			issueLink := Hyperlink(th.issue.Render(countPhrase(item.OpenIssuesCount, "open issue", "open issues")), repoURL+"/issues")
 			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
-		branchPart := branchLink
-		if div := repoDivergence(item); div != "" && m.Width >= 60 {
-			branchPart += th.dim.Render(sep) + th.dim.Render(div)
+		div := ""
+		if m.Width >= 60 {
+			div = repoDivergence(item)
+		}
+		divPart := ""
+		if div != "" {
+			divPart = th.dim.Render(sep) + th.dim.Render(div)
 		}
 		status := m.renderStatusBadge(item)
-		if m.Viewport.Width < 40 {
-			fmt.Fprintf(&sb, " %s\n %s\n %s\n", repoLink, branchPart, status)
+		fixed := 1 + ansi.StringWidth(repoLink) + 2*ansi.StringWidth(sep) + ansi.StringWidth(status)
+		budget := avail - fixed - ansi.StringWidth(divPart)
+		if m.Width >= 60 && budget >= 8 {
+			branchText := ansi.Truncate(branchLabel, budget, "…")
+			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
+			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, divPart, th.dim.Render(sep)+status)
 		} else {
-			budget := m.Viewport.Width - 1 - ansi.StringWidth(repoLink) - 2*ansi.StringWidth(sep) - ansi.StringWidth(status)
-			if budget < 8 {
-				budget = 8
-			}
-			branchPart = fitLine(branchPart, budget)
-			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, th.dim.Render(sep), status)
+			branchBudget := max(1, avail-2-ansi.StringWidth(divPart))
+			branchText := ansi.Truncate(branchLabel, branchBudget, "…")
+			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
+			fmt.Fprintf(&sb, " %s\n %s%s\n %s\n", repoLink, branchPart, divPart, fitLine(status, avail-1))
 		}
 		fmt.Fprintf(&sb, " %s", counts)
 		var extras []string
@@ -284,16 +292,18 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || reErrorStart.MatchString(classify):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[group]"):
 		return th.fg(th.blue).Render(ansi.Strip(line))
-	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || reOK.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
+	case strings.HasPrefix(classify, "--- PASS") || reOK.MatchString(classify):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case strings.Contains(classify, "panic:") || reErrorWord.MatchString(classify):
+	case reErrorWord.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
+	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
+		return th.fg(th.green).Render(ansi.Strip(line))
 	}
 
 	render := func(style lipgloss.Style) func(string) string {
