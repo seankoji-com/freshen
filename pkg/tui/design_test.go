@@ -197,6 +197,37 @@ func TestDetailShowsUnreadDefaultAndStatusMessage(t *testing.T) {
 	}
 }
 
+// Long repository and branch names stay inside the viewport, and divergence
+// survives the branch truncation at 60+ columns.
+func TestLongDetailHeaderFitsViewport(t *testing.T) {
+	for _, size := range [][2]int{{40, 12}, {60, 18}, {80, 24}} {
+		m := smokeFixtureModel()
+		long := strings.Repeat("very-long-repository-", 4)
+		m.Repos[0].Name, m.Repos[0].GHRepoName = long, long
+		m.Repos[0].CurrentBranch = strings.Repeat("feature/", 8)
+		m.Repos[0].DefaultBranch = "main"
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 12, 34
+		m.ActiveFocus = FocusRepos
+		m.SelectedIndex = 0
+		m.ScreenCursor[FocusRepos] = m.Repos[0].Path + "/" + m.Repos[0].Name
+		m.Detail = true
+		m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m.updateViewport()
+		view := m.Viewport.View()
+		for _, line := range strings.Split(view, "\n") {
+			if w := ansi.StringWidth(line); w > m.Viewport.Width {
+				t.Fatalf("%v: header line %d cells, viewport %d: %q", size, w, m.Viewport.Width, stripped(line))
+			}
+		}
+		if !strings.Contains(stripped(view), "updated") {
+			t.Fatalf("%v: header lost the status: %q", size, stripped(view))
+		}
+		if size[0] >= 60 && !strings.Contains(stripped(view), "↑12 ↓34") {
+			t.Fatalf("%v: header lost divergence: %q", size, stripped(view))
+		}
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()
