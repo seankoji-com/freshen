@@ -82,7 +82,7 @@ func (m *Model) updateViewport() {
 		}
 		sep := th.dim.Render("  ·  ")
 		branchPart := branchLink
-		if div := repoDivergence(item); div != "" {
+		if div := repoDivergence(item); div != "" && m.Width >= 60 {
 			branchPart += sep + th.dim.Render(div)
 		}
 		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchPart, sep, status)

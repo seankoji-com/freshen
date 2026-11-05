@@ -247,7 +247,7 @@ func repoDivergence(r *git.RepoItem) string {
 	case r.Behind > 0:
 		return fmt.Sprintf("↓%d behind", r.Behind)
 	}
-	return "up to date"
+	return ""
 }
 
 // ciRunsByRepo indexes the newest observed run per repository once for a
