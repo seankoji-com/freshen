@@ -91,7 +91,7 @@ func (m *Model) updateViewport() {
 			counts = prLink + th.dim.Render(" · ") + issueLink
 		}
 		status := m.renderStatusBadge(item)
-		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) {
+		if _, label := repoKind(item.Status); item.StatusMsg != "" && !strings.EqualFold(item.StatusMsg, label) && m.Width >= 60 {
 			status += th.dim.Render(" · " + item.StatusMsg)
 		}
 		sep := th.dim.Render("  ·  ")
