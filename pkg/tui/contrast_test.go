@@ -124,6 +124,25 @@ func TestLightProgressFillContrast(t *testing.T) {
 	}
 }
 
+// GitHub prefixes job-log lines with an ISO timestamp. A severity colour must
+// survive that prefix instead of being reset by the timestamp span.
+func TestTimestampedErrorLogStaysRed(t *testing.T) {
+	previous := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(0)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previous) })
+	saved := th
+	t.Cleanup(func() { th = saved })
+	th = newThemeMode(false, false)
+
+	out := highlightLogLine("2026-11-05T01:02:03Z ##[error]HTTP 403")
+	if !strings.Contains(out, "240;113;120") {
+		t.Fatalf("timestamped error line lost its red span: %q", out)
+	}
+	if !strings.HasSuffix(out, "\x1b[0m") {
+		t.Fatalf("error line is not a single styled span: %q", out)
+	}
+}
+
 // The wide Overview must use the height it is given, not leave half the body
 // empty. This is the defect that opened the design run.
 func TestOverviewWideLayoutUsesSpace(t *testing.T) {

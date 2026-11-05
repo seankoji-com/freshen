@@ -498,13 +498,13 @@ func (m Model) contextSummary() string {
 		switch {
 		case m.OpenJobID != "":
 			if j := m.openJob(); j != nil {
-				s = string(j.Status)
+				s = jobLabel(j.Status)
 				if j.RunnerName != "" {
 					s += " · on " + j.RunnerName
 				}
 			}
 		case m.OpenRun != nil:
-			s = fmt.Sprintf("%s · attempt %d", string(m.OpenRun.Status), m.OpenRun.Attempt)
+			s = fmt.Sprintf("%s · attempt %d", jobLabel(m.OpenRun.Status), m.OpenRun.Attempt)
 			if t := runTiming(m.OpenRun, time.Now()); t != "" {
 				s += " · " + t
 			}

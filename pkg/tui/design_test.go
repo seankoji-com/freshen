@@ -114,6 +114,16 @@ func TestSnapshotChipNamesReviewNotPartial(t *testing.T) {
 	}
 }
 
+// A push from the default branch is refused before any worker starts.
+func TestDefaultBranchPushRefuses(t *testing.T) {
+	m := smokeFixtureModel()
+	m.ActionTarget = &git.RepoItem{Name: "delta", Path: "/tmp/delta", CurrentBranch: "main", DefaultBranch: "main"}
+	cmd := m.executeAction("push")
+	if cmd != nil || m.BusyAction != "" || !strings.Contains(m.ToastMsg, "default branch") {
+		t.Fatalf("default-branch push was not refused: cmd=%v busy=%q toast=%q", cmd, m.BusyAction, m.ToastMsg)
+	}
+}
+
 // Entering a concern opens the tab that carries its signal.
 func TestConcernsOpensReviewTab(t *testing.T) {
 	m := smokeFixtureModel()
@@ -223,7 +233,7 @@ func TestWideListUsesTableAndPreview(t *testing.T) {
 	m.ActiveFocus = FocusRepos
 	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 160, Height: 40})
 	frame := stripped(m.View())
-	if !strings.Contains(frame, "REPOSITORY") || !strings.Contains(frame, "BRANCH · COUNTS") {
+	if !strings.Contains(frame, "REPOSITORY") || !strings.Contains(frame, "SIGNALS") || !strings.Contains(frame, "PRs") {
 		t.Fatalf("wide list has no column headings:\n%s", frame)
 	}
 	if !strings.Contains(frame, "PREVIEW") || !strings.Contains(frame, "Branches") {

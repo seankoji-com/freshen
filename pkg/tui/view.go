@@ -81,7 +81,11 @@ func (m *Model) updateViewport() {
 			status += th.dim.Render(" · " + item.StatusMsg)
 		}
 		sep := th.dim.Render("  ·  ")
-		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchLink, sep, status)
+		branchPart := branchLink
+		if div := repoDivergence(item); div != "" {
+			branchPart += sep + th.dim.Render(div)
+		}
+		fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, sep, branchPart, sep, status)
 		fmt.Fprintf(&sb, " %s", counts)
 		if item.HasUnstagedChanges {
 			sb.WriteString(sep + th.warning.Render(statusGlyphs[kindWarning]+" local changes"))
@@ -243,6 +247,17 @@ func highlightLogLine(line string) string {
 	if line == "" {
 		return line
 	}
+	trimmed := strings.TrimSpace(line)
+	switch {
+	case strings.Contains(trimmed, "##[error]") || strings.Contains(trimmed, "--- FAIL") || strings.HasPrefix(trimmed, "FAIL") || strings.Contains(trimmed, "panic:"):
+		return th.fg(th.red).Render(ansi.Strip(line))
+	case strings.Contains(trimmed, "##[warning]"):
+		return th.fg(th.yellow).Render(ansi.Strip(line))
+	case strings.Contains(trimmed, "##[group]"):
+		return th.fg(th.blue).Render(ansi.Strip(line))
+	case strings.Contains(trimmed, "PASS") || strings.Contains(trimmed, "successfully") || strings.Contains(trimmed, "Up to date"):
+		return th.fg(th.green).Render(ansi.Strip(line))
+	}
 
 	render := func(style lipgloss.Style) func(string) string {
 		return func(s string) string { return style.Render(s) }
@@ -251,20 +266,6 @@ func highlightLogLine(line string) string {
 	line = reCmd.ReplaceAllStringFunc(line, render(th.logCommand))
 	line = reURL.ReplaceAllStringFunc(line, render(th.link))
 	line = reQuoted.ReplaceAllStringFunc(line, render(th.logQuoted))
-
-	switch {
-	case strings.Contains(line, "##[error]") || strings.Contains(line, "--- FAIL") || strings.HasPrefix(strings.TrimSpace(line), "FAIL") || strings.Contains(line, "panic:"):
-		line = th.fg(th.red).Render(line)
-	case strings.Contains(line, "##[warning]"):
-		line = th.fg(th.yellow).Render(line)
-	case strings.Contains(line, "##[group]"):
-		line = th.fg(th.blue).Render(line)
-	case strings.Contains(line, "󰄬") || strings.Contains(line, "PASS") || strings.Contains(line, "successfully") || strings.Contains(line, "Up to date"):
-		line = th.fg(th.green).Render(line)
-	case strings.Contains(line, "󰅙") || strings.Contains(line, "error") || strings.Contains(line, "Failed") || strings.Contains(line, "conflict"):
-		line = th.fg(th.red).Render(line)
-	}
-
 	return line
 }
 

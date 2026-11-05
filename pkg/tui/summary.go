@@ -277,7 +277,7 @@ func (m Model) summaryContent(width, height int) string {
 	remaining := height - used
 	if remaining >= 6 {
 		content = append(content, "")
-		available := max(2, remaining-1)
+		available := max(2, remaining-2)
 		health := m.repoHealthPanel(s, leftW, available)
 		recent := m.recentPanel(s, rightW, available)
 		bottom := lipgloss.JoinHorizontal(lipgloss.Top, health, strings.Repeat(" ", gap), recent)

@@ -171,6 +171,9 @@ func (m Model) footerBindings() []key.Binding {
 		add(pair(k.Up, k.Down, "scroll"), relabel(k.Back, "back"), pair(k.PrevTab, k.NextTab, "tab"), relabel(k.Menu, "actions"), relabel(k.Refresh, "refresh"), k.Quit, relabel(k.Help, "keys"))
 	default:
 		if len(m.entries()) == 0 {
+			if (m.OpenRun != nil || m.QueueView || m.detailVisible()) && k.Back.Enabled() {
+				add(relabel(k.Back, "back"))
+			}
 			add(relabel(k.Refresh, "refresh"), relabel(k.Jump, "screens"), k.Quit, relabel(k.Help, "keys"))
 			break
 		}

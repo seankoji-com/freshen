@@ -308,7 +308,11 @@ func (m Model) entries() []screenEntry {
 				detail = "not cloned"
 			}
 			if r.StatusMsg != "" {
-				detail += " · " + r.StatusMsg
+				msg := r.StatusMsg
+				if _, label := repoKind(r.Status); strings.EqualFold(msg, label) {
+					msg = label
+				}
+				detail += " · " + msg
 			}
 			if r.LocalMetadataStale {
 				detail += " · local metadata from last snapshot"
@@ -571,7 +575,7 @@ func (m Model) tableLayout(width int) tableLayout {
 	inner := max(20, width-2)
 	status := 11
 	itemLabel := "REPOSITORY"
-	detailLabel := "BRANCH · COUNTS"
+	detailLabel := "SIGNALS"
 	switch m.ActiveFocus {
 	case FocusRepos:
 		status = 12
@@ -768,6 +772,8 @@ func (m Model) tableRow(e screenEntry, selected bool, width int, layout tableLay
 		}
 		if selected {
 			cell = ansi.Strip(cell)
+		} else if i == len(cells)-1 {
+			cell = th.dim.Render(cell)
 		}
 		body.WriteString(padTo(cell, layout.widths[i]))
 	}

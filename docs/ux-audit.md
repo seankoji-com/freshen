@@ -150,6 +150,19 @@ The screenshot was regenerated at the final layout. `go build ./...`,
 `GOTOOLCHAIN=go1.26.5 make lint` and `GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_NOSYSTEM=1 go test -race -count=1 ./...` pass locally.
 
+### Final panel polish
+
+| Finding | Change |
+|---|---|
+| A timestamped `##[error]` line lost its red because the timestamp span ended with a foreground reset | Severity is decided first and the whole line is styled as one span; the timestamp/command styling only applies to neutral lines |
+| The repository table's detail column was still labelled `BRANCH · COUNTS` after counts became columns | It is `SIGNALS`, covering divergence, failure, CI and branch |
+| Table detail text carried the same weight as names | The detail column is dimmed; the status and item columns carry the emphasis |
+| Repository detail headers omitted ahead/behind | The header shows `↑2 ↓1` / `↓3 behind` beside the branch |
+| The wide Overview's overflow row sat against the footer hint | The bottom block reserves one row of breathing space |
+| The default-branch push body still said Enter confirms | The body, footer, menu detail and guard all say the action is unavailable until a feature branch is checked out |
+| Run/job empty lists omitted the back hint | The empty-list footer advertises `esc back` for run/job/queue layers |
+| Breadcrumb run states and normal repository status messages kept their original case | Run states use the lowercase labels; repository status messages equal to the kind label use the lowercase label |
+
 ## Verification
 
 `pkg/tui/ux_test.go` renders every screen, drill-down and layer at 80 × 24,

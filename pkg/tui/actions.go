@@ -41,11 +41,15 @@ func (m Model) menuActions() []uiAction {
 	if m.ActionTarget.IsArchived {
 		return append(actions, uiAction{"delete", "Delete archived clone", "Delete this local repository from disk. This cannot be undone.", true})
 	}
+	pushDetail := "Commit all changes, push, create a PR and switch to the default branch."
+	if m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+		pushDetail += " This repository is on its default branch; switch to a feature branch first."
+	}
 	return append(actions,
 		uiAction{"sync", "Sync repository", "Run the repository sync workflow, including stash/pull/reapply", false},
 		uiAction{"sync-all", "Sync all repositories", "Run sync across every active repository", true},
 		uiAction{"switch", "Switch branch", "Toggle between the original and default branch", false},
-		uiAction{"push", "Commit, push and create PR", "Commit all changes, push, create a PR and switch to the default branch", true},
+		uiAction{"push", "Commit, push and create PR", pushDetail, true},
 		uiAction{"prune", "Prune branches and worktrees", "Remove clean secondary worktrees, prune expired registrations, and delete non-default branches already reachable from a remote. Changed or unavailable worktrees and branches with local-only commits are kept.", true})
 }
 func (m *Model) captureActionTarget() {
@@ -90,15 +94,18 @@ func (m Model) menuContent() string {
 					branch := target.CurrentBranch
 					base := target.DefaultBranch
 					detail += fmt.Sprintf("\n\nBranch %s → PR base %s", branch, base)
-					if branch == base {
-						detail += "\nThis is the default branch; Freshen will refuse to raise a PR."
-					}
 					if files := target.BranchDetails.ChangedFiles; len(files) > 0 {
 						detail += fmt.Sprintf("\nChanged files (%d): %s", len(files), strings.Join(files, ", "))
 					} else {
 						detail += "\nChanged files not read; open Branches to review before confirming."
 					}
 					detail += fmt.Sprintf("\nCommit message: WIP: Updates on branch '%s'", branch)
+				}
+				confirmLine := th.keyPrimary.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels"
+				if m.Width < 60 || m.Height < 16 {
+					confirmLine = th.key.Render("Esc") + " cancels · resize the terminal to read the full confirmation"
+				} else if a.id == "push" && m.ActionTarget != nil && m.ActionTarget.CurrentBranch == m.ActionTarget.DefaultBranch {
+					confirmLine = th.key.Render("Esc") + " cancels · switch to a feature branch first"
 				}
 				lines := []string{
 					rule("CONFIRM", width),
@@ -108,7 +115,7 @@ func (m Model) menuContent() string {
 					"",
 					detail,
 					"",
-					th.keyPrimary.Render("Enter") + " confirms · " + th.key.Render("Esc") + " cancels",
+					confirmLine,
 				}
 				for i := range lines {
 					if i > 0 {
