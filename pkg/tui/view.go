@@ -106,7 +106,7 @@ func (m *Model) updateViewport() {
 		status := m.renderStatusBadge(item)
 		fixed := 1 + ansi.StringWidth(repoLink) + 2*ansi.StringWidth(sep) + ansi.StringWidth(status)
 		budget := avail - fixed - ansi.StringWidth(divPart)
-		if ansi.StringWidth(branchLabel) <= budget || (m.Width >= 60 && budget >= max(20, ansi.StringWidth(branchAnnotation)+16)) {
+		if ansi.StringWidth(branchLabel) <= budget || (m.Width >= 60 && budget >= max(28, ansi.StringWidth(branchAnnotation)+24)) {
 			branchText := ansi.Truncate(strings.TrimSuffix(branchLabel, branchAnnotation), budget-ansi.StringWidth(branchAnnotation), "…") + branchAnnotation
 			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, divPart, th.dim.Render(sep)+status)

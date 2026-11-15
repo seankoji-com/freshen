@@ -203,6 +203,20 @@ func TestRepositoryHeaderEdgeCases(t *testing.T) {
 	}
 }
 
+func TestTruncatedHeaderKeepsUsefulBranchPrefix(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].Name, m.Repos[0].GHRepoName = strings.Repeat("r", 36), strings.Repeat("r", 36)
+	m.Repos[0].CurrentBranch = "release/very-long-branch-name-for-testing"
+	m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+	m.ActiveFocus, m.Detail = FocusRepos, true
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.updateViewport()
+	view := stripped(m.Viewport.View())
+	if !strings.Contains(view, "release/very") {
+		t.Fatalf("header lost useful branch prefix:\n%s", view)
+	}
+}
+
 func TestFittingRepositoryHeadersStayOnOneLine(t *testing.T) {
 	for _, tc := range []struct {
 		width int

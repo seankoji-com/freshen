@@ -205,6 +205,11 @@ func TestLogSeverityClassification(t *testing.T) {
 		"Starting sync for panic",
 		"[12:34:56] 󰓦 Starting sync for failed",
 		" Branch: failure | Default: failed | Unstaged: false",
+		"Deleted local branch: failed",
+		"Kept branch registered to a worktree: failure",
+		"Kept branch with local-only commits: failed",
+		" On default branch 'failed' (clean). Running git pull --no-rebase origin failed...",
+		" On default branch 'failure' (dirty). Stashing local changes (including untracked files), pulling origin failure, then restoring them...",
 		"0 failures, 0 errors",
 	} {
 		if out := highlightLogLine(neutral); strings.Contains(out, "240;113;120") {
