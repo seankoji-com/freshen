@@ -140,6 +140,40 @@ func TestApplyRepoSnapshotMergesSyncFieldsOnly(t *testing.T) {
 	}
 }
 
+func TestOrgRefreshPreservesIssueAndPRDetailState(t *testing.T) {
+	m := newTestModel("/tmp", "acme")
+	m.Repos = []*git.RepoItem{
+		{Name: "alpha", Path: "/tmp/alpha", IssuesList: []git.IssueItem{{Number: 3, Title: "issue"}}, PRsList: []git.PRItem{{Number: 4, Title: "pull request"}}, HasLoadedIssues: true, HasLoadedPRs: true, IsLoadingIssues: true, IsLoadingPRs: true},
+		{Name: "beta", Path: "/tmp/beta"},
+	}
+	m.handleOrgSyncedMsg(orgSyncedMsg{repos: []*git.RepoItem{{Name: "beta", Path: "/tmp/beta"}, {Name: "alpha", Path: "/tmp/alpha"}, {Name: "new", Path: "/tmp/new"}}})
+	var alpha *git.RepoItem
+	for _, item := range m.Repos {
+		if item.Name == "alpha" {
+			alpha = item
+		}
+	}
+	if alpha == nil {
+		t.Fatal("refreshed repository missing")
+	}
+	if !alpha.HasLoadedIssues || !alpha.HasLoadedPRs || !alpha.IsLoadingIssues || !alpha.IsLoadingPRs || len(alpha.IssuesList) != 1 || alpha.IssuesList[0].Number != 3 || len(alpha.PRsList) != 1 || alpha.PRsList[0].Number != 4 {
+		t.Fatalf("refresh lost detail state: %+v", alpha)
+	}
+	for _, item := range m.Repos {
+		if item == alpha {
+			continue
+		}
+		if item.HasLoadedIssues || item.HasLoadedPRs || item.IsLoadingIssues || item.IsLoadingPRs || len(item.IssuesList) != 0 || len(item.PRsList) != 0 {
+			t.Fatalf("refresh copied detail state to unrelated repo: %+v", item)
+		}
+	}
+	m.handleLoadedIssuesMsg(loadedIssuesMsg{repoName: "alpha", issues: []git.IssueItem{{Number: 5}}})
+	m.handleLoadedPRsMsg(loadedPRsMsg{repoName: "alpha", prs: []git.PRItem{{Number: 6}}})
+	if alpha.IsLoadingIssues || alpha.IsLoadingPRs || !alpha.HasLoadedIssues || !alpha.HasLoadedPRs || len(alpha.IssuesList) != 1 || alpha.IssuesList[0].Number != 5 || len(alpha.PRsList) != 1 || alpha.PRsList[0].Number != 6 {
+		t.Fatalf("in-flight detail results did not replace cached state: %+v", alpha)
+	}
+}
+
 func TestApplyRepoSnapshotUnknownRepo(t *testing.T) {
 	m := newTestModel("/tmp", "acme")
 	m.Repos = []*git.RepoItem{{Name: "alpha", Status: git.StatusPending}}
