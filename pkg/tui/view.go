@@ -106,7 +106,7 @@ func (m *Model) updateViewport() {
 		status := m.renderStatusBadge(item)
 		fixed := 1 + ansi.StringWidth(repoLink) + 2*ansi.StringWidth(sep) + ansi.StringWidth(status)
 		budget := avail - fixed - ansi.StringWidth(divPart)
-		if (m.Width >= 60 && budget >= max(20, ansi.StringWidth(branchAnnotation)+16)) || (m.Width < 60 && ansi.StringWidth(branchLabel) <= budget) {
+		if ansi.StringWidth(branchLabel) <= budget || (m.Width >= 60 && budget >= max(20, ansi.StringWidth(branchAnnotation)+16)) {
 			branchText := ansi.Truncate(strings.TrimSuffix(branchLabel, branchAnnotation), budget-ansi.StringWidth(branchAnnotation), "…") + branchAnnotation
 			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, divPart, th.dim.Render(sep)+status)
@@ -124,7 +124,7 @@ func (m *Model) updateViewport() {
 			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 			fmt.Fprintf(&sb, " %s\n %s%s\n", repoLink, branchPart, divPart)
 			if annotationOnOwnLine {
-				fmt.Fprintf(&sb, " %s\n", strings.TrimSpace(branchAnnotation))
+				fmt.Fprintf(&sb, " %s\n", fitLine(strings.TrimSpace(branchAnnotation), avail-1))
 			}
 			fmt.Fprintf(&sb, " %s\n", fitLine(status, avail-1))
 		}
@@ -306,7 +306,7 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify) || reFailures.MatchString(classify):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
@@ -314,7 +314,7 @@ func highlightLogLine(line string) string {
 		return th.fg(th.blue).Render(ansi.Strip(line))
 	case strings.HasPrefix(classify, "--- PASS") || reOK.MatchString(classify):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case reErrorWord.MatchString(classify) && !reSyncInfo.MatchString(classify):
+	case reFailures.MatchString(classify) || (reErrorWord.MatchString(classify) && !reSyncInfo.MatchString(classify)):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))

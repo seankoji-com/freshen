@@ -203,6 +203,44 @@ func TestRepositoryHeaderEdgeCases(t *testing.T) {
 	}
 }
 
+func TestFittingRepositoryHeadersStayOnOneLine(t *testing.T) {
+	for _, tc := range []struct {
+		width int
+		repo  string
+	}{{60, "freshen-dotfiles-repo"}, {80, "infrastructure-terraform-modules-x"}, {100, strings.Repeat("r", 40)}} {
+		m := smokeFixtureModel()
+		m.Repos[0].Name, m.Repos[0].GHRepoName = tc.repo, tc.repo
+		m.Repos[0].CurrentBranch = "main"
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = tc.width != 60, 2, 1
+		m.ActiveFocus, m.Detail = FocusRepos, true
+		m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: tc.width, Height: 30})
+		m.updateViewport()
+		first := strings.Split(stripped(m.Viewport.View()), "\n")[0]
+		if !strings.Contains(first, tc.repo) || !strings.Contains(first, "main") || !strings.Contains(first, "updated") {
+			t.Errorf("width %d: fitting header split: %q", tc.width, first)
+		}
+	}
+}
+
+func TestLongDefaultAnnotationFitsHeader(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].Name, m.Repos[0].GHRepoName = strings.Repeat("r", 62), strings.Repeat("r", 62)
+	m.Repos[0].DefaultBranch = strings.Repeat("d", 120)
+	m.ActiveFocus, m.Detail = FocusRepos, true
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m.updateViewport()
+	view := m.Viewport.View()
+	for _, line := range strings.Split(view, "\n") {
+		if ansi.StringWidth(line) > m.Viewport.Width {
+			t.Fatalf("line exceeds viewport: %q", stripped(line))
+		}
+	}
+	lines := strings.Split(stripped(view), "\n")
+	if len(lines) < 4 || !strings.Contains(lines[2], "(default:") || !strings.Contains(lines[3], "updated") {
+		t.Fatalf("long default did not fit on one annotation line:\n%s", stripped(view))
+	}
+}
+
 func TestRepositoryPreviewShowsUnreadDefault(t *testing.T) {
 	m := smokeFixtureModel()
 	m.Repos[0].DefaultBranch = ""

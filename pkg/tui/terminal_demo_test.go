@@ -100,6 +100,11 @@ func TestTerminalDemo(t *testing.T) {
 	if os.Getenv("FRESHEN_DEMO_UNREAD") == "1" {
 		m.Repos[0].DefaultBranch = ""
 	}
+	if os.Getenv("FRESHEN_DEMO_FIT") == "1" {
+		m.Repos[0].Name, m.Repos[0].GHRepoName = "infrastructure-terraform-modules-x", "infrastructure-terraform-modules-x"
+		m.Repos[0].CurrentBranch, m.Repos[0].DefaultBranch = "main", "main"
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+	}
 	if _, err := tea.NewProgram(terminalDemo{m}, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		t.Fatal(err)
 	}
