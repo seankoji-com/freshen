@@ -182,6 +182,9 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"Tests failed!", "240;113;120"},
 		{"Tests failed. PASS", "240;113;120"},
 		{"make: *** [Makefile:12: test] Error 1", "240;113;120"},
+		{"make[1]: *** [test] Error 2", "240;113;120"},
+		{"2 failures, 0 errors", "240;113;120"},
+		{"Branch: failure | Default: main: operation failed", "240;113;120"},
 		{"Automatic merge failed; fix conflicts", "240;113;120"},
 		{"error: HTTP 403", "240;113;120"},
 		{"󰅙 something happened", "240;113;120"},
@@ -198,6 +201,9 @@ func TestLogSeverityClassification(t *testing.T) {
 		"Committing and pushing branch 'fix/panic-recovery'",
 		"Branch: conflict | Default: main",
 		"Starting sync for panic",
+		"[12:34:56] 󰓦 Starting sync for failed",
+		" Branch: failure | Default: failed | Unstaged: false",
+		"0 failures, 0 errors",
 	} {
 		if out := highlightLogLine(neutral); strings.Contains(out, "240;113;120") {
 			t.Errorf("neutral line %q rendered as failure: %q", neutral, out)

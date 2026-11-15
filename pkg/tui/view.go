@@ -70,20 +70,22 @@ func (m *Model) updateViewport() {
 			sep = " · "
 		}
 		branchDetail := "not cloned"
+		branchAnnotation := ""
 		if !item.IsNew {
 			switch {
 			case item.CurrentBranch == "":
 				branchDetail = "unread"
 			case m.Width >= 100 && item.DefaultBranch != "":
-				branchDetail = fmt.Sprintf("%s (default)", item.CurrentBranch)
+				branchDetail = item.CurrentBranch
+				branchAnnotation = " (default)"
 				if item.CurrentBranch != item.DefaultBranch {
-					branchDetail = fmt.Sprintf("%s (default: %s)", item.CurrentBranch, item.DefaultBranch)
+					branchAnnotation = fmt.Sprintf(" (default: %s)", item.DefaultBranch)
 				}
 			default:
 				branchDetail = item.CurrentBranch
 			}
 		}
-		branchLabel := "branch " + branchDetail
+		branchLabel := "branch " + branchDetail + branchAnnotation
 		if m.Width < 60 {
 			branchLabel = branchDetail
 		}
@@ -104,15 +106,27 @@ func (m *Model) updateViewport() {
 		status := m.renderStatusBadge(item)
 		fixed := 1 + ansi.StringWidth(repoLink) + 2*ansi.StringWidth(sep) + ansi.StringWidth(status)
 		budget := avail - fixed - ansi.StringWidth(divPart)
-		if m.Width >= 60 && budget >= 8 {
-			branchText := ansi.Truncate(branchLabel, budget, "…")
+		if (m.Width >= 60 && budget >= max(20, ansi.StringWidth(branchAnnotation)+16)) || (m.Width < 60 && ansi.StringWidth(branchLabel) <= budget) {
+			branchText := ansi.Truncate(strings.TrimSuffix(branchLabel, branchAnnotation), budget-ansi.StringWidth(branchAnnotation), "…") + branchAnnotation
 			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
 			fmt.Fprintf(&sb, " %s%s%s%s%s\n", repoLink, th.dim.Render(sep), branchPart, divPart, th.dim.Render(sep)+status)
 		} else {
 			branchBudget := max(1, avail-2-ansi.StringWidth(divPart))
-			branchText := ansi.Truncate(branchLabel, branchBudget, "…")
+			annotationOnOwnLine := branchAnnotation != "" && ansi.StringWidth(branchAnnotation)+16 > branchBudget
+			nameBudget := branchBudget
+			if !annotationOnOwnLine {
+				nameBudget -= ansi.StringWidth(branchAnnotation)
+			}
+			branchText := ansi.Truncate(strings.TrimSuffix(branchLabel, branchAnnotation), max(1, nameBudget), "…")
+			if !annotationOnOwnLine {
+				branchText += branchAnnotation
+			}
 			branchPart := Hyperlink(branchText, fmt.Sprintf("%s/tree/%s", repoURL, item.CurrentBranch))
-			fmt.Fprintf(&sb, " %s\n %s%s\n %s\n", repoLink, branchPart, divPart, fitLine(status, avail-1))
+			fmt.Fprintf(&sb, " %s\n %s%s\n", repoLink, branchPart, divPart)
+			if annotationOnOwnLine {
+				fmt.Fprintf(&sb, " %s\n", strings.TrimSpace(branchAnnotation))
+			}
+			fmt.Fprintf(&sb, " %s\n", fitLine(status, avail-1))
 		}
 		fmt.Fprintf(&sb, " %s", counts)
 		var extras []string
@@ -292,7 +306,7 @@ func highlightLogLine(line string) string {
 	// after it so a timestamped "ok .../errors" is still a passing line.
 	classify := strings.TrimSpace(reTimestamp.ReplaceAllString(trimmed, ""))
 	switch {
-	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify):
+	case strings.Contains(classify, "##[error]") || strings.Contains(classify, "--- FAIL") || strings.Contains(classify, "󰅙") || reFail.MatchString(classify) || strings.Contains(classify, "panic:") || reErrorStart.MatchString(classify) || reMakeError.MatchString(classify) || reFailures.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "##[warning]") || strings.Contains(classify, "󰀪"):
 		return th.fg(th.yellow).Render(ansi.Strip(line))
@@ -300,7 +314,7 @@ func highlightLogLine(line string) string {
 		return th.fg(th.blue).Render(ansi.Strip(line))
 	case strings.HasPrefix(classify, "--- PASS") || reOK.MatchString(classify):
 		return th.fg(th.green).Render(ansi.Strip(line))
-	case reErrorWord.MatchString(classify):
+	case reErrorWord.MatchString(classify) && !reSyncInfo.MatchString(classify):
 		return th.fg(th.red).Render(ansi.Strip(line))
 	case strings.Contains(classify, "󰄬") || rePass.MatchString(classify) || strings.Contains(classify, "successfully") || strings.Contains(classify, "Up to date"):
 		return th.fg(th.green).Render(ansi.Strip(line))

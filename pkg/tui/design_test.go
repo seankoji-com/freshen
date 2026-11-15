@@ -180,6 +180,37 @@ func TestRepositoryDetailHeaderShowsDivergence(t *testing.T) {
 	}
 }
 
+func TestRepositoryHeaderEdgeCases(t *testing.T) {
+	for _, width := range []int{80, 100, 120, 160} {
+		m := smokeFixtureModel()
+		m.Repos[0].CurrentBranch = "release/" + strings.Repeat("long-branch-", 12)
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+		m.ActiveFocus, m.Detail = FocusRepos, true
+		m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: width, Height: 30})
+		m.updateViewport()
+		view := stripped(m.Viewport.View())
+		if !strings.Contains(view, "release/") || !strings.Contains(view, "↑2 ↓1") || (width >= 100 && !strings.Contains(view, "(default: main)")) {
+			t.Errorf("width %d lost branch, default or divergence:\n%s", width, view)
+		}
+	}
+	m := smokeFixtureModel()
+	m.Repos[0].CurrentBranch = "main"
+	m.ActiveFocus, m.Detail = FocusRepos, true
+	m.handleWindowSizeMsg(tea.WindowSizeMsg{Width: 40, Height: 12})
+	m.updateViewport()
+	if view := stripped(m.Viewport.View()); !strings.Contains(view, "git pull") {
+		t.Errorf("40x12 did not show a log row:\n%s", view)
+	}
+}
+
+func TestRepositoryPreviewShowsUnreadDefault(t *testing.T) {
+	m := smokeFixtureModel()
+	m.Repos[0].DefaultBranch = ""
+	if view := stripped(strings.Join(m.repoPreview(screenEntry{index: 0}), "\n")); !strings.Contains(view, "default branch unread") {
+		t.Fatalf("preview lost unread default: %s", view)
+	}
+}
+
 // An unread default branch and a failure message must both be visible.
 func TestDetailShowsUnreadDefaultAndStatusMessage(t *testing.T) {
 	m := smokeFixtureModel()
