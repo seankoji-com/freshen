@@ -493,6 +493,12 @@ func (m *Model) handleOrgSyncedMsg(msg orgSyncedMsg) (tea.Cmd, bool) {
 			if fresh.Path == old.Path {
 				fresh.Logs = old.Logs
 				fresh.OriginalBranch = old.OriginalBranch
+				fresh.IssuesList = old.IssuesList
+				fresh.PRsList = old.PRsList
+				fresh.HasLoadedIssues = old.HasLoadedIssues
+				fresh.HasLoadedPRs = old.HasLoadedPRs
+				fresh.IsLoadingIssues = old.IsLoadingIssues
+				fresh.IsLoadingPRs = old.IsLoadingPRs
 				if msg.localErr != nil && !fresh.IsNew {
 					if fresh.CurrentBranch == "" {
 						fresh.CurrentBranch = old.CurrentBranch
