@@ -45,6 +45,16 @@ func TestSanitizeTerminal(t *testing.T) {
 			want:  "run[31mred[0mbelldel",
 		},
 		{
+			name:  "strips C1 CSI OSC and string terminator",
+			input: "title\u009b31mred\u009d8;;https://evil.example\u009cclick",
+			want:  "title31mred8;;https://evil.exampleclick",
+		},
+		{
+			name:  "strips entire C1 range and preserves adjacent Unicode",
+			input: "\u007e\u0080\u0081\u0082\u0083\u0084\u0085\u0086\u0087\u0088\u0089\u008a\u008b\u008c\u008d\u008e\u008f\u0090\u0091\u0092\u0093\u0094\u0095\u0096\u0097\u0098\u0099\u009a\u009b\u009c\u009d\u009e\u009f\u00a0日本語",
+			want:  "\u007e\u00a0日本語",
+		},
+		{
 			name:  "expands tabs so test output stays readable",
 			input: "FAIL\tgithub.com/acme/beta\t0.41s",
 			want:  "FAIL    github.com/acme/beta    0.41s",

@@ -106,9 +106,9 @@ type JobItem struct {
 // SanitizeTerminal strips control characters from GitHub-sourced free text (titles,
 // branch names, job/run/runner names) before it reaches terminal rendering. This
 // prevents ANSI/OSC escape injection when such text is interpolated into raw escape
-// sequences (e.g. OSC 8 hyperlinks) or otherwise written to the terminal. All bytes
-// below 0x20 except space, plus 0x7F (DEL), are removed; everything else (including
-// UTF-8 multibyte sequences) passes through unchanged.
+// sequences (e.g. OSC 8 hyperlinks) or otherwise written to the terminal. Tabs
+// become spaces; other C0 controls, DEL, and C1 controls are removed. Other Unicode
+// characters pass through unchanged.
 func SanitizeTerminal(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -117,7 +117,7 @@ func SanitizeTerminal(s string) string {
 			b.WriteString("    ")
 			continue
 		}
-		if (r < 0x20 && r != ' ') || r == 0x7F {
+		if r < 0x20 || (r >= 0x7F && r <= 0x9F) {
 			continue
 		}
 		b.WriteRune(r)
