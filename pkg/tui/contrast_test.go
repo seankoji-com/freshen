@@ -170,6 +170,7 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/conflict 0.03s", "201;139"},
 		{"2026-11-05T01:02:03Z ok  github.com/acme/beta/errors 0.03s", "201;139"},
 		{"--- PASS: TestCases/FAIL (0.00s)", "201;139"},
+		{"--- PASS: TestRetry (recovered after 2 failures)", "201;139"},
 		{"ok  github.com/acme/FAIL 0.10s", "201;139"},
 		{"--- FAIL: TestCases/PASS (0.00s)", "240;113;120"},
 		{"--- PASS: TestParse_error", "201;139"},
@@ -182,6 +183,10 @@ func TestLogSeverityClassification(t *testing.T) {
 		{"Tests failed!", "240;113;120"},
 		{"Tests failed. PASS", "240;113;120"},
 		{"make: *** [Makefile:12: test] Error 1", "240;113;120"},
+		{"make[1]: *** [test] Error 2", "240;113;120"},
+		{"2 failures, 0 errors", "240;113;120"},
+		{"Branch: failure | Default: main: operation failed", "240;113;120"},
+		{"Pull failed: Starting sync for x", "240;113;120"},
 		{"Automatic merge failed; fix conflicts", "240;113;120"},
 		{"error: HTTP 403", "240;113;120"},
 		{"󰅙 something happened", "240;113;120"},
@@ -198,6 +203,14 @@ func TestLogSeverityClassification(t *testing.T) {
 		"Committing and pushing branch 'fix/panic-recovery'",
 		"Branch: conflict | Default: main",
 		"Starting sync for panic",
+		"[12:34:56] 󰓦 Starting sync for failed",
+		" Branch: failure | Default: failed | Unstaged: false",
+		"Deleted local branch: failed",
+		"Kept branch registered to a worktree: failure",
+		"Kept branch with local-only commits: failed",
+		" On default branch 'failed' (clean). Running git pull --no-rebase origin failed...",
+		" On default branch 'failure' (dirty). Stashing local changes (including untracked files), pulling origin failure, then restoring them...",
+		"0 failures, 0 errors",
 	} {
 		if out := highlightLogLine(neutral); strings.Contains(out, "240;113;120") {
 			t.Errorf("neutral line %q rendered as failure: %q", neutral, out)

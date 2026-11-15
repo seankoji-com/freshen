@@ -113,7 +113,9 @@ func (m Model) repoPreview(e screenEntry) []string {
 			branch = "unread; press r to refresh"
 		}
 		lines = append(lines, th.dim.Render("branch "+branch))
-		if r.DefaultBranch != "" && r.CurrentBranch != r.DefaultBranch {
+		if r.DefaultBranch == "" {
+			lines = append(lines, th.dim.Render("default branch unread; press r to refresh"))
+		} else if r.CurrentBranch != r.DefaultBranch {
 			lines = append(lines, th.dim.Render("default "+r.DefaultBranch))
 		}
 	}

@@ -91,6 +91,20 @@ func TestTerminalDemo(t *testing.T) {
 		t.Skip("manual terminal fixture")
 	}
 	m := demoFixtureModel()
+	if os.Getenv("FRESHEN_DEMO_EDGE") == "1" {
+		m.Repos[0].CurrentBranch = "release/very-long-branch-name-for-testing-header-truncation"
+		m.Repos[0].DefaultBranch = "main"
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+		m.Repos[0].Logs = []string{"Starting sync for failed", "Branch: failure | Default: main", "make[1]: *** [test] Error 2", "2 failures, 0 errors", "--- PASS: TestCases/FAIL (0.00s)"}
+	}
+	if os.Getenv("FRESHEN_DEMO_UNREAD") == "1" {
+		m.Repos[0].DefaultBranch = ""
+	}
+	if os.Getenv("FRESHEN_DEMO_FIT") == "1" {
+		m.Repos[0].Name, m.Repos[0].GHRepoName = "infrastructure-terraform-modules-x", "infrastructure-terraform-modules-x"
+		m.Repos[0].CurrentBranch, m.Repos[0].DefaultBranch = "main", "main"
+		m.Repos[0].HasUpstream, m.Repos[0].Ahead, m.Repos[0].Behind = true, 2, 1
+	}
 	if _, err := tea.NewProgram(terminalDemo{m}, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		t.Fatal(err)
 	}
